@@ -1,0 +1,186 @@
+# ---------- macOS 系统文件 ----------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+Icon?
+*.localized
+
+# Xcode / 开发工具的派生数据
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# ---------- 编辑器与 IDE ----------
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.#*
+#*#
+*.code-workspace
+
+# ---------- 通用构建产物 ----------
+build/
+out/
+dist/
+bin/
+obj/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.pdb
+*.dSYM/
+*.dSYM.zip
+target/
+.gradle/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# ---------- Swift / SwiftPM ----------
+.build/
+.build-*
+.swiftpm/
+Package.resolved.bak
+*.xctest
+*.profraw
+*.profdata
+*.cov
+.coverage/
+.docc-build/
+
+# ---------- Node / 前端 ----------
+node_modules/
+.pnpm-store/
+.yarn/
+.yarn-cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+.npm/
+.eslintcache
+.stylelintcache
+.parcel-cache/
+.next/
+.nuxt/
+.svelte-kit/
+.turbo/
+.vercel/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# ---------- Playwright ----------
+# 报告与失败现场:每次运行重新生成,含截图/视频/trace,体积大且随运行变化
+playwright-report/
+blob-report/
+test-results/
+# 浏览器二进制缓存与本地运行痕迹
+.playwright/
+.playwright-cli/
+playwright/.cache/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# ---------- Rust ----------
+/target/
+**/*.rs.bk
+*.rlib
+*.rmeta
+
+# ---------- Go ----------
+*.test
+*.out
+vendor/
+go.work.sum
+
+# ---------- Java / Kotlin / Android ----------
+*.class
+*.jar
+*.war
+*.dex
+*.apk
+*.aab
+classes/
+local.properties
+captures/
+.cxx/
+.externalNativeBuild/
+
+# ---------- C / C++ ----------
+*.lo
+*.la
+*.lib
+*.obj
+*.ilk
+*.idb
+*.gcda
+*.gcno
+*.gcov
+
+# ---------- 日志与运行时产物 ----------
+logs/
+*.log
+*.log.*
+*.pid
+*.seed
+*.pid.lock
+tmp/
+temp/
+.cache/
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ---------- 本地配置 / 密钥(绝不入库) ----------
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+secrets/
+*credentials*
+!*credentials*.example
+
+# ---------- 运行时数据与大型媒体产物 ----------
+# 截图/录屏等中间产物不入库,需要的作为发布附件单独管理。
+snapshots/
+*.h264
+*.mp4.tmp
