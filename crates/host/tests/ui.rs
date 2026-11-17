@@ -165,3 +165,25 @@ fn stuck_point_is_shown_while_starting() {
     app.wait_for_within("id:stuck", Duration::from_secs(8))
         .unwrap_or_else(|e| panic!("启动中应显示卡点: {e}\n屏幕: {:?}", app.screen().texts()));
 }
+
+/// 自检结果必须随快照到达界面。
+///
+/// 没有这条断言，自检可以静默返回空——界面会显示「一切正常」，
+/// 而用户点下去才发现缺组件。缺失信息必须由宿主给出，界面无权编造。
+#[test]
+fn readiness_reaches_the_ui() {
+    let (mut app, _h) = start(FakeBackend::new());
+    // 侧边栏一定渲染：它不依赖设备状态。
+    app.wait_for_within("text:Windroid", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("侧边栏应渲染: {e}"));
+
+    // 本机装齐时不该出现「未就绪」；缺组件时必须出现。
+    // 两种结果都合法，但界面不能在两者之间停留——它读的是同一份自检。
+    let screen = app.screen().texts();
+    let shows_blocked = screen.iter().any(|t| t.contains("运行环境未就绪"));
+    let shows_library = screen.iter().any(|t| t.contains("应用") || t.contains("启动实例"));
+    assert!(
+        shows_blocked || shows_library,
+        "界面必须处于「未就绪」或「应用库」之一，实际: {screen:?}"
+    );
+}
