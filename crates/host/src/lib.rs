@@ -17,6 +17,7 @@ use contract::{Ack, Command, Facts, Phase, Rejection, Snapshot, State};
 use device::Handle;
 use nsh_engine::{HostCall, HostChannel, JsonValue};
 
+pub mod actions;
 pub mod surface;
 pub mod video;
 
@@ -110,8 +111,21 @@ impl Bridge {
         });
 
         channel.handle(names::SNAPSHOT, move |call: HostCall| {
-            let mut view = SnapshotView::of(snap_handle.snapshot());
+            let snap = snap_handle.snapshot();
+            let apps = snap.apps.clone();
+            let home = runtime::catalog::home_state(&snap.serial).unwrap_or_default();
+            let mut view = SnapshotView::of(snap);
             view.readiness = Some(readiness_view());
+            view = view.with_apps(&apps, &home);
+            if std::env::var_os("WINDROID_DEBUG_APPS").is_some() {
+                eprintln!(
+                    "[snapshot] apps={} groups={} home={:?} id={}",
+                    apps.len(),
+                    view.groups.len(),
+                    home.default,
+                    view.snapshot.serial
+                );
+            }
             call.resolve(to_json(&view));
         });
 
@@ -150,19 +164,40 @@ impl Bridge {
 
 /// 把界面的调用翻译成命令，结果编码成回传 JSON。
 fn execute(handle: &Handle, data: &JsonValue) -> JsonValue {
-    let cmd: Command = match serde_json::from_value(data.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            // 解析失败是界面侧的 bug，不能静默：回一个明确的拒绝。
-            return to_json(&Ack::Rejected {
-                reason: Rejection::Error {
-                    code: contract::ErrorCode::Other,
-                    detail: format!("命令无法解析: {e}"),
-                },
-            });
-        }
+    // 两种输入形状：完整的命令（create/start/stop/install），或一条操作
+    // （launch/setDefaultHome/...）。操作只带 kind 与包名，因此先试操作。
+    let cmd = match translate_action(data) {
+        Some(c) => c,
+        None => match serde_json::from_value(data.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                // 解析失败是界面侧的 bug，不能静默：回一个明确的拒绝。
+                return to_json(&Ack::Rejected {
+                    reason: Rejection::Error {
+                        code: contract::ErrorCode::Other,
+                        detail: format!("命令无法解析: {e}"),
+                    },
+                });
+            }
+        },
     };
     to_json(&handle.send(cmd))
+}
+
+/// 把界面回传的操作翻译成设备域命令。
+///
+/// 操作的形状由 [actions] 定义，界面原样回传 `kind` 与包名。新增操作时
+/// 两侧各加一处，不涉及格式协商。
+fn translate_action(data: &JsonValue) -> Option<Command> {
+    let kind = data.get("kind")?.as_str()?;
+    let package = contract::PackageName::new(data.get("package")?.as_str()?);
+    Some(match kind {
+        "launch" => Command::Launch { package },
+        "setDefaultHome" => Command::SetDefaultHome { package },
+        "forceStop" => Command::ForceStop { package },
+        "clearData" => Command::ClearData { package },
+        _ => return None,
+    })
 }
 
 /// 序列化到通道格式。
@@ -217,8 +252,53 @@ pub struct SnapshotView {
     pub stuck_at: Option<&'static str>,
     /// 当前可执行的操作。界面按钮的禁用以此为准，不自己判断状态。
     pub capabilities: contract::Capabilities,
+    /// 桌面状态。派生操作时需要，不直接下发。
+    #[serde(skip)]
+    pub home_state: Option<runtime::catalog::HomeState>,
     /// 运行时自检。null 表示还没查。
     pub readiness: Option<ReadinessView>,
+    /// 应用库分组。界面直接渲染，不自己判断归属。
+    pub groups: Vec<GroupView>,
+    /// 桌面状态（哪些能当桌面、当前是谁）。界面用它在卡片上标记。
+    ///
+    /// 与 groups 分开：这是设备的一类能力状态，不是应用分组。
+    pub desktop: Option<DesktopView>,
+}
+
+/// 桌面相关状态的界面形态。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopView {
+    /// 当前默认桌面的包名。
+    pub default_package: Option<String>,
+}
+
+/// 一个应用分组。
+///
+/// 分组规则留在宿主：它依赖 AppEntry 的三个判定（系统/能否启动/能否作桌面），
+/// 界面复制这套判断必然漂移。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupView {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// 组内应用数。
+    pub count: usize,
+    pub apps: Vec<AppItemView>,
+}
+
+/// 应用在界面上的形态。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppItemView {
+    pub package: String,
+    /// 展示名。缺失时用包名，界面不显示空白项。
+    pub label: String,
+    pub system: bool,
+    /// 能否打开独立窗口。
+    pub launchable: bool,
+    /// 可执行的操作。由应用事实、设备状态与能力查询共同派生。
+    pub actions: Vec<crate::actions::Action>,
 }
 
 /// 自检结果的界面形态。
@@ -249,8 +329,77 @@ impl SnapshotView {
             summary,
             capabilities,
             readiness: None,
+            groups: Vec::new(),
+            desktop: None,
+            home_state: None,
             snapshot,
         }
+    }
+
+    /// 由应用清单派生分组。
+    ///
+    /// 三条规则：
+    /// - **能否启动**由 LAUNCHER 决定，这是进「已安装 / 系统应用」的硬条件；
+    /// - **桌面**由 HOME 决定，与系统/用户正交——用户装的第三方桌面是合格的；
+    /// - 没有任何 LAUNCHER 但声明了 HOME 的（只作桌面），单独成组，
+    ///   否则它们在界面上无处可去。
+    pub fn with_apps(
+        mut self,
+        apps: &[contract::AppEntry],
+        home: &runtime::catalog::HomeState,
+    ) -> Self {
+        self.home_state = Some(home.clone());
+        self.desktop = Some(DesktopView {
+            default_package: home.default.clone(),
+        });
+        let item = |a: &contract::AppEntry| AppItemView {
+            package: a.package.to_string(),
+            label: a.label.clone().unwrap_or_else(|| a.package.to_string()),
+            system: a.system,
+            launchable: a.launcher,
+            actions: crate::actions::for_app(a, home, self.capabilities.launch_app),
+        };
+        let sorted = |v: Vec<_>| {
+            let mut v = v;
+            v.sort_by(|a: &contract::AppEntry, b| {
+                a.label
+                    .as_deref()
+                    .unwrap_or(a.package.as_str())
+                    .to_lowercase()
+                    .cmp(&b.label.as_deref().unwrap_or(b.package.as_str()).to_lowercase())
+            });
+            v
+        };
+
+        let installed: Vec<_> = sorted(
+            apps.iter()
+                .filter(|a| a.launcher && !a.system)
+                .cloned()
+                .collect(),
+        );
+        let system: Vec<_> = sorted(
+            apps.iter()
+                .filter(|a| a.launcher && a.system)
+                .cloned()
+                .collect(),
+        );
+
+        let mut groups = Vec::new();
+        let mut push = |id: &'static str, name: &'static str, list: Vec<contract::AppEntry>| {
+            if list.is_empty() {
+                return;
+            }
+            groups.push(GroupView {
+                id,
+                name,
+                count: list.len(),
+                apps: list.iter().map(item).collect(),
+            });
+        };
+        push("installed", "已安装", installed);
+        push("system", "系统应用", system);
+        self.groups = groups;
+        self
     }
 }
 

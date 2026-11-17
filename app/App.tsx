@@ -71,6 +71,30 @@ interface Readiness {
   components: ComponentStatus[];
 }
 
+/** 一条可执行的操作。由宿主派生，界面只渲染，不判断。 */
+interface Action {
+  kind: "launch" | "setDefaultHome" | "forceStop" | "clearData";
+  label: string;
+  enabled: boolean;
+  reason: string | null;
+  destructive: boolean;
+}
+
+interface AppItem {
+  package: string;
+  label: string;
+  system: boolean;
+  launchable: boolean;
+  actions: Action[];
+}
+
+interface Group {
+  id: string;
+  name: string;
+  count: number;
+  apps: AppItem[];
+}
+
 interface Snapshot {
   id: string;
   state: DeviceState;
@@ -84,6 +108,9 @@ interface Snapshot {
   stuckAt: "process" | "adb" | "package" | "activity" | "window" | null;
   capabilities: Capabilities;
   readiness: Readiness | null;
+  groups: Group[];
+  /** 当前默认桌面的包名。空表示没有。 */
+  desktop: { defaultPackage: string | null } | null;
 }
 
 interface Ack {
@@ -155,6 +182,8 @@ function stateColor(s: DeviceState): string {
 const snap = signal<Snapshot | null>(null);
 const notice = signal("");
 const busy = signal(false);
+/** 当前选中的分组 id。空表示用第一个分组。 */
+const groupId = signal("");
 
 /** 重新取一次快照。事件到达后与启动时都走这里。 */
 function refresh() {
@@ -189,6 +218,16 @@ function send(cmd: unknown, label: string) {
       notice.set(`${label}出错: ${e.message}`);
     },
   );
+}
+
+/** 执行一个应用操作。形状与宿主约好：kind + package。 */
+function runAction(app: AppItem, kind: Action["kind"]) {
+  const action = app.actions.find((x) => x.kind === kind);
+  if (!action || !action.enabled) {
+    notice.set(action?.reason ?? "此操作当前不可用");
+    return;
+  }
+  send({ kind, package: app.package }, `${action.label} ${app.label}`);
 }
 
 // 订阅一次。事件到达后重取快照而不是拼事件载荷：界面只读一个数据源，
@@ -255,7 +294,14 @@ function App() {
         {blocked().length > 0 ? (
           <BlockedPanel items={blocked()} />
         ) : (
-          <LibraryPlaceholder state={state()} />
+          <Library
+            groups={snap()?.groups ?? []}
+            selected={groupId()}
+            canLaunch={can("launchApp")}
+            canInstall={can("install")}
+            state={state()}
+            defaultPackage={snap()?.desktop?.defaultPackage ?? null}
+          />
         )}
 
         {notice() ? (
@@ -424,28 +470,148 @@ function BlockedPanel(props: { items: ComponentStatus[] }) {
 }
 
 /**
- * 应用库的占位。
+ * 应用库：分组标签 + 图标网格。
  *
- * 应用列表由后续切片接入；此刻如实说明当前可以做什么，而不是显示一个
- * 空白网格让人以为出了问题。
+ * 分组与归属由宿主给出，界面只渲染。界面不判断「这个应用算不算系统应用」——
+ * 那套判定依赖 LAUNCHER/HOME 两个 intent 与 pm 的分类，复制一遍必然漂移。
  */
-function LibraryPlaceholder(props: { state: DeviceState }) {
-  const hint =
-    props.state === "ready" || props.state === "streaming"
-      ? "实例已就绪。应用列表与安装入口在下一个切片接入。"
-      : "启动实例后可在此查看应用。";
+function Library(props: {
+  groups: Group[];
+  selected: string;
+  canLaunch: boolean;
+  canInstall: boolean;
+  state: DeviceState;
+  defaultPackage: string | null;
+}) {
+  if (props.groups.length === 0) {
+    const hint =
+      props.state === "ready" || props.state === "streaming"
+        ? "此实例没有可显示的应用。"
+        : "启动实例后在此查看应用。";
+    return (
+      <View
+        style={{
+          flex: 1,
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Text style={{ fontSize: 13, color: "#5a5a68" }}>{hint}</Text>
+      </View>
+    );
+  }
+
+  const current =
+    props.groups.find((g) => g.id === props.selected) ?? props.groups[0];
+
+  return (
+    <View style={{ flex: 1, flexDirection: "column" }}>
+      {/* 分组标签。选中态用实心胶囊，未选用描边——同色系下靠填充区分，
+          不靠颜色（颜色已被状态灯占用）。 */}
+      <View
+        style={{
+          flexDirection: "row",
+          gap: 8,
+          paddingHorizontal: 16,
+          paddingVertical: 12,
+          alignItems: "center",
+        }}
+      >
+        {props.groups.map((g) => {
+          const on = g.id === current.id;
+          return (
+            <View
+              onPress={() => groupId.set(g.id)}
+              style={{
+                flexDirection: "row",
+                gap: 6,
+                alignItems: "center",
+                paddingHorizontal: 10,
+                paddingVertical: 4,
+                borderRadius: 999,
+                backgroundColor: on ? "#3a5fcd" : "#1b1b21",
+              }}
+            >
+              <Text style={{ fontSize: 12, color: on ? "#ffffff" : "#9a9aa8" }}>
+                {g.name}
+              </Text>
+              <Text style={{ fontSize: 10, color: on ? "#c8d4f8" : "#5a5a68" }}>
+                {String(g.count)}
+              </Text>
+            </View>
+          );
+        })}
+      </View>
+
+      <View
+        style={{
+          flexDirection: "row",
+          flexWrap: "wrap",
+          gap: 14,
+          paddingHorizontal: 16,
+          paddingBottom: 16,
+        }}
+      >
+        {current.apps.map((app) => (
+          <AppCard
+            app={app}
+            defaultHome={app.package === (props.defaultPackage ?? "")}
+            canLaunch={props.canLaunch}
+            onPress={() => runAction(app, "launch")}
+          />
+        ))}
+      </View>
+    </View>
+  );
+}
+
+/** 图标下的标签最多 8 个字符，超出用省略号。 */
+function shortLabel(label: string): string {
+  return label.length <= 8 ? label : label.slice(0, 8) + "…";
+}
+
+/**
+ * 一个应用图标。
+ *
+ * 显示哪些信息由数据决定（是否默认桌面），能做什么由宿主派生的 actions
+ * 决定——界面不判断「这个应用能不能当桌面」。不能启动的应用照样显示，
+ * 只是点不动：隐藏它等于抹掉事实。
+ */
+function AppCard(props: {
+  app: AppItem;
+  defaultHome: boolean;
+  canLaunch: boolean;
+  onPress: () => void;
+}) {
+  const launch = props.app.actions.find((x) => x.kind === "launch");
+  const enabled = props.canLaunch && (launch?.enabled ?? false);
   return (
     <View
-      style={{
-        flex: 1,
-        padding: 20,
-        flexDirection: "column",
-        gap: 8,
-        alignItems: "center",
-        justifyContent: "center",
-      }}
+      testID={`app-${props.app.package}`}
+      accessibilityLabel={props.app.label}
+      onPress={enabled ? props.onPress : undefined}
+      style={{ width: 92, flexDirection: "column", gap: 5, alignItems: "center" }}
     >
-      <Text style={{ fontSize: 13, color: "#5a5a68" }}>{hint}</Text>
+      <View
+        style={{
+          width: 56,
+          height: 56,
+          borderRadius: 14,
+          backgroundColor: enabled ? "#2a2a34" : "#1b1b21",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Text style={{ fontSize: 18, color: enabled ? "#e4e4ea" : "#4a4a56" }}>
+          {props.app.label.slice(0, 1)}
+        </Text>
+      </View>
+      <Text style={{ fontSize: 11, color: enabled ? "#c8c8d4" : "#5a5a68" }}>
+        {shortLabel(props.app.label)}
+      </Text>
+      {props.defaultHome ? (
+        <Text style={{ fontSize: 9, color: "#4ade80" }}>默认桌面</Text>
+      ) : null}
     </View>
   );
 }

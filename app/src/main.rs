@@ -34,8 +34,15 @@ fn main() {
     window.register_video(&slot, mtm);
 
     // 设备域。用真实模拟器还是假后端由环境决定——见 choose_backend。
+    let serial = runtime::serial_for(
+        std::env::var("WINDROID_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(5554),
+    );
     let (handle, events) = spawn(
         InstanceId::new("dev-1"),
+        serial.clone(),
         choose_backend(),
         device::Timeouts::default(),
     );
@@ -56,15 +63,9 @@ fn main() {
     // 开了 `WINDROID_REAL` 就直接把流接上：M1a 要验证的是「真实画面进我们的
     // 窗口」，不是「点击流程」。UI 驱动流启动属于 M1b。
     let _stream = if std::env::var_os("WINDROID_REAL").is_some() {
-        let serial = runtime::serial_for(
-            std::env::var("WINDROID_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(5554),
-        );
         // 必须复用注册给表面的那个槽位。新建一个等于把帧写进没人读的地方，
         // 表现为「流已连接、解码在跑、窗口始终黑屏」。
-        match streaming::Stream::start(serial, std::sync::Arc::clone(&slot), 27186) {
+        match streaming::Stream::start(serial.clone(), std::sync::Arc::clone(&slot), 27186) {
             Ok(s) => {
                 eprintln!("[stream] 已连接 {}", s.url);
                 Some(s)
