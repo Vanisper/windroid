@@ -291,6 +291,15 @@ pub enum Command {
     RefreshApps,
     /// 启动应用。不创建窗口——窗口由呈现域订阅事件后创建。
     Launch { package: PackageName },
+    /// 设为默认桌面。
+    ///
+    /// 只有声明了 HOME intent 的应用能被设为桌面，准入由
+    /// [Capabilities] 与运行时查询共同决定。
+    SetDefaultHome { package: PackageName },
+    /// 结束应用进程。系统应用不提供此操作。
+    ForceStop { package: PackageName },
+    /// 清除应用数据。系统应用不提供此操作。
+    ClearData { package: PackageName },
 }
 
 /// 命令的接收回执。
@@ -395,7 +404,19 @@ impl ErrorCode {
 pub struct AppEntry {
     pub package: PackageName,
     /// 系统应用（pm list packages -s）还是用户安装（-3）。
+    ///
+    /// 判定依据必须是 Android 自己的分类，不能看 APK 所在分区：系统包被
+    /// 更新后会搬到 /data/app，只看路径会把 Play Store 这类预装应用误判成
+    /// 用户安装。
     pub system: bool,
+    /// 声明了 LAUNCHER intent，能被普通方式启动。
+    ///
+    /// 这是「能否出现在应用库」的硬条件：没有 LAUNCHER 的包（纯库、overlay）
+    /// 放进界面没有意义。
+    ///
+    /// 这是应用自身的事实，与任何操作无关。像「能否作桌面」这类能力不进
+    /// 这个结构：它随功能扩展而增加，属于动作集的输入，不属于应用的身份。
+    pub launcher: bool,
     /// 展示名，来自主机侧 aapt，可能尚未补全。
     pub label: Option<String>,
     /// 图标缓存键，含 versionCode，应用更新后自动失效。
@@ -455,6 +476,11 @@ pub enum LogStream {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub id: InstanceId,
+    /// 该实例在 adb 中的地址（`emulator-5554`）。
+    ///
+    /// 与 [InstanceId] 分开：id 是产品的身份，serial 是它对外的运输地址。
+    /// 两者不复用——同一个实例换了端口，身份不该变；而查询设备必须有地址。
+    pub serial: String,
     pub state: State,
     pub phase: Option<Phase>,
     pub facts: Facts,

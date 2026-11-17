@@ -6,6 +6,9 @@
 //! 分工：本 crate 认识 emulator 与 adb 的调用方式；[adb] 只负责发命令与取输出。
 //! 状态推导不在这里——那是设备域的事。
 
+pub mod catalog;
+pub mod install;
+pub mod labels;
 pub mod prepare;
 
 use std::io;
@@ -40,6 +43,15 @@ impl Layout {
     }
 }
 
+/// 接管到外部实例时记一条。只记一次，避免每次观测都刷。
+fn log_recovered(serial: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if !ONCE.swap(true, Ordering::Relaxed) {
+        eprintln!("[runtime] 接管已在运行的实例 {serial}");
+    }
+}
+
 /// adb serial 的命名规则：`emulator-<console port>`。
 ///
 /// 端口由本 crate 分配并记录，因为它是需要全局协调的资源：
@@ -60,11 +72,36 @@ pub struct EmulatorBackend {
     started: Option<Instant>,
     /// 待写入的事实：`Create` 之后才为 true。
     created: bool,
+    /// 应用清单缓存。按需刷新，不在每次观测时重查——一次清单要跑五条
+    /// adb 命令，放到观测节奏里等于每秒几十次外部调用。
+    apps: Vec<contract::AppEntry>,
+    /// 清单是否需要在下次可读时刷新。
+    apps_dirty: bool,
+    /// 应用展示名缓存。
+    labels: labels::Labels,
+    /// 该实例不是本进程启动的，而是接管了一个已在运行的实例。
+    ///
+    /// 用户可能先手动起了模拟器，或上一次退出时没来得及清理。设备域必须
+    /// 如实反映「这台设备在运行」，否则界面会显示已停止、所有按钮禁用，
+    /// 而实际画面就在旁边正常播放。
+    adopted: bool,
 }
 
 impl EmulatorBackend {
     pub fn new(id: InstanceId, layout: Layout, port: u16) -> Self {
-        Self { id, layout, port, process: None, started: None, created: false }
+        let layout_cache = layout.root.join("cache");
+        Self {
+            id,
+            layout,
+            port,
+            process: None,
+            started: None,
+            created: false,
+            apps: Vec::new(),
+            apps_dirty: true,
+            adopted: false,
+            labels: labels::Labels::new(&layout_cache),
+        }
     }
 
     pub fn serial(&self) -> String {
@@ -178,15 +215,98 @@ impl Backend for EmulatorBackend {
                 facts.stop_requested = true;
                 self.stop(facts);
             }
-            // 其余命令在 M1b 之后接入。到这里说明调用方越过了准入判断。
-            other => {
-                return Err(Rejection::Error {
-                    code: contract::ErrorCode::Unsupported,
-                    detail: format!("M1a 未实现: {other:?}"),
-                });
+            Cmd::RefreshApps => {
+                self.apps = catalog::snapshot(&self.serial()).map_err(|e| {
+                    Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: e,
+                    }
+                })?;
+                self.apps_dirty = false;
+            }
+            Cmd::Install { apk_path } => {
+                // 安装结果必须回读。失败要带上分类与原因——「安装失败」
+                // 这四个字对用户没有任何用处。
+                match install::install(&self.serial(), apk_path).map_err(|e| {
+                    Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: e,
+                    }
+                })? {
+                    install::Outcome::Installed => self.apps_dirty = true,
+                    install::Outcome::Unverified => self.apps_dirty = true,
+                    install::Outcome::Failed { code, detail } => {
+                        return Err(Rejection::Error { code, detail });
+                    }
+                }
+            }
+            Cmd::Uninstall { package, keep_data } => {
+                let ok = install::uninstall(&self.serial(), package.as_str(), *keep_data)
+                    .map_err(|e| Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: e,
+                    })?;
+                if !ok {
+                    return Err(Rejection::Error {
+                        code: contract::ErrorCode::PackageNotFound,
+                        detail: format!("未能卸载 {package}"),
+                    });
+                }
+                self.apps_dirty = true;
+            }
+            Cmd::SetDefaultHome { package } => {
+                let ok = catalog::set_default_home(&self.serial(), package.as_str())
+                    .map_err(|e| Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: e,
+                    })?;
+                if !ok {
+                    return Err(Rejection::Error {
+                        code: contract::ErrorCode::PackageNotFound,
+                        detail: format!("{package} 不能作为桌面"),
+                    });
+                }
+            }
+            Cmd::ForceStop { package } => {
+                let _ = adb::shell(&self.serial(), &format!("am force-stop {package}"));
+                self.apps_dirty = true;
+            }
+            Cmd::ClearData { package } => {
+                let out = adb::shell(&self.serial(), &format!("pm clear {package}")).map_err(
+                    |e| Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: e.to_string(),
+                    },
+                )?;
+                // pm clear 失败时退出码仍是 0，只能看输出。
+                if !out.has("Success") {
+                    return Err(Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: format!("清除 {package} 的数据失败"),
+                    });
+                }
+                self.apps_dirty = true;
+            }
+            Cmd::Launch { package } => {
+                let ok = catalog::launch(&self.serial(), package.as_str()).map_err(|e| {
+                    Rejection::Error {
+                        code: contract::ErrorCode::AdbFailure,
+                        detail: e,
+                    }
+                })?;
+                if !ok {
+                    return Err(Rejection::Error {
+                        code: contract::ErrorCode::PackageNotFound,
+                        detail: format!("找不到可启动的 {package}"),
+                    });
+                }
             }
         }
         Ok(())
+    }
+
+    fn apps(&self) -> Vec<contract::AppEntry> {
+        self.apps.clone()
     }
 
     fn abort(&mut self, facts: &mut Facts) {
@@ -204,6 +324,21 @@ impl Backend for EmulatorBackend {
         // 只写观测到的事实。这里不判断状态——那是 State::of 的事。
         facts.dir_exists = self.dir().is_dir();
         facts.process_alive = self.alive();
+
+        // 不是我们启动的，但设备在应答：接管它。
+        //
+        // 这不是宽容，是如实反映：adb 能看到这台设备并且它已经引导完成，
+        // 「实例正在运行」就是事实。隐瞒它会让界面显示已停止，而画面就在
+        // 旁边正常播放——用户只会认为软件坏了。
+        if !facts.process_alive {
+            let serial = self.serial();
+            if adb::is_ready(&serial).unwrap_or(false) {
+                facts.process_alive = true;
+                facts.ever_launched = true;
+                self.adopted = true;
+                log_recovered(&serial);
+            }
+        }
         if !facts.process_alive {
             facts.adb_visible = false;
             facts.services = Default::default();
@@ -230,5 +365,25 @@ impl Backend for EmulatorBackend {
         facts.boot_completed = adb::shell(&serial, "getprop sys.boot_completed")
             .map(|o| o.stdout.trim() == "1")
             .unwrap_or(false);
+
+        // 设备可用后按需刷新清单。刷新失败不影响状态判定——清单是目录，
+        // 不是状态事实。
+        if self.apps_dirty && facts.services.ready() {
+            match catalog::snapshot(&serial) {
+                Ok(mut apps) => {
+                    // 包名对用户没有意义，换成应用自己声明的名字。
+                    let pkgs: Vec<String> =
+                        apps.iter().map(|a| a.package.to_string()).collect();
+                    let labels = self.labels.resolve(&serial, &pkgs);
+                    for a in &mut apps {
+                        a.label = labels.get(a.package.as_str()).cloned();
+                    }
+                    self.apps = apps;
+                    self.apps_dirty = false;
+                }
+                // 刷新失败不影响状态判定：清单是目录，不是状态事实。
+                Err(_) => self.apps_dirty = false,
+            }
+        }
     }
 }

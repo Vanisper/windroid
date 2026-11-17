@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 pub use contract::{Backend, Timeouts};
 
 use contract::{
-    Ack, AppEntry, Command, Event, Facts, InstanceId, LogStream, Phase, Rejection, Seq, Snapshot,
-    State,
+    Ack, AppEntry, Command, Event, Facts, InstanceId, LogStream, PackageName, Phase, Rejection, Seq,
+    Snapshot, State,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,12 +123,18 @@ impl Events {
 /// 启动 actor 线程，返回句柄与事件订阅端。
 ///
 /// 事件通道是单一出站：actor 是唯一发送方，因此事件天然有序。
-pub fn spawn<B: Backend>(id: InstanceId, mut backend: B, timeouts: Timeouts) -> (Handle, Events) {
+pub fn spawn<B: Backend>(
+    id: InstanceId,
+    serial: String,
+    mut backend: B,
+    timeouts: Timeouts,
+) -> (Handle, Events) {
     let (tx, rx) = mpsc::channel::<Msg>();
     let (ev_tx, ev_rx) = mpsc::channel::<Event>();
 
     let initial = Snapshot {
         id: id.clone(),
+        serial: serial.clone(),
         state: State::Absent,
         phase: None,
         facts: Facts::default(),
@@ -146,6 +152,7 @@ pub fn spawn<B: Backend>(id: InstanceId, mut backend: B, timeouts: Timeouts) -> 
         .spawn(move || {
             let mut actor = Actor {
                 id,
+                serial,
                 facts: Facts::default(),
                 apps: Vec::<AppEntry>::new(),
                 seq: 0,
@@ -157,6 +164,7 @@ pub fn spawn<B: Backend>(id: InstanceId, mut backend: B, timeouts: Timeouts) -> 
                 events: ev_tx,
                 aborted_once: false,
                 pending_abort: false,
+                last_apps: Vec::new(),
             };
             actor.run(rx, &mut backend);
         })
@@ -167,6 +175,7 @@ pub fn spawn<B: Backend>(id: InstanceId, mut backend: B, timeouts: Timeouts) -> 
 
 struct Actor {
     id: InstanceId,
+    serial: String,
     facts: Facts,
     apps: Vec<AppEntry>,
     seq: Seq,
@@ -177,6 +186,8 @@ struct Actor {
     timeouts: Timeouts,
     shared: Arc<Shared>,
     events: Sender<Event>,
+    /// 上一次发布的清单，用于判断是否需要通知界面。
+    last_apps: Vec<AppEntry>,
     /// 已因硬上限强制终止过，避免重复触发。
     aborted_once: bool,
     /// 本轮需要调用后端终止。放在字段里而不是当场调用：`apply_timeouts`
@@ -189,6 +200,8 @@ impl Actor {
         let mut next_observe = Instant::now();
         loop {
             // 1) 观测事实。这是状态的唯一输入。
+            // 应用清单也在这里同步：它是按需刷新的目录，不参与状态推导，
+            // 但快照要带上它，否则界面拿不到列表。
             //
             // 观测是有代价的：真实后端每次 observe 要发若干条 adb 命令，
             // 单条实测约 20ms。固定 50ms 轮询等于每秒 20 次外部调用、常驻
@@ -199,6 +212,8 @@ impl Actor {
                 backend.observe(&mut self.facts);
                 next_observe = now + self.observe_interval();
             }
+            // 清单随观测同步。它不参与状态推导，但快照要带上，否则界面拿不到。
+            self.apps = backend.apps();
             self.apply_timeouts();
             // 终止必须发生在观测之后：先看到最新事实，再决定收手。
             if std::mem::take(&mut self.pending_abort) {
@@ -316,6 +331,17 @@ impl Actor {
     fn publish_state(&mut self) {
         let state = State::of(&self.facts);
         let phase = Phase::of(&self.facts);
+
+        // 应用清单变化也要通知界面。它不是状态事实，但界面同样需要知道：
+        // 留着不发，界面只会在首次快照里看到一份空清单，之后永远不再取。
+        if self.apps != self.last_apps {
+            self.seq += 1;
+            self.last_apps = self.apps.clone();
+            self.emit(Event::AppsChanged {
+                seq: self.seq,
+                apps: self.apps.clone(),
+            });
+        }
         if state != self.last_state || phase != self.last_phase {
             self.seq += 1;
             let from = Some(self.last_state);
@@ -340,6 +366,7 @@ impl Actor {
         g.apps = self.apps.clone();
         g.seq = self.seq;
         g.id = self.id.clone();
+        g.serial = self.serial.clone();
     }
 
     fn emit(&self, e: Event) {
@@ -374,6 +401,12 @@ fn guard(cmd: &Command, state: State) -> Option<&'static str> {
         Command::Uninstall { .. } => (!caps.install).then_some("系统就绪"),
         Command::Launch { .. } => (!caps.launch_app).then_some("系统就绪"),
         Command::RefreshApps => (!caps.refresh_apps).then_some("系统就绪"),
+        // 这三个都是对已装应用的操作，与启动同样的前提：设备完全可用。
+        Command::SetDefaultHome { .. }
+        | Command::ForceStop { .. }
+        | Command::ClearData { .. } => {
+            (!caps.launch_app).then_some("系统就绪")
+        }
     }
 }
 
@@ -434,6 +467,27 @@ impl Default for FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    /// 两个应用：一个用户安装、一个系统自带。
+    /// 「能否作桌面」不在这里——那是设备的一类能力查询，不是应用的身份。
+    fn apps(&self) -> Vec<AppEntry> {
+        vec![
+            AppEntry {
+                package: PackageName::new("com.example.reader"),
+                system: false,
+                launcher: true,
+                label: Some("阅读器".into()),
+                icon_key: None,
+            },
+            AppEntry {
+                package: PackageName::new("com.example.launcher"),
+                system: true,
+                launcher: true,
+                label: Some("系统桌面".into()),
+                icon_key: None,
+            },
+        ]
+    }
+
     fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
         match cmd {
             Command::Create { .. } => {
@@ -461,7 +515,13 @@ impl Backend for FakeBackend {
                 facts.session_count = 0;
                 self.step = 0;
             }
-            Command::RefreshApps | Command::Install { .. } | Command::Uninstall { .. } | Command::Launch { .. } => {}
+            Command::RefreshApps
+            | Command::Install { .. }
+            | Command::Uninstall { .. }
+            | Command::Launch { .. }
+            | Command::SetDefaultHome { .. }
+            | Command::ForceStop { .. }
+            | Command::ClearData { .. } => {}
         }
         Ok(())
     }

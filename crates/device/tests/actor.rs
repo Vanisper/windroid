@@ -5,7 +5,7 @@
 //! 事件有序、状态不跳变、拒绝不误报、快照与事件能对齐。
 
 use contract::*;
-use device::{spawn, FakeBackend, Timeouts};
+use device::{FakeBackend, Timeouts};
 use std::time::Duration;
 
 fn short_timeouts() -> Timeouts {
@@ -15,6 +15,15 @@ fn short_timeouts() -> Timeouts {
         hard: Duration::from_secs(60),
         poll: Duration::from_millis(5),
     }
+}
+
+/// 测试用的 spawn：serial 固定，测试不关心它。
+fn spawn_test<B: contract::Backend>(
+    id: InstanceId,
+    backend: B,
+    timeouts: Timeouts,
+) -> (device::Handle, device::Events) {
+    device::spawn(id, "emulator-5554".to_owned(), backend, timeouts)
 }
 
 fn id() -> InstanceId {
@@ -36,7 +45,7 @@ fn until_state(events: &device::Events, want: State, budget: Duration) -> Option
 
 #[test]
 fn command_roundtrip_returns_ack() {
-    let (h, _ev) = spawn(id(), FakeBackend::new(), Timeouts::default());
+    let (h, _ev) = spawn_test(id(), FakeBackend::new(), Timeouts::default());
 
     let ack = h.send(Command::Create {
         spec: Spec {
@@ -55,7 +64,7 @@ fn command_roundtrip_returns_ack() {
 
 #[test]
 fn events_arrive_in_order_with_monotonic_seq() {
-    let (h, ev) = spawn(id(), FakeBackend::new(), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new(), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -81,7 +90,7 @@ fn events_arrive_in_order_with_monotonic_seq() {
 
 #[test]
 fn boot_progresses_through_expected_states() {
-    let (h, ev) = spawn(id(), FakeBackend::new().slowed(2), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().slowed(2), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -121,7 +130,7 @@ fn boot_progresses_through_expected_states() {
 fn ready_requires_all_three_services_not_just_pm() {
     // 这是最重要的一条：假后端在 package 服务出现后还会停一拍，
     // 我们可以验证 package 有、window 无的那一刻，状态不是 Ready。
-    let (h, ev) = spawn(id(), FakeBackend::new().slowed(3), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().slowed(3), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -156,7 +165,7 @@ fn ready_requires_all_three_services_not_just_pm() {
 #[test]
 fn stall_reports_the_sticking_point() {
     // 假后端在 adb 可见后停住；超时后应进入 Stalled。
-    let (h, ev) = spawn(id(), FakeBackend::new().stalling(), short_timeouts());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().stalling(), short_timeouts());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -181,7 +190,7 @@ fn stall_reports_the_sticking_point() {
 #[test]
 fn stalled_process_exit_becomes_failed() {
     // Stalled 之后进程死掉，必须转 Failed——这是最确定的失败信号。
-    let (h, ev) = spawn(id(), FakeBackend::new().stalling(), short_timeouts());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().stalling(), short_timeouts());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -201,7 +210,7 @@ fn stalled_process_exit_becomes_failed() {
 
 #[test]
 fn duplicate_start_is_rejected_with_reason() {
-    let (h, ev) = spawn(id(), FakeBackend::new().slowed(2), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().slowed(2), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -231,7 +240,7 @@ fn duplicate_start_is_rejected_with_reason() {
 
 #[test]
 fn install_before_ready_is_rejected_as_not_ready() {
-    let (h, ev) = spawn(id(), FakeBackend::new().slowed(3), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().slowed(3), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -254,7 +263,7 @@ fn install_before_ready_is_rejected_as_not_ready() {
 #[test]
 fn snapshot_and_events_can_be_reconciled_by_seq() {
     // 先取快照再订阅事件时的对齐方式：丢弃 seq <= snapshot.seq 的事件。
-    let (h, ev) = spawn(id(), FakeBackend::new().slowed(2), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().slowed(2), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -284,7 +293,7 @@ fn snapshot_and_events_can_be_reconciled_by_seq() {
 
 #[test]
 fn snapshot_state_always_equals_derived_state() {
-    let (h, ev) = spawn(id(), FakeBackend::new(), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new(), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -312,7 +321,7 @@ fn snapshot_state_always_equals_derived_state() {
 
 #[test]
 fn delete_requires_stopped() {
-    let (h, ev) = spawn(id(), FakeBackend::new().slowed(2), Timeouts::default());
+    let (h, ev) = spawn_test(id(), FakeBackend::new().slowed(2), Timeouts::default());
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
@@ -343,7 +352,7 @@ fn delete_requires_stopped() {
 /// 占资源」，实现却只是记了个标志。
 #[test]
 fn hard_limit_aborts_and_reports_failure() {
-    let (h, ev) = spawn(
+    let (h, ev) = spawn_test(
         id(),
         FakeBackend::new().stalling(),
         Timeouts {
@@ -383,7 +392,7 @@ fn hard_limit_aborts_and_reports_failure() {
 /// 强制终止后仍可重新启动：资源已回收，不是死路。
 #[test]
 fn instance_can_restart_after_abort() {
-    let (h, ev) = spawn(
+    let (h, ev) = spawn_test(
         id(),
         FakeBackend::new().stalling(),
         Timeouts {

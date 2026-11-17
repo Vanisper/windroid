@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crate::{Command, Facts, Rejection};
+use crate::{AppEntry, Command, Facts, Rejection};
 
 /// 执行命令的真实副作用，并回报观测到的事实。
 ///
@@ -31,6 +31,17 @@ pub trait Backend: Send + 'static {
     /// 实现方只能写观测到的东西，不要在这里推导状态——状态由
     /// [crate::State::of] 从事实算出来。
     fn observe(&mut self, facts: &mut Facts);
+
+    /// 当前应用清单。
+    ///
+    /// 与 [Facts] 分开传：应用清单不是「状态事实」，它是按需刷新的目录，
+    /// 参与状态推导毫无意义。混进 Facts 会让 snapshot_state_always_equals_
+    /// derived_state 那条断言失去意义。
+    ///
+    /// 默认空实现：不关心应用的实现（如假后端）不必实现它。
+    fn apps(&self) -> Vec<AppEntry> {
+        Vec::new()
+    }
 }
 
 /// 启动等待的两层超时。
@@ -71,6 +82,10 @@ impl Default for Timeouts {
 impl Backend for Box<dyn Backend> {
     fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
         (**self).exec(cmd, facts)
+    }
+
+    fn apps(&self) -> Vec<AppEntry> {
+        (**self).apps()
     }
 
     fn abort(&mut self, facts: &mut Facts) {

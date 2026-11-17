@@ -224,11 +224,13 @@ fn event_roundtrips_and_keeps_cursor() {
 #[test]
 fn snapshot_roundtrips() {
     let s = Snapshot {
+        serial: "emulator-5554".into(),
         id: InstanceId::new("i-1"),
         state: State::Ready,
         phase: None,
         facts: ready(),
         apps: vec![AppEntry {
+            launcher: true,
             package: PackageName::new("com.android.settings"),
             system: true,
             label: Some("设置".into()),
@@ -245,6 +247,7 @@ fn snapshot_roundtrips() {
 fn wire_format_is_camel_case_kebab_enum() {
     // 前端在 TSX 侧消费这些值，字段名固定，改了就是破坏性变更。
     let s = Snapshot {
+        serial: "emulator-5554".into(),
         id: InstanceId::new("i-1"),
         state: State::Stalled,
         phase: Some(Phase::WaitingAdb),
