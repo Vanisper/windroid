@@ -186,10 +186,5 @@ snapshots/
 *.mp4.tmp
 
 # ---------- 界面构建产物 ----------
-# 由 cargo run -p xtask 从 App.tsx 生成
-app/bundle.js
-app/bundle.js.map
-
 # nsh 生成物：类型声明、构建产物（由 xtask 生成）
 app/.nsh/
-app/capabilities.json
