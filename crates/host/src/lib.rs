@@ -80,8 +80,8 @@ impl Bridge {
         // 快照：纯读，就地回复。
         let snap_handle = handle.clone();
         channel.handle(names::SNAPSHOT, move |call: HostCall| {
-            let snap = snap_handle.snapshot();
-            call.resolve(to_json(&snap));
+            let view = SnapshotView::of(snap_handle.snapshot());
+            call.resolve(to_json(&view));
         });
 
         // 事件：独立线程转发。
@@ -149,6 +149,7 @@ fn to_json<T: serde::Serialize>(v: &T) -> JsonValue {
 /// 状态的一句话说明，供界面直接显示。
 ///
 /// 放在这里而不是 TSX：它依赖 [Facts] 的语义，写两遍必然漂移。
+/// 界面拿到的是 `Snapshot` 加 `summary` 字段（见 [SnapshotView]），不自己拼。
 pub fn describe(state: State, phase: Option<Phase>, facts: &Facts) -> String {
     match state {
         State::Absent => "实例尚未创建".into(),
@@ -167,6 +168,52 @@ pub fn describe(state: State, phase: Option<Phase>, facts: &Facts) -> String {
         State::Stopping => "正在停止".into(),
         State::Failed => "启动失败".into(),
     }
+}
+
+/// 发给界面的快照：设备域的快照加上由此派生的展示文案。
+///
+/// 为什么不在 TSX 里拼：状态说明依赖 [Facts] 的语义（三个服务分别意味着
+/// 什么、卡在 adb 与服务层如何区分）。放在两侧各写一份，改一处忘另一处，
+/// 用户看到的解释就会与真实原因不符。文案单点维护在这一侧。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotView {
+    #[serde(flatten)]
+    pub snapshot: Snapshot,
+    /// 一句话说明当前状态。
+    pub summary: String,
+    /// 卡点：启动中或 Stalled 时指出卡在哪一步，其余状态为 None。
+    pub stuck_at: Option<&'static str>,
+}
+
+impl SnapshotView {
+    pub fn of(snapshot: Snapshot) -> Self {
+        let summary = describe(snapshot.state, snapshot.phase, &snapshot.facts);
+        Self { stuck_at: stuck_at(snapshot.state, &snapshot.facts), summary, snapshot }
+    }
+}
+
+/// 卡在哪一步。用户的应对随卡点不同而完全不同——这是 Stalled 界面的核心信息。
+fn stuck_at(state: State, facts: &Facts) -> Option<&'static str> {
+    if !matches!(state, State::Starting | State::Stalled) {
+        return None;
+    }
+    if !facts.process_alive {
+        return Some("process");
+    }
+    if !facts.adb_visible {
+        return Some("adb");
+    }
+    if !facts.services.package {
+        return Some("package");
+    }
+    if !facts.services.activity {
+        return Some("activity");
+    }
+    if !facts.services.window {
+        return Some("window");
+    }
+    None
 }
 
 #[cfg(test)]

@@ -39,6 +39,10 @@ interface Snapshot {
   facts: Facts;
   apps: { package: string; system: boolean; label: string | null }[];
   seq: number;
+  /** 宿主给出的一句话说明。文案只在 Rust 侧维护，此处不自行拼接。 */
+  summary: string;
+  /** 卡在哪一步：process / adb / package / activity / window。 */
+  stuckAt: "process" | "adb" | "package" | "activity" | "window" | null;
 }
 
 interface Ack {
@@ -47,7 +51,11 @@ interface Ack {
   reason?: { kind: string; current?: DeviceState; wanted?: string; detail?: string };
 }
 
-const STATE_TEXT: Record<DeviceState, string> = {
+/**
+ * 状态名。只用于「当前 X，需要 Y」这类拒绝说明——说明性文案由宿主给出
+ * （见 Snapshot.summary），这里只提供状态本身的名字。
+ */
+const STATE_NAME: Record<DeviceState, string> = {
   absent: "尚未创建",
   stopped: "已停止",
   starting: "正在启动",
@@ -58,34 +66,21 @@ const STATE_TEXT: Record<DeviceState, string> = {
   failed: "启动失败",
 };
 
+/**
+ * 卡点的人话说法。宿主给出标识，文案在此——因为它要接在「卡在」后面，
+ * 属于界面措辞而非领域语义。
+ */
+const STUCK_TEXT: Record<string, string> = {
+  process: "模拟器进程",
+  adb: "adb 识别",
+  package: "package 服务",
+  activity: "activity 服务",
+  window: "window 服务",
+};
+
 /** 服务齐备的数目。门限是三个都齐，不是 pm 可用。 */
 function serviceCount(s: Services): number {
   return Number(s.activity) + Number(s.package) + Number(s.window);
-}
-
-/** 一句话说明卡在哪。与 Rust 侧 host::describe 的语义保持一致。 */
-function detailOf(snap: Snapshot): string {
-  const { state, phase, facts } = snap;
-  switch (state) {
-    case "absent":
-      return "还没有创建实例";
-    case "stopped":
-      return "可以启动";
-    case "starting":
-      if (phase === "waiting-adb") return "等待 adb 识别设备";
-      if (phase === "warming") return "系统服务尚未就绪";
-      return `正在启动，服务 ${serviceCount(facts.services)}/3`;
-    case "stalled":
-      return `服务 ${serviceCount(facts.services)}/3，可继续等待或查看日志`;
-    case "ready":
-      return "可以安装并运行应用";
-    case "streaming":
-      return `${facts.sessionCount} 个窗口在运行`;
-    case "stopping":
-      return "正在关闭";
-    case "failed":
-      return "进程已退出";
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +115,7 @@ function send(cmd: unknown, label: string) {
         // 预期内的状况与真正的错误分开说：前者用户能自己处理。
         notice.set(
           r?.kind === "wrongState"
-            ? `${label}：当前${STATE_TEXT[r.current ?? "absent"]}，需要${r.wanted ?? "其他状态"}`
+            ? `${label}：当前${STATE_NAME[r.current ?? "absent"]}，需要${r.wanted ?? "其他状态"}`
             : `${label}失败: ${r?.detail ?? r?.kind ?? "未知原因"}`,
         );
       } else {
@@ -144,13 +139,12 @@ function App() {
   // 派生值必须用 computed：在组件体内直接读信号只在首次渲染取一次值，
   // 后续更新不会反映到界面。这是响应式最容易踩的一处。
   const state = computed<DeviceState>(() => snap()?.state ?? "absent");
-  const count = computed<number>(() => {
+  const summary = computed<string>(() => snap()?.summary ?? "正在连接设备域");
+  // 卡点只在启动过程里展示。用户的应对随卡点完全不同——这是 Stalled 的核心信息。
+  const stuck = computed<string | null>(() => {
     const s = snap();
-    return s ? serviceCount(s.facts.services) : 0;
-  });
-  const summary = computed<string>(() => {
-    const s = snap();
-    return s ? `${STATE_TEXT[s.state]} · ${detailOf(s)}` : "正在连接设备域";
+    if (!s || (s.state !== "starting" && s.state !== "stalled")) return null;
+    return s.stuckAt ? `卡在${STUCK_TEXT[s.stuckAt] ?? s.stuckAt}` : null;
   });
   const servicesLine = computed<string>(() => {
     const s = snap();
@@ -187,6 +181,11 @@ function App() {
         <Text testID="services" style={{ fontSize: 12, color: "#5a5a68" }}>
           {servicesLine()}
         </Text>
+        {stuck() ? (
+          <Text testID="stuck" style={{ fontSize: 12, color: "#c8a06a" }}>
+            {stuck()}
+          </Text>
+        ) : null}
       </View>
 
       <View style={{ padding: 20, flexDirection: "row", gap: 10 }}>

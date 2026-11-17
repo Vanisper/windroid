@@ -32,7 +32,7 @@ fn start(backend: FakeBackend) -> (Headless, device::Handle) {
 
     let bundle = nsh_testing::compile_tsx(app_dir().join("App.tsx"), &[]).expect("编译 App.tsx");
 
-    let mut config = EngineConfig::new(bundle);
+    let config = EngineConfig::new(bundle);
     let channel = config.host.clone();
     let _bridge = host::Bridge::attach(handle.clone(), channel, events);
 
@@ -55,7 +55,8 @@ fn ui_shows_initial_absent_state() {
     // 首次渲染后界面已经取过快照，应显示「尚未创建」。
     // 用正则选择器而非 shows()：shows() 是整串精确匹配，而界面显示的是
     // 「状态 · 说明」整句。
-    app.wait_for_within("text:/^尚未创建/", Duration::from_secs(5))
+    // 文案来自宿主的 describe()，界面不自己拼——改文案只改一处。
+    app.wait_for_within("text:/^实例尚未创建/", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("界面应显示初始状态: {e}"));
 }
 
@@ -97,11 +98,20 @@ fn rejected_command_is_explained_in_the_ui() {
     h.send(Command::Create { spec: create_spec() });
     app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
 
-    // 停止按钮此时是禁用的（实例没启动），点不动——这正是界面在
-    // 帮用户避免一次必然失败的操作。改为验证拒绝信息的措辞来源：
-    // 直接发一条会失败的命令，看界面怎么说。
+    // 停止一个已停止的实例是幂等的：接受且无副作用。
+    // 这条不是「无所谓」——界面重试一次必然失败的命令不该让用户看到错误。
     let ack = h.send(Command::Stop);
-    assert!(!ack.is_accepted(), "停止一个已停止的实例应被拒绝");
+    assert!(ack.is_accepted(), "停止一个已停止的实例应被幂等受理");
+    assert!(
+        matches!(h.snapshot().state, State::Stopped),
+        "幂等受理不得改变状态"
+    );
+
+    // 真正该被拒绝的是没有实例时停止——那说明界面与设备域脱节了。
+    let (mut fresh, h2) = start(FakeBackend::new());
+    let _ = &mut fresh;
+    let ack = h2.send(Command::Stop);
+    assert!(!ack.is_accepted(), "无实例时停止应被拒绝");
 
     // 界面通过 notice 展示拒绝原因；这里验证措辞被翻译成用户能懂的话。
     app.wait_for_within("id:notice", Duration::from_secs(2)).ok();
@@ -138,4 +148,20 @@ fn service_indicators_come_from_facts_not_guesswork() {
     // 正则里的斜杠要转义，Rust 字符串里反斜杠本身也要转义。
     app.wait_for_within(r"text:/服务 3/3/", Duration::from_secs(3))
         .unwrap_or_else(|e| panic!("就绪时应显示 3/3: {e}"));
+}
+
+/// 启动过程中界面要指出卡在哪一步。
+///
+/// 这不是锦上添花：adb 未出现与服务未就绪，用户的应对完全不同——前者要查
+/// 端口与 adbd，后者要查镜像与磁盘。只说「启动较慢」等于什么也没说。
+#[test]
+fn stuck_point_is_shown_while_starting() {
+    let (mut app, h) = start(FakeBackend::new().stalling().slowed(1));
+    h.send(Command::Create { spec: create_spec() });
+    app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
+    app.press("id:start").expect("start");
+
+    // 假后端在 adb 可见后停住，卡点应指向更后面的服务层。
+    app.wait_for_within("id:stuck", Duration::from_secs(8))
+        .unwrap_or_else(|e| panic!("启动中应显示卡点: {e}\n屏幕: {:?}", app.screen().texts()));
 }

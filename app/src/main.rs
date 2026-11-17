@@ -67,7 +67,7 @@ fn main() {
 /// 而 capabilities.host 不声明等于全禁）；没有产物时退回源码，
 /// 并显式给出能力声明。这样开发期与打包后走同一条路径。
 fn load_ui(window: &Window) -> Result<(), String> {
-    let bundle_js = ui_dir().join("bundle.js");
+    let bundle_js = bundle_dir().join("bundle.js");
     if bundle_js.is_file() {
         return window.load_bundle_dir(&bundle_js);
     }
@@ -87,6 +87,13 @@ fn ui_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// xtask 的构建产物目录。
+///
+/// 与源码分开：`App.tsx` 是输入，`.nsh/out` 是输出。开发期与打包后都从这里载入。
+fn bundle_dir() -> PathBuf {
+    ui_dir().join(".nsh/out")
 }
 
 fn env_logger_init() {
