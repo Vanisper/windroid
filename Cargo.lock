@@ -7398,6 +7398,7 @@ dependencies = [
  "nsh-base",
  "nsh-bundler",
  "nsh-core",
+ "nsh-js",
 ]
 
 [[package]]
