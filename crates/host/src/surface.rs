@@ -157,6 +157,14 @@ impl Window {
         Ok(())
     }
 
+    /// 注册视频表面组件。
+    ///
+    /// 必须在 load 之前调用：组件注册晚于界面载入，界面上那个
+    /// `<native name="windroid.video">` 就是无效的，表现为空白区域。
+    pub fn register_video(&self, slot: &crate::video::FrameSlot, mtm: MainThreadMarker) {
+        crate::video::register(&self.view, mtm, std::sync::Arc::clone(slot));
+    }
+
     /// 显示并激活。
     pub fn show(&self, mtm: MainThreadMarker) {
         self.window.makeKeyAndOrderFront(None);

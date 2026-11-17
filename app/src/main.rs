@@ -7,8 +7,10 @@
 
 use std::path::PathBuf;
 
-use contract::InstanceId;
-use device::{spawn, FakeBackend};
+mod streaming;
+
+use contract::{Backend, InstanceId};
+use device::spawn;
 use host::surface::{CloseIntent, Window};
 use nsh_platform_macos::objc2::MainThreadMarker;
 use nsh_platform_macos::objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -27,10 +29,14 @@ fn main() {
         CloseIntent::Close
     }));
 
-    // 设备域：M0 用假后端。真后端接模拟器是 M1 的事。
+    // 视频表面：帧由后台流线程写入槽位，界面驱动上传。
+    let slot = host::video::frame_slot();
+    window.register_video(&slot, mtm);
+
+    // 设备域。用真实模拟器还是假后端由环境决定——见 choose_backend。
     let (handle, events) = spawn(
         InstanceId::new("dev-1"),
-        FakeBackend::new().slowed(6),
+        choose_backend(),
         device::Timeouts::default(),
     );
 
@@ -47,7 +53,39 @@ fn main() {
         }
     }
 
+    // 开了 `WINDROID_REAL` 就直接把流接上：M1a 要验证的是「真实画面进我们的
+    // 窗口」，不是「点击流程」。UI 驱动流启动属于 M1b。
+    let _stream = if std::env::var_os("WINDROID_REAL").is_some() {
+        let serial = runtime::serial_for(
+            std::env::var("WINDROID_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5554),
+        );
+        // 必须复用注册给表面的那个槽位。新建一个等于把帧写进没人读的地方，
+        // 表现为「流已连接、解码在跑、窗口始终黑屏」。
+        match streaming::Stream::start(serial, std::sync::Arc::clone(&slot), 27186) {
+            Ok(s) => {
+                eprintln!("[stream] 已连接 {}", s.url);
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[stream] 连接失败: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     window.show(mtm);
+
+    // 帧上传由主线程定时器驱动，而不是由界面驱动。
+    //
+    // 界面驱动存在的问题是：界面不知道帧的节奏，只能猜一个间隔，猜大了掉帧、
+    // 猜小了空转。用 16ms（约 60Hz）轮询槽位：没有新帧时它只做一次 Option
+    // 检查，代价可以忽略；有新帧就上传。
+    host::video::start_pump();
 
     // 事件转发线程与 actor 都在后台跑；主线程交给 AppKit 事件循环。
     app.run();
@@ -94,6 +132,27 @@ fn ui_dir() -> PathBuf {
 /// 与源码分开：`App.tsx` 是输入，`.nsh/out` 是输出。开发期与打包后都从这里载入。
 fn bundle_dir() -> PathBuf {
     ui_dir().join(".nsh/out")
+}
+
+/// 选择后端。
+///
+/// `WINDROID_REAL=1` 时接真实模拟器，否则用假后端。默认假后端不是偷懒：
+/// 开发界面时不该每次都等模拟器启动，而两种后端跑同一套 actor，
+/// 说明状态机与真实世界的关系是被验证过的，不是两套代码各跑各的。
+fn choose_backend() -> Box<dyn Backend> {
+    if std::env::var_os("WINDROID_REAL").is_none() {
+        return Box::new(device::FakeBackend::new().slowed(6));
+    }
+
+    let port = std::env::var("WINDROID_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5554);
+    Box::new(runtime::EmulatorBackend::new(
+        InstanceId::new("dev-1"),
+        runtime::Layout::default_root(),
+        port,
+    ))
 }
 
 fn env_logger_init() {

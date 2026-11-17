@@ -18,6 +18,7 @@ use device::Handle;
 use nsh_engine::{HostCall, HostChannel, JsonValue};
 
 pub mod surface;
+pub mod video;
 
 /// 宿主与界面之间的消息名。改名即是破坏性变更：TSX 侧的字符串必须同步。
 pub mod names {

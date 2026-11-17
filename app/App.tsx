@@ -1,5 +1,13 @@
-import { computed, mount, signal, Text, View } from "nsh";
+import { computed, mount, nativeComponent, signal, Text, View } from "nsh";
 import { host } from "nsh";
+
+/**
+ * 视频表面。由 Rust 侧注册的同名原生组件承载。
+ *
+ * 这里只声明名字与占位，不涉及任何解码或纹理——那些在 Rust 侧。
+ * 界面这一层的职责就是「在布局里给它一个位置」。
+ */
+const VideoSurface = nativeComponent("windroid.video", { props: [] });
 
 /**
  * 设备状态。字段名与 Rust 侧 contract 的 serde 形态一致。
@@ -170,6 +178,12 @@ function App() {
         <Text testID="summary" style={{ fontSize: 12, color: "#9a9aa8" }}>
           {summary()}
         </Text>
+      </View>
+
+      {/* 视频区域。真实画面来自解码器，经 Rust 侧纹理上传。
+          放在顶部并占满剩余空间：用户看的是应用，不是状态指示灯。 */}
+      <View style={{ flex: 1, backgroundColor: "#000000" }}>
+        <VideoSurface style={{ flex: 1 }} />
       </View>
 
       <View style={{ paddingHorizontal: 20, flexDirection: "column", gap: 6 }}>
