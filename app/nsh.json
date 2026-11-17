@@ -1,0 +1,14 @@
+{
+  "name": "Windroid",
+  "id": "dev.windroid.app",
+  "version": "0.1.0",
+  "build": "1",
+  "capabilities": {
+    "host": ["windroid.*"],
+    "statusBar": true
+  },
+  "window": {
+    "width": 900,
+    "height": 640
+  }
+}

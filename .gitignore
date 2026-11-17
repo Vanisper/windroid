@@ -184,3 +184,9 @@ secrets/
 snapshots/
 *.h264
 *.mp4.tmp
+
+# ---------- 界面构建产物 ----------
+# 由 cargo run -p xtask 从 App.tsx 生成
+app/bundle.js
+app/bundle.js.map
+app/capabilities.json
