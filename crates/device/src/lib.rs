@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub use contract::{Backend, Timeouts};
+
 use contract::{
     Ack, AppEntry, Command, Event, Facts, InstanceId, LogStream, Phase, Rejection, Seq, Snapshot,
     State,
@@ -24,61 +26,6 @@ use contract::{
 // ---------------------------------------------------------------------------
 // Backend：副作用边界
 // ---------------------------------------------------------------------------
-
-/// 执行命令的真实副作用，并回报观测到的事实。
-///
-/// 把副作用收到这个 trait 后面，是为了让状态机在没有模拟器、没有子进程的
-/// 情况下也能被完整测试。接真实现时，这里才是碰 emulator、adb、文件系统的地方。
-pub trait Backend: Send + 'static {
-    /// 执行命令中「发起动作」的部分。
-    ///
-    /// 返回值只表示**命令是否被受理**，不表示动作已完成。安装是否成功必须
-    /// 通过后续的 [Backend::observe] 回读验证——adb 的退出码与 Success 文本
-    /// 都不是证据（见 docs/架构/02-设备域.md 第七节）。
-    fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection>;
-
-    /// 强制终止进程，用于超过硬上限时回收端口与磁盘。
-    ///
-    /// 与 `Stop` 命令的区别：那是用户请求的优雅停止，这是系统为避免无限期
-    /// 占用资源而做出的决定。实现应尽快终止，不做清理等待。
-    fn abort(&mut self, facts: &mut Facts);
-
-    /// 观测当前事实，就地更新。
-    ///
-    /// actor 每次循环调用一次。真实实现会在这里看进程是否存活、adb devices、
-    /// service list、getprop。实现方只能写观测到的东西，不要在这里推导状态。
-    fn observe(&mut self, facts: &mut Facts);
-}
-
-/// 启动等待的两层超时。
-///
-/// 分层的价值是失败归因：第一层超时意味着 adb 层出了问题，第二层超时意味着
-/// 系统层出了问题。混成一个超时，用户只能看到「启动失败」。
-#[derive(Debug, Clone, Copy)]
-pub struct Timeouts {
-    /// 等待 adb 可见。端口冲突、外部 adb 占用、adbd 未起都会卡在这里。
-    pub adb: Duration,
-    /// 等待三个核心服务齐备。镜像异常、磁盘慢、OOM 会卡在这里。
-    pub services: Duration,
-    /// 从进程启动累计的硬上限，防止长时间占用端口与磁盘。
-    pub hard: Duration,
-    /// 过渡态（启动中、停止中）的观测间隔，其余状态按倍数放宽。
-    ///
-    /// 做成配置而非常量：测试需要它小到毫秒级才跑得快，生产需要它大到
-    /// adb 调用不至于成为常态开销。两者只差一个数字，不该有两套代码。
-    pub poll: Duration,
-}
-
-impl Default for Timeouts {
-    fn default() -> Self {
-        Self {
-            adb: Duration::from_secs(60),
-            services: Duration::from_secs(180),
-            hard: Duration::from_secs(600),
-            poll: Duration::from_millis(50),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 句柄：外部唯一的入口

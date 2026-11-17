@@ -7,6 +7,10 @@
 //! 状态不由赋值产生，而由事实派生：[Facts] 是唯一输入，[State::of] 是唯一推导，
 //! 没有其他代码路径能写状态。
 
+mod backend;
+
+pub use backend::{Backend, Timeouts};
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -345,6 +349,10 @@ pub enum ErrorCode {
     PackageNotFound,
     /// adb 层面失败。
     AdbFailure,
+    /// 主机侧文件系统操作失败（建目录、写日志、删除实例）。
+    Io,
+    /// 当前里程碑尚未实现。不是错误配置，是能力缺口，措辞要区分开。
+    Unsupported,
     /// 未分类。
     Other,
 }
