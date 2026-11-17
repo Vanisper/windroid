@@ -186,5 +186,5 @@ snapshots/
 *.mp4.tmp
 
 # ---------- 界面构建产物 ----------
-# nsh 生成物：类型声明、构建产物（由 xtask 生成）
+# nsh 生成物：类型声明与构建产物，由 nsh check / nsh build 生成
 app/.nsh/
