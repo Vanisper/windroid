@@ -1,0 +1,13 @@
+[package]
+name = "contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windroid 域间契约：命令、事件、快照与失败分类。纯数据，无平台依赖。"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
