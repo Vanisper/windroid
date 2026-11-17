@@ -1,0 +1,20 @@
+[package]
+name = "windroid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windroid：在桌面以原生窗口运行 Android 应用。"
+
+[[bin]]
+name = "windroid"
+path = "src/main.rs"
+
+[dependencies]
+contract = { path = "../crates/contract" }
+device = { path = "../crates/device" }
+host = { path = "../crates/host" }
+nsh-core = "0.5"
+nsh-platform-macos = "0.5"
+log = "0.4"
+env_logger = "0.11"
