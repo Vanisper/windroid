@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 fn setup() -> (Arc<Bridge>, HostChannel) {
     let (h, ev) = spawn(
         InstanceId::new("bridge-test"),
+        "emulator-5554".to_owned(),
         FakeBackend::new(),
         Timeouts::default(),
     );

@@ -26,6 +26,7 @@ fn app_dir() -> PathBuf {
 fn start(backend: FakeBackend) -> (Headless, device::Handle) {
     let (handle, events) = device::spawn(
         InstanceId::new("ui-test"),
+        "emulator-5554".to_owned(),
         backend,
         device::Timeouts::default(),
     );
