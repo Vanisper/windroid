@@ -6,6 +6,8 @@
 //! 分工：本 crate 认识 emulator 与 adb 的调用方式；[adb] 只负责发命令与取输出。
 //! 状态推导不在这里——那是设备域的事。
 
+pub mod prepare;
+
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -69,7 +71,9 @@ impl EmulatorBackend {
         serial_for(self.port)
     }
 
-    /// 模拟器可执行文件。真实产品会从自带的二级组件里取；M1a 先用系统 SDK。
+    /// 模拟器可执行文件。
+    ///
+    /// 发布版从应用自带的运行时组件取；开发期可用系统 SDK，因此留了环境变量入口。
     fn emulator_bin(&self) -> String {
         std::env::var("WINDROID_EMULATOR")
             .unwrap_or_else(|_| "emulator".to_owned())

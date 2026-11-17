@@ -1937,6 +1937,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
+ "runtime",
  "serde",
  "serde_json",
  "stream",
