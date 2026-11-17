@@ -1,0 +1,10 @@
+[package]
+name = "stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "流域：scrcpy 协议握手、视频包解析、帧解码。不碰窗口。"
+
+[dependencies]
+adb = { path = "../adb" }
