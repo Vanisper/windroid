@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "构建期工具：编译界面、生成能力声明。"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+nsh-bundler = "0.5"
+nsh-base = "0.5"
+nsh-core = "0.5"
