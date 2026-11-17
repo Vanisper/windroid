@@ -62,6 +62,11 @@ pub struct Timeouts {
     pub services: Duration,
     /// 从进程启动累计的硬上限，防止长时间占用端口与磁盘。
     pub hard: Duration,
+    /// 过渡态（启动中、停止中）的观测间隔，其余状态按倍数放宽。
+    ///
+    /// 做成配置而非常量：测试需要它小到毫秒级才跑得快，生产需要它大到
+    /// adb 调用不至于成为常态开销。两者只差一个数字，不该有两套代码。
+    pub poll: Duration,
 }
 
 impl Default for Timeouts {
@@ -70,6 +75,7 @@ impl Default for Timeouts {
             adb: Duration::from_secs(60),
             services: Duration::from_secs(180),
             hard: Duration::from_secs(600),
+            poll: Duration::from_millis(50),
         }
     }
 }
@@ -233,9 +239,19 @@ struct Actor {
 
 impl Actor {
     fn run<B: Backend>(&mut self, rx: Receiver<Msg>, backend: &mut B) {
+        let mut next_observe = Instant::now();
         loop {
             // 1) 观测事实。这是状态的唯一输入。
-            backend.observe(&mut self.facts);
+            //
+            // 观测是有代价的：真实后端每次 observe 要发若干条 adb 命令，
+            // 单条实测约 20ms。固定 50ms 轮询等于每秒 20 次外部调用、常驻
+            // 占用一个核，而实例停在 Stopped 时那个数字毫无意义。
+            // 所以按状态定观测节奏：启动中盯得紧，其余时段松。
+            let now = Instant::now();
+            if now >= next_observe {
+                backend.observe(&mut self.facts);
+                next_observe = now + self.observe_interval();
+            }
             self.apply_timeouts();
             // 终止必须发生在观测之后：先看到最新事实，再决定收手。
             if std::mem::take(&mut self.pending_abort) {
@@ -245,7 +261,13 @@ impl Actor {
             self.publish_state();
 
             // 2) 等命令，同时保持观测节奏。
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            //
+            // 等待时长必须与下一次观测的时刻对齐：固定 50ms 会让「本该 5ms
+            // 后观测」的状态等到 50ms，测试随之变慢，而生产里这只是白等。
+            let wait = next_observe
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            match rx.recv_timeout(wait) {
                 Ok(Msg::Command(cmd, reply)) => {
                     let ack = self.handle_command(&cmd, backend);
                     let _ = reply.send(ack);
@@ -253,6 +275,21 @@ impl Actor {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+    }
+
+    /// 当前状态下的观测间隔。
+    ///
+    /// 启动中与停止中是过渡态，变化快，需要盯紧；就绪后与未创建时是稳定态，
+    /// 只有外部变化（用户手动 kill、模拟器自己崩溃）才需要发现，可以松。
+    fn observe_interval(&self) -> Duration {
+        let base = self.timeouts.poll;
+        match State::of(&self.facts) {
+            State::Starting | State::Stalled | State::Stopping => base,
+            State::Ready | State::Streaming => base * 10,
+            State::Stopped | State::Failed => base * 20,
+            // 没有实例就没有可观测的对象，放得更松。
+            State::Absent => base * 40,
         }
     }
 

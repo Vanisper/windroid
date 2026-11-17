@@ -13,6 +13,7 @@ fn short_timeouts() -> Timeouts {
         adb: Duration::from_millis(60),
         services: Duration::from_millis(60),
         hard: Duration::from_secs(60),
+        poll: Duration::from_millis(5),
     }
 }
 
@@ -351,6 +352,7 @@ fn hard_limit_aborts_and_reports_failure() {
             // 硬上限要明显晚于两层超时：否则 Stalled 会被直接跳过，
             // 而 Stalled 正是给用户看「卡在哪」的时刻。
             hard: Duration::from_millis(400),
+            poll: Duration::from_millis(5),
         },
     );
     h.send(Command::Create {
@@ -388,6 +390,7 @@ fn instance_can_restart_after_abort() {
             adb: Duration::from_millis(30),
             services: Duration::from_millis(30),
             hard: Duration::from_millis(90),
+            poll: Duration::from_millis(5),
         },
     );
     h.send(Command::Create {
