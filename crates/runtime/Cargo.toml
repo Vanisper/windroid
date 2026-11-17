@@ -1,0 +1,11 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "运行环境域：实例目录、模拟器进程、adb 就绪判定。"
+
+[dependencies]
+contract = { path = "../contract" }
+adb = { path = "../adb" }
