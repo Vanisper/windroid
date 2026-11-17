@@ -63,9 +63,9 @@ fn main() {
 
 /// 载入界面。
 ///
-/// 优先读 nsh build 的产物目录（它会一并带上 capabilities.json，
-/// 而 capabilities.host 不声明等于全禁）；没有产物时退回源码，
-/// 并显式给出能力声明。这样开发期与打包后走同一条路径。
+/// 优先读 `nsh build` 的产物目录：它一并写出 capabilities.json，
+/// 而 capabilities.host 不声明等于全禁。没有产物时退回源码，并显式给出
+/// 能力声明——这样开发期与打包后走同一条路径。
 fn load_ui(window: &Window) -> Result<(), String> {
     let bundle_js = bundle_dir().join("bundle.js");
     if bundle_js.is_file() {
@@ -89,7 +89,7 @@ fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// xtask 的构建产物目录。
+/// nsh build 的产物目录。
 ///
 /// 与源码分开：`App.tsx` 是输入，`.nsh/out` 是输出。开发期与打包后都从这里载入。
 fn bundle_dir() -> PathBuf {
