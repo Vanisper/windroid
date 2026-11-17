@@ -69,14 +69,18 @@ impl Stream {
                                 pending_config = Some(data);
                                 continue;
                             }
-                            if let Some(cfg) = pending_config.take()
-                                && decoder.feed(&cfg).is_err() {
+                            // 不合并成 let-chain：这是一个有独立含义的步骤
+                            // （把暂存的 SPS/PPS 先送进去），嵌套读起来更清楚
+                            // 它和下面的「送媒体帧」是两件事。
+                            #[allow(clippy::collapsible_if)]
+                            if let Some(cfg) = pending_config.take() {
+                                if decoder.feed(&cfg).is_err() {
                                     break;
                                 }
+                            }
                             if decoder.feed(&data).is_err() {
                                 break;
                             }
-
                         }
                         // 画面静止时 scrcpy 不发帧。这不是错误。
                         Ok(None) => continue,

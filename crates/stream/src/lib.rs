@@ -112,7 +112,11 @@ impl VideoSocket {
             {
                 return Ok(None);
             }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            // EOF 必须与「暂时无数据」分开。设备端断开时 socket 持续返回 0 字节，
+            // 若把它也当成空闲，读取线程会永远空转，而用户看到的是画面卡住不动——
+            // 一个死掉的实例看起来像活着的。
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof =>
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "视频流已断开")),
             Err(e) => return Err(e),
         }
         let flags = u64::from_be_bytes(header[0..8].try_into().unwrap());
