@@ -29,6 +29,13 @@ pub mod names {
     pub const EVENT: &str = "windroid.event";
 }
 
+/// 界面所需的能力声明，对应 nsh build 产出的 capabilities.json。
+///
+/// 必须显式声明：没有 capabilities 的 app，host 一项是空的——
+/// 每个 host.call 都会被拒。用前缀 "windroid.*" 而不是 true，
+/// 后者展开成 ["*"]，等于把整套宿主接口全开。
+pub const CAPABILITIES_JSON: &str = r#"{"host":["windroid.*"]}"#;
+
 /// 把设备域接到界面。
 pub struct Bridge {
     handle: Handle,

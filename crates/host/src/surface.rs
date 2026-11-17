@@ -134,10 +134,27 @@ impl Window {
         self.view.load(nsh_engine::App::Rust(root));
     }
 
-    /// 载入 TSX bundle（编译后的 JS 源）。
-    pub fn load_bundle(&self, code: String) {
-        let bundle = nsh_engine::Bundle::source(code);
+    /// 从 nsh build 的产物目录载入界面。
+    ///
+    /// 用 [nsh_engine::Bundle::read] 而非读字符串进 Bundle::source：它会一并
+    /// 读取同目录的 source map、capabilities.json 与 app.json。手工拼 Bundle
+    /// 会漏掉 capabilities，而 capabilities.host 默认什么都不授予——漏掉的
+    /// 结果是界面上每个 host.call 都被拒，且错误出现在运行期而非构建期。
+    pub fn load_bundle_dir(&self, bundle_js: &std::path::Path) -> Result<(), String> {
+        let bundle = nsh_engine::Bundle::read(bundle_js).map_err(|e| e.to_string())?;
         self.view.load(nsh_engine::App::Js(bundle));
+        Ok(())
+    }
+
+    /// 从内存中的 JS 源载入，并显式给出能力声明。
+    ///
+    /// 供内嵌与测试使用。capabilities_json 不可省略：不传等于「什么都不授予」。
+    /// 格式与 nsh build 产出的 capabilities.json 一致。
+    pub fn load_bundle_source(&self, code: String, capabilities_json: &str) -> Result<(), String> {
+        let bundle = nsh_engine::Bundle::source(code)
+            .with_capabilities_json(Some(capabilities_json))?;
+        self.view.load(nsh_engine::App::Js(bundle));
+        Ok(())
     }
 
     /// 显示并激活。
