@@ -10,6 +10,7 @@ description = "Windroid 呈现域：窗口所有权、视频表面、关闭拦�
 contract = { path = "../contract" }
 device = { path = "../device" }
 stream = { path = "../stream" }
+runtime = { path = "../runtime" }
 nsh-core = "0.5"
 nsh-engine = { version = "0.5", features = ["js-core"] }
 serde = { workspace = true }

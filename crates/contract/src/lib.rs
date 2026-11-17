@@ -8,8 +8,10 @@
 //! 没有其他代码路径能写状态。
 
 mod backend;
+mod capability;
 
 pub use backend::{Backend, Timeouts};
+pub use capability::Capabilities;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

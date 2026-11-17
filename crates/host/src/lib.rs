@@ -28,6 +28,30 @@ pub mod names {
     pub const SNAPSHOT: &str = "windroid.snapshot";
     /// 宿主推送，状态或事实变化。载荷是事件 JSON。
     pub const EVENT: &str = "windroid.event";
+    /// 界面调用，取运行时自检结果。无参数。
+    pub const READINESS: &str = "windroid.readiness";
+}
+
+/// 运行时自检结果，序列化为界面可读的 JSON。
+///
+/// 界面拿到的是「缺什么、后果是什么」，而不是错误码——用户在首次启动时
+/// 需要的是一句能照做的话。
+fn readiness_view() -> ReadinessView {
+    let r = runtime::prepare::check();
+    ReadinessView {
+        usable: r.usable(),
+        avds: r.avds,
+        components: r
+            .components
+            .iter()
+            .map(|c| ComponentView {
+                name: c.name,
+                ok: c.ok,
+                path: c.path.as_ref().map(|p| p.display().to_string()),
+                remedy: c.remedy,
+            })
+            .collect(),
+    }
 }
 
 /// 界面所需的能力声明，对应 nsh build 产出的 capabilities.json。
@@ -80,8 +104,14 @@ impl Bridge {
 
         // 快照：纯读，就地回复。
         let snap_handle = handle.clone();
+        // 自检：读本机现状，不启动任何进程，因此可以直接在引擎线程上做。
+        channel.handle(names::READINESS, move |call: HostCall| {
+            call.resolve(to_json(&readiness_view()));
+        });
+
         channel.handle(names::SNAPSHOT, move |call: HostCall| {
-            let view = SnapshotView::of(snap_handle.snapshot());
+            let mut view = SnapshotView::of(snap_handle.snapshot());
+            view.readiness = Some(readiness_view());
             call.resolve(to_json(&view));
         });
 
@@ -185,12 +215,42 @@ pub struct SnapshotView {
     pub summary: String,
     /// 卡点：启动中或 Stalled 时指出卡在哪一步，其余状态为 None。
     pub stuck_at: Option<&'static str>,
+    /// 当前可执行的操作。界面按钮的禁用以此为准，不自己判断状态。
+    pub capabilities: contract::Capabilities,
+    /// 运行时自检。null 表示还没查。
+    pub readiness: Option<ReadinessView>,
+}
+
+/// 自检结果的界面形态。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessView {
+    pub usable: bool,
+    pub avds: Vec<String>,
+    pub components: Vec<ComponentView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentView {
+    pub name: &'static str,
+    pub ok: bool,
+    pub path: Option<String>,
+    pub remedy: &'static str,
 }
 
 impl SnapshotView {
     pub fn of(snapshot: Snapshot) -> Self {
         let summary = describe(snapshot.state, snapshot.phase, &snapshot.facts);
-        Self { stuck_at: stuck_at(snapshot.state, &snapshot.facts), summary, snapshot }
+        let stuck = stuck_at(snapshot.state, &snapshot.facts);
+        let capabilities = contract::Capabilities::of(snapshot.state);
+        Self {
+            stuck_at: stuck,
+            summary,
+            capabilities,
+            readiness: None,
+            snapshot,
+        }
     }
 }
 

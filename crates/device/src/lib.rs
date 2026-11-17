@@ -8,8 +8,8 @@
 //! 3. **不依赖 GUI**。本 crate 不引用任何窗口或渲染类型，因此可以在没有窗口的
 //!    情况下完整测试状态机。
 //!
-//! 副作用通过 [Backend] 抽象隔离。M0 用假后端验证状态机；接真模拟器时只替换
-//! 后端实现，actor 与契约不动。
+//! 副作用通过 [contract::Backend] 抽象隔离。actor 与契约不依赖任何具体实现，
+//! 因此同一套状态机可以跑在假后端（无模拟器）与真实后端上。
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -357,24 +357,28 @@ impl Actor {
 
 /// 命令准入规则。返回 Some(wanted) 表示拒绝，并说明需要什么状态。
 ///
-/// 规则只描述「什么状态能做这件事」，不描述怎么做。
+/// 判断取自 [contract::Capabilities]：界面按钮的禁用与这里的准入是同一份
+/// 结果。两侧各写一遍会漂移，而漂移的表现是「按钮能点，点了报错」。
+///
+/// Stop 是幂等的：已停止时再点一次不是错误，也不弹提示。拒绝的是「没有实例
+/// 时停止」，那说明界面与设备域脱节了。
 fn guard(cmd: &Command, state: State) -> Option<&'static str> {
     use State::*;
+    let caps = contract::Capabilities::of(state);
     match cmd {
-        Command::Create { .. } => (state != Absent).then_some("不存在的实例"),
-        Command::Delete => (state != Stopped).then_some("已停止"),
-        Command::Start => (!matches!(state, Stopped | Failed)).then_some("已停止"),
-        // 重复 Stop 是幂等的用户意图：已停止时再点一次不是错误，也不该弹提示。
-        // 无实例时拒绝——那说明界面与设备域脱节了，值得说出来。
+        Command::Create { .. } => (!caps.create).then_some("不存在的实例"),
+        Command::Delete => (!caps.delete).then_some("已停止"),
+        Command::Start => (!caps.start).then_some("已停止"),
         Command::Stop => matches!(state, Absent).then_some("已创建的实例"),
-        // 其余命令都要求系统已经能服务。
-        _ if !state.accepts_stream() => Some("系统就绪"),
-        _ => None,
+        Command::Install { .. } => (!caps.install).then_some("系统就绪"),
+        Command::Uninstall { .. } => (!caps.install).then_some("系统就绪"),
+        Command::Launch { .. } => (!caps.launch_app).then_some("系统就绪"),
+        Command::RefreshApps => (!caps.refresh_apps).then_some("系统就绪"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// 假后端：M0 用，验证状态机而不碰模拟器
+// 假后端：按真实时序推进，验证状态机而不碰模拟器
 // ---------------------------------------------------------------------------
 
 /// 模拟一次启动过程的后端。
