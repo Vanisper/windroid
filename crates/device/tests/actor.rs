@@ -334,3 +334,72 @@ fn delete_requires_stopped() {
     assert!(ack.is_accepted(), "delete when stopped should be accepted: {ack:?}");
     assert_eq!(h.snapshot().state, State::Absent);
 }
+
+/// 硬上限必须真正终止进程并转为 Failed。
+///
+/// 这条之前是缺的，而缺失的后果很实在：只置 boot_stalled 而不杀进程，
+/// 界面会永远停在 Stalled，端口与磁盘被无限期占用——文档写着「防止无限
+/// 占资源」，实现却只是记了个标志。
+#[test]
+fn hard_limit_aborts_and_reports_failure() {
+    let (h, ev) = spawn(
+        id(),
+        FakeBackend::new().stalling(),
+        Timeouts {
+            adb: Duration::from_millis(40),
+            services: Duration::from_millis(40),
+            // 硬上限要明显晚于两层超时：否则 Stalled 会被直接跳过，
+            // 而 Stalled 正是给用户看「卡在哪」的时刻。
+            hard: Duration::from_millis(400),
+        },
+    );
+    h.send(Command::Create {
+        spec: Spec {
+            template: "t".into(),
+            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            disk_bytes: 1,
+        },
+    });
+    h.send(Command::Start);
+
+    // 先确认它确实卡住了（不是启动成功）。
+    until_state(&ev, State::Stalled, Duration::from_secs(5)).expect("stalled");
+
+    // 超过硬上限后必须是 Failed，而不是继续 Stalled。
+    let e = until_state(&ev, State::Failed, Duration::from_secs(5))
+        .expect("超出硬上限后应转 Failed");
+    let Event::StateChanged { facts, .. } = e else { unreachable!() };
+    assert!(facts.aborted, "Failed 必须由 aborted 标记，否则与进程崩溃无法区分");
+    assert!(!facts.process_alive, "硬上限必须真正终止进程");
+
+    // 进程没了，状态推导也要自洽。
+    let snap = h.snapshot();
+    assert_eq!(snap.state, State::of(&snap.facts));
+    assert_eq!(snap.state, State::Failed);
+}
+
+/// 强制终止后仍可重新启动：资源已回收，不是死路。
+#[test]
+fn instance_can_restart_after_abort() {
+    let (h, ev) = spawn(
+        id(),
+        FakeBackend::new().stalling(),
+        Timeouts {
+            adb: Duration::from_millis(30),
+            services: Duration::from_millis(30),
+            hard: Duration::from_millis(90),
+        },
+    );
+    h.send(Command::Create {
+        spec: Spec {
+            template: "t".into(),
+            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            disk_bytes: 1,
+        },
+    });
+    h.send(Command::Start);
+    until_state(&ev, State::Failed, Duration::from_secs(5)).expect("aborted to failed");
+
+    let ack = h.send(Command::Start);
+    assert!(ack.is_accepted(), "Failed 之后应能重新启动: {ack:?}");
+}

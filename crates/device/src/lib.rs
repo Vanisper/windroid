@@ -37,6 +37,12 @@ pub trait Backend: Send + 'static {
     /// 都不是证据（见 docs/架构/02-设备域.md 第七节）。
     fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection>;
 
+    /// 强制终止进程，用于超过硬上限时回收端口与磁盘。
+    ///
+    /// 与 `Stop` 命令的区别：那是用户请求的优雅停止，这是系统为避免无限期
+    /// 占用资源而做出的决定。实现应尽快终止，不做清理等待。
+    fn abort(&mut self, facts: &mut Facts);
+
     /// 观测当前事实，就地更新。
     ///
     /// actor 每次循环调用一次。真实实现会在这里看进程是否存活、adb devices、
@@ -196,6 +202,8 @@ pub fn spawn<B: Backend>(id: InstanceId, mut backend: B, timeouts: Timeouts) -> 
                 timeouts,
                 shared,
                 events: ev_tx,
+                aborted_once: false,
+                pending_abort: false,
             };
             actor.run(rx, &mut backend);
         })
@@ -216,6 +224,11 @@ struct Actor {
     timeouts: Timeouts,
     shared: Arc<Shared>,
     events: Sender<Event>,
+    /// 已因硬上限强制终止过，避免重复触发。
+    aborted_once: bool,
+    /// 本轮需要调用后端终止。放在字段里而不是当场调用：`apply_timeouts`
+    /// 只读 `&mut self`，需要 `&mut B` 才能碰副作用。
+    pending_abort: bool,
 }
 
 impl Actor {
@@ -224,6 +237,11 @@ impl Actor {
             // 1) 观测事实。这是状态的唯一输入。
             backend.observe(&mut self.facts);
             self.apply_timeouts();
+            // 终止必须发生在观测之后：先看到最新事实，再决定收手。
+            if std::mem::take(&mut self.pending_abort) {
+                backend.abort(&mut self.facts);
+                backend.observe(&mut self.facts);
+            }
             self.publish_state();
 
             // 2) 等命令，同时保持观测节奏。
@@ -253,14 +271,24 @@ impl Actor {
             return;
         }
         let waited = start.elapsed();
+
+        // 硬上限是最后一道闸：到点必须真正终止，否则端口与磁盘被无限期占用。
+        // 只置 boot_stalled 而不杀进程，等于把「防止无限占用」写成了一句注释。
+        if waited >= self.timeouts.hard && !self.aborted_once {
+            self.aborted_once = true;
+            self.facts.aborted = true;
+            self.pending_abort = true;
+            log::warn!("device {} 启动超过硬上限，强制终止", self.id);
+        }
+
         // 两层超时收敛到同一个事实，但诊断阶段不同：
         // 未到 adb 超时前卡在 waiting-adb，之后卡在服务层。
         let stalled = if self.facts.adb_visible {
             waited >= self.timeouts.services
         } else {
             waited >= self.timeouts.adb
-        } || waited >= self.timeouts.hard;
-        self.facts.boot_stalled = stalled;
+        };
+        self.facts.boot_stalled = stalled && !self.aborted_once;
     }
 
     fn handle_command<B: Backend>(&mut self, cmd: &Command, backend: &mut B) -> Ack {
@@ -352,8 +380,9 @@ fn guard(cmd: &Command, state: State) -> Option<&'static str> {
         Command::Create { .. } => (state != Absent).then_some("不存在的实例"),
         Command::Delete => (state != Stopped).then_some("已停止"),
         Command::Start => (!matches!(state, Stopped | Failed)).then_some("已停止"),
-        // 重复 Stop 是幂等的用户意图，不该报错；但 Stopping 时不重复执行。
-        Command::Stop => (!matches!(state, Starting | Stalled | Ready | Streaming)).then_some("运行中"),
+        // 重复 Stop 是幂等的用户意图：已停止时再点一次不是错误，也不该弹提示。
+        // 无实例时拒绝——那说明界面与设备域脱节了，值得说出来。
+        Command::Stop => matches!(state, Absent).then_some("已创建的实例"),
         // 其余命令都要求系统已经能服务。
         _ if !state.accepts_stream() => Some("系统就绪"),
         _ => None,
@@ -447,6 +476,16 @@ impl Backend for FakeBackend {
             Command::RefreshApps | Command::Install { .. } | Command::Uninstall { .. } | Command::Launch { .. } => {}
         }
         Ok(())
+    }
+
+    fn abort(&mut self, facts: &mut Facts) {
+        // 强制终止：不走优雅流程，直接让进程消失。
+        facts.process_alive = false;
+        facts.adb_visible = false;
+        facts.services = Default::default();
+        facts.boot_completed = false;
+        facts.session_count = 0;
+        self.step = 0;
     }
 
     fn observe(&mut self, facts: &mut Facts) {

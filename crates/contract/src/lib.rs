@@ -119,6 +119,11 @@ pub struct Facts {
     pub stop_requested: bool,
     /// 启动等待已超过第二层超时。
     pub boot_stalled: bool,
+    /// 超过硬上限后已被强制终止。
+    ///
+    /// 与 `stop_requested` 分开：那是用户的意图，这是系统的决定。两者都导致
+    /// 进程不再存活，但前者是 `Stopped`（预期），后者是 `Failed`（需告知用户）。
+    pub aborted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +162,13 @@ impl State {
             return State::Absent;
         }
         if !f.process_alive {
-            // 从未启动过不是失败；请求停止后退出是预期行为。
-            return if !f.ever_launched || f.stop_requested {
-                State::Stopped
-            } else {
+            // 硬上限触发的终止是失败：用户等了几分钟，必须知道它没成功，
+            // 而不是看到「已停止」以为一切正常。
+            // 其余情形：从未启动过不是失败；请求停止后退出是预期行为。
+            return if f.aborted || (f.ever_launched && !f.stop_requested) {
                 State::Failed
+            } else {
+                State::Stopped
             };
         }
         if f.stop_requested {
@@ -355,9 +362,10 @@ impl ErrorCode {
             ErrorCode::VersionDowngrade
         } else if s.contains("not enough space") {
             ErrorCode::OutOfSpace
-        } else if s.contains("INSTALL_FAILED_INVALID_APK") || s.contains("code is missing") {
-            ErrorCode::InvalidApk
-        } else if s.contains("INSTALL_PARSE_FAILED_NO_CERTIFICATES") {
+        } else if s.contains("INSTALL_FAILED_INVALID_APK")
+            || s.contains("code is missing")
+            || s.contains("INSTALL_PARSE_FAILED_NO_CERTIFICATES")
+        {
             ErrorCode::InvalidApk
         } else if s.contains("DELETE_FAILED_INTERNAL_ERROR") {
             ErrorCode::PackageNotFound
