@@ -48,7 +48,7 @@ WINDROID_REAL=1 WINDROID_PORT=5554 cargo run -p windroid
 ```
 
 可选环境变量：`WINDROID_AVD`（AVD 名）、`WINDROID_EMULATOR`、`WINDROID_ADB`、
-`WINDROID_SERVER_JAR`、`WINDROID_HOME`。
+`WINDROID_SERVER_JAR`、`WINDROID_HOME`、`WINDROID_GPU`（默认 `host`）。
 
 `app/.nsh/` 是生成物，不入库。首次检出后先跑一次 `nsh check app`：其中的
 类型声明 `.nsh/types` 决定了编辑器能否解析 `from "nsh"`，缺了会导致满屏
