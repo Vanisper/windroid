@@ -15,7 +15,6 @@ contract = { path = "../crates/contract" }
 device = { path = "../crates/device" }
 host = { path = "../crates/host" }
 runtime = { path = "../crates/runtime" }
-stream = { path = "../crates/stream" }
 nsh-core = "0.5"
 nsh-platform-macos = "0.5"
 log = "0.4"

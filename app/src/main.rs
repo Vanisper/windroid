@@ -7,8 +7,6 @@
 
 use std::path::PathBuf;
 
-mod streaming;
-
 use contract::{Backend, InstanceId};
 use device::spawn;
 use host::surface::{CloseIntent, Window};
@@ -29,10 +27,6 @@ fn main() {
         CloseIntent::Close
     }));
 
-    // 视频表面：帧由后台流线程写入槽位，界面驱动上传。
-    let slot = host::video::frame_slot();
-    window.register_video(&slot, mtm);
-
     // 设备域。用真实模拟器还是假后端由环境决定——见 choose_backend。
     let serial = runtime::serial_for(
         std::env::var("WINDROID_PORT")
@@ -42,7 +36,7 @@ fn main() {
     );
     let (handle, events) = spawn(
         InstanceId::new("dev-1"),
-        serial.clone(),
+        serial,
         choose_backend(),
         device::Timeouts::default(),
     );
@@ -60,33 +54,10 @@ fn main() {
         }
     }
 
-    // 开了 `WINDROID_REAL` 就直接把流接上：M1a 要验证的是「真实画面进我们的
-    // 窗口」，不是「点击流程」。UI 驱动流启动属于 M1b。
-    let _stream = if std::env::var_os("WINDROID_REAL").is_some() {
-        // 必须复用注册给表面的那个槽位。新建一个等于把帧写进没人读的地方，
-        // 表现为「流已连接、解码在跑、窗口始终黑屏」。
-        match streaming::Stream::start(serial.clone(), std::sync::Arc::clone(&slot), 27186) {
-            Ok(s) => {
-                eprintln!("[stream] 已连接 {}", s.url);
-                Some(s)
-            }
-            Err(e) => {
-                eprintln!("[stream] 连接失败: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     window.show(mtm);
 
-    // 帧上传由主线程定时器驱动，而不是由界面驱动。
-    //
-    // 界面驱动存在的问题是：界面不知道帧的节奏，只能猜一个间隔，猜大了掉帧、
-    // 猜小了空转。用 16ms（约 60Hz）轮询槽位：没有新帧时它只做一次 Option
-    // 检查，代价可以忽略；有新帧就上传。
-    host::video::start_pump();
+    // 视频流只在设备视图或应用窗口存在时启动。应用库不拉流：
+    // 后台解码一段没有界面消费的视频只会占用 CPU 与设备编码器。
 
     // 事件转发线程与 actor 都在后台跑；主线程交给 AppKit 事件循环。
     app.run();
