@@ -71,6 +71,42 @@ struct ViewState {
     task_errors: BTreeMap<String, String>,
 }
 
+impl ViewState {
+    fn write_running(&self, out: &mut JsonValue, snap: &Snapshot) {
+        let id = snap.id.as_str();
+        let tasks = self.tasks.get(id);
+        out["running"] = snap
+            .apps
+            .iter()
+            .filter(|app| app.launcher)
+            .filter_map(|app| {
+                let package = app.package.as_str();
+                let window_open = self.open.contains(&(id.into(), Some(package.into())));
+                (window_open || tasks.is_some_and(|tasks| tasks.contains(package))).then(|| {
+                    json!({
+                        "instanceId": id, "package": package,
+                        "label": app.label.as_deref().unwrap_or(package), "windowOpen": window_open
+                    })
+                })
+            })
+            .collect();
+
+        // 任务栈非空时，要等 LAUNCHER 清单核实哪些包能恢复。两者的读取顺序不固定。
+        let needs_catalog = tasks.is_some_and(|tasks| !tasks.is_empty());
+        let catalog_error = match &snap.catalog_status {
+            contract::CatalogStatus::Failed { message } if needs_catalog => {
+                Some(format!("应用列表读取失败 · {message}"))
+            }
+            _ => None,
+        };
+        out["runningError"] = json!(self.task_errors.get(id).or(catalog_error.as_ref()));
+        out["tasksLoaded"] = json!(
+            tasks.is_some()
+                && (!needs_catalog || snap.catalog_status == contract::CatalogStatus::Ready)
+        );
+    }
+}
+
 pub struct Library {
     layout: Layout,
     recommended_template: &'static str,
@@ -368,13 +404,7 @@ impl Library {
             .or_else(|| state.operations.get(""))
             .cloned()
             .unwrap_or_default();
-        out["running"] = snap.apps.iter().filter(|a|a.launcher).filter_map(|a| {
-            let package=a.package.as_str();
-            let window_open=state.open.contains(&(id.clone(),Some(package.into())));
-            (window_open || state.tasks.get(&id).is_some_and(|tasks|tasks.contains(package))).then(||json!({"instanceId":id,"package":package,"label":a.label.as_deref().unwrap_or(package),"windowOpen":window_open}))
-        }).collect();
-        out["runningError"] = json!(state.task_errors.get(&id));
-        out["tasksLoaded"] = json!(state.tasks.contains_key(&id));
+        state.write_running(&mut out, &snap);
         out["preparation"] = preparation;
         if let Some(runtime) = &self.runtime {
             let paths = runtime.paths();

@@ -156,6 +156,49 @@ fn same_package_windows_close_and_restore_on_the_original_instance() {
 }
 
 #[test]
+fn running_list_waits_for_launcher_classification_and_keeps_cached_rows_on_error() {
+    let (lib, _) = library();
+    let id = create(&lib, "平板");
+    let mut state = lib.state.lock().unwrap();
+    let mut snapshot = state.instances[&id].handle.snapshot();
+    let apps = std::mem::take(&mut snapshot.apps);
+    let mut view = json!({});
+    snapshot.catalog_status = contract::CatalogStatus::Pending;
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], false);
+
+    state.tasks.insert(id.clone(), BTreeSet::new());
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], true);
+    assert_eq!(view["running"], json!([]));
+    state
+        .tasks
+        .get_mut(&id)
+        .unwrap()
+        .insert("com.example.reader".into());
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], false);
+    assert!(view["runningError"].is_null());
+
+    snapshot.apps = apps;
+    snapshot.catalog_status = contract::CatalogStatus::Ready;
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], true);
+    assert_eq!(view["running"][0]["package"], "com.example.reader");
+    snapshot.catalog_status = contract::CatalogStatus::Failed {
+        message: "缺少包索引".into(),
+    };
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], false);
+    assert_eq!(view["runningError"], "应用列表读取失败 · 缺少包索引");
+    assert_eq!(view["running"][0]["package"], "com.example.reader");
+    state.task_errors.insert(id, "读取活动栈超时".into());
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["runningError"], "读取活动栈超时");
+    assert_eq!(view["running"][0]["package"], "com.example.reader");
+}
+
+#[test]
 fn deleting_a_group_restores_source_without_affecting_another_instance() {
     let (lib, _) = library();
     let id = create(&lib, "主机");
