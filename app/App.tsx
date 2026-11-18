@@ -494,7 +494,7 @@ function Library(props: {
   if (props.groups.length === 0) {
     const hint =
       props.state === "ready" || props.state === "streaming"
-        ? "此实例没有可显示的应用。"
+        ? "正在读取应用清单…"
         : "启动实例后在此查看应用。";
     return (
       <View

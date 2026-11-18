@@ -9,3 +9,5 @@ description = "运行环境域：实例目录、模拟器进程、adb 就绪判�
 [dependencies]
 contract = { path = "../contract" }
 adb = { path = "../adb" }
+
+log = "0.4"

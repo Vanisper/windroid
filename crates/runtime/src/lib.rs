@@ -77,6 +77,11 @@ pub struct EmulatorBackend {
     apps: Vec<contract::AppEntry>,
     /// 清单是否需要在下次可读时刷新。
     apps_dirty: bool,
+    /// 清单读取失败后的下次重试时刻。
+    ///
+    /// 失败不能清除 dirty，否则一次早期失败会让列表永远为空；也不能每个
+    /// 观测周期立刻重试，否则持续的 adb 故障会变成高频外部调用。
+    apps_retry_at: Option<Instant>,
     /// 应用展示名缓存。
     labels: labels::Labels,
     /// 桌面状态缓存，与清单一并刷新。
@@ -101,6 +106,7 @@ impl EmulatorBackend {
             created: false,
             apps: Vec::new(),
             apps_dirty: true,
+            apps_retry_at: None,
             adopted: false,
             labels: labels::Labels::new(&layout_cache),
             desktop: contract::Desktop::default(),
@@ -109,6 +115,34 @@ impl EmulatorBackend {
 
     pub fn serial(&self) -> String {
         serial_for(self.port)
+    }
+
+    /// 读取应用清单、展示名与桌面状态。
+    ///
+    /// 三项必须一起更新：界面用它们共同派生每个应用可执行的操作。
+    fn refresh_catalog(&mut self, serial: &str) -> Result<(), String> {
+        let mut apps = catalog::snapshot(serial)?;
+        // package 服务已注册不代表包索引已构建完成。启动早期 pm 可能成功
+        // 返回空集合；把空集合当成有效结果会让清单永久停在那里。
+        // 正常 Android 至少有系统桌面与设置，因此空集合应按暂未就绪重试。
+        if apps.is_empty() {
+            return Err("设备暂未返回应用清单".to_owned());
+        }
+        let pkgs: Vec<String> = apps.iter().map(|a| a.package.to_string()).collect();
+        let labels = self.labels.resolve(serial, &pkgs);
+        for app in &mut apps {
+            app.label = labels.get(app.package.as_str()).cloned();
+        }
+        let desktop = catalog::home_state(serial).map(|h| contract::Desktop {
+            candidates: h.candidates.iter().map(contract::PackageName::new).collect(),
+            default: h.default.as_deref().map(contract::PackageName::new),
+        })?;
+        self.apps = apps;
+        self.desktop = desktop;
+        log::debug!("应用清单已刷新: {} 个应用", self.apps.len());
+        self.apps_dirty = false;
+        self.apps_retry_at = None;
+        Ok(())
     }
 
     /// 模拟器可执行文件。
@@ -155,6 +189,11 @@ impl EmulatorBackend {
             .arg("-port")
             .arg(self.port.to_string())
             .args(["-no-window", "-no-audio", "-no-boot-anim"])
+            // 无窗口不等于无渲染。AVD 可能配置 hw.gpu.enabled=no，此时
+            // Android 仍会用 SwiftShader 在 CPU 上合成 1080p 画面，qemu
+            // 实测可长期占用 7 个核。产品默认使用宿主机 GPU。
+            .arg("-gpu")
+            .arg(std::env::var("WINDROID_GPU").unwrap_or_else(|_| "host".to_owned()))
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?;
@@ -219,13 +258,10 @@ impl Backend for EmulatorBackend {
                 self.stop(facts);
             }
             Cmd::RefreshApps => {
-                self.apps = catalog::snapshot(&self.serial()).map_err(|e| {
-                    Rejection::Error {
-                        code: contract::ErrorCode::AdbFailure,
-                        detail: e,
-                    }
+                self.refresh_catalog(&self.serial()).map_err(|e| Rejection::Error {
+                    code: contract::ErrorCode::AdbFailure,
+                    detail: e,
                 })?;
-                self.apps_dirty = false;
             }
             Cmd::Install { apk_path } => {
                 // 安装结果必须回读。失败要带上分类与原因——「安装失败」
@@ -337,7 +373,10 @@ impl Backend for EmulatorBackend {
         // 这不是宽容，是如实反映：adb 能看到这台设备并且它已经引导完成，
         // 「实例正在运行」就是事实。隐瞒它会让界面显示已停止，而画面就在
         // 旁边正常播放——用户只会认为软件坏了。
-        if !facts.process_alive {
+        // 用户已请求停止时不再接管。接管是为了反映「设备在运行」这个事实，
+        // 而停止途中设备会短暂地仍能应答——此时接管会让状态在 Stopping 与
+        // Ready 之间来回跳，用户看到的是「停了但一直停不下来」。
+        if !facts.process_alive && !facts.stop_requested {
             let serial = self.serial();
             if adb::is_ready(&serial).unwrap_or(false) {
                 facts.process_alive = true;
@@ -359,48 +398,38 @@ impl Backend for EmulatorBackend {
             facts.boot_completed = false;
             return;
         }
-        // 三个核心服务分别探测，因为「哪一个是最后一个就绪的」决定了诊断信息。
-        facts.services.package = adb::shell(&serial, "service check package")
-            .map(|o| o.has("found"))
-            .unwrap_or(false);
-        facts.services.activity = adb::shell(&serial, "service check activity")
-            .map(|o| o.has("found"))
-            .unwrap_or(false);
-        facts.services.window = adb::shell(&serial, "service check window")
-            .map(|o| o.has("found"))
-            .unwrap_or(false);
+        // 服务探测只在还没齐的时候做。
+        //
+        // 三个服务一旦就绪就不会变回未就绪（设备要挂是整台挂，那时
+        // adb_visible 先变假）。每轮都查是三条 adb 命令，而观测在就绪态
+        // 每 500ms 一次——实测这是空闲时的主要 CPU 消耗。
+        if !facts.services.ready() {
+            facts.services.package = adb::shell(&serial, "service check package")
+                .map(|o| o.has("found"))
+                .unwrap_or(false);
+            facts.services.activity = adb::shell(&serial, "service check activity")
+                .map(|o| o.has("found"))
+                .unwrap_or(false);
+            facts.services.window = adb::shell(&serial, "service check window")
+                .map(|o| o.has("found"))
+                .unwrap_or(false);
+        }
         facts.boot_completed = adb::shell(&serial, "getprop sys.boot_completed")
             .map(|o| o.stdout.trim() == "1")
-            .unwrap_or(false);
+            .unwrap_or(!facts.services.ready());
 
         // 设备可用后按需刷新清单。刷新失败不影响状态判定——清单是目录，
         // 不是状态事实。
-        if self.apps_dirty && facts.services.ready() {
-            match catalog::snapshot(&serial) {
-                Ok(mut apps) => {
-                    // 包名对用户没有意义，换成应用自己声明的名字。
-                    let pkgs: Vec<String> =
-                        apps.iter().map(|a| a.package.to_string()).collect();
-                    let labels = self.labels.resolve(&serial, &pkgs);
-                    for a in &mut apps {
-                        a.label = labels.get(a.package.as_str()).cloned();
-                    }
-                    self.apps = apps;
-                    self.desktop = catalog::home_state(&serial)
-                        .map(|h| contract::Desktop {
-                            candidates: h
-                                .candidates
-                                .iter()
-                                .map(contract::PackageName::new)
-                                .collect(),
-                            default: h.default.as_deref().map(contract::PackageName::new),
-                        })
-                        .unwrap_or_default();
-                    self.apps_dirty = false;
-                }
-                // 刷新失败不影响状态判定：清单是目录，不是状态事实。
-                Err(_) => self.apps_dirty = false,
-            }
+        let retry_due = self.apps_retry_at.is_none_or(|at| Instant::now() >= at);
+        if self.apps_dirty
+            && facts.services.ready()
+            && retry_due
+            && let Err(error) = self.refresh_catalog(&serial)
+        {
+            // 清单失败不改变设备状态，但必须保留 dirty 并退避重试。
+            // 清除 dirty 会让一次早期失败变成永久空列表。
+            log::warn!("读取应用清单失败，5 秒后重试: {error}");
+            self.apps_retry_at = Some(Instant::now() + std::time::Duration::from_secs(5));
         }
     }
 }
