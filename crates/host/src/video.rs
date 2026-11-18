@@ -1,121 +1,397 @@
-//! 视频表面：把解码后的帧画进我们自己的窗口。
-//!
-//! 这是整个项目最关键的接缝：画面不是由第三方进程画在它自己的窗口里，
-//! 而是我们接收像素、上传到自己的层、放进自己的视图树。正因如此，
-//! 窗口关闭才能被拦截（见 [crate::surface]）。
-//!
-//! **光有像素不足以显示**：必须有一层把它画到屏幕上。缺了这一步的表现是
-//! 「解码在跑、帧在上传、窗口全黑」——这个坑值得写在这里。
-//!
-//! 显示走 `CALayer.contents` + `CGImage`，不是 Metal 渲染管线。理由是 M1a
-//! 要验证的是「帧能进我们的窗口」，而 Metal 显示需要编译着色器、建管线，
-//! 那是另一件独立的、与窗口所有权无关的风险。先证明前者成立。
-//! 代价是每帧一次 CPU 位图构造（1080p 约 1-2ms），够用但不理想；
-//! 换成 Metal 是 M2 的性能工作。
+//! 单窗视频表面。图层按原比例居中绘制，输入的参照系始终是最后一次成功显示的帧。
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
 
-use nsh_core::JsonValue;
 use nsh_platform_macos::objc2::rc::Retained;
-use nsh_platform_macos::objc2::{MainThreadMarker, MainThreadOnly};
-use nsh_platform_macos::objc2_app_kit::{NSView, NSViewLayerContentsRedrawPolicy};
-use nsh_platform_macos::objc2_foundation::{NSPoint, NSRect, NSSize};
-use nsh_platform_macos::{ComponentContext, NativeComponent};
-use objc2_core_foundation::CFData;
+use nsh_platform_macos::objc2::{
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+};
+use nsh_platform_macos::objc2_app_kit::{
+    NSEvent, NSEventModifierFlags as Mod, NSView, NSViewLayerContentsPlacement,
+    NSViewLayerContentsRedrawPolicy,
+};
+use nsh_platform_macos::objc2_foundation::{
+    NSData, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+};
+use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
     CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
 };
+use objc2_quartz_core::CATransaction;
+use stream::{Frame, InputEvent};
 
-/// 帧的生产端与消费端共享的槽位。
-///
-/// 用 Mutex 而不是无锁结构：帧的写入频率是每秒几十次，锁竞争的代价远小于
-/// 无锁实现带来的一整类正确性问题。
-pub type FrameSlot = Arc<Mutex<Option<stream::Frame>>>;
-
-/// 创建一个帧槽位。解码侧写入，表面侧读取。
-pub fn frame_slot() -> FrameSlot {
-    Arc::new(Mutex::new(None))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pixel {
+    x: i32,
+    y: i32,
+    width: u16,
+    height: u16,
 }
 
-thread_local! {
-    /// 当前活着的表面。帧的节奏只有这一个来源——多个定时器会互相错拍，
-    /// 表现为画面抖动。
-    static SURFACES: RefCell<std::collections::BTreeMap<u64, Rc<RefCell<SurfaceState>>>> =
-        const { RefCell::new(std::collections::BTreeMap::new()) };
-    static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+/// AppKit 报告窗口点，scrcpy 要求左上角原点的编码像素。两侧都按比例换算，
+/// Retina backing scale 因而相消。拖出画面后的 move/up 夹在边缘以结束原手势。
+fn map_pixel(view: (f64, f64), point: (f64, f64), size: (u16, u16), clamp: bool) -> Option<Pixel> {
+    let (vw, vh) = view;
+    let (width, height) = size;
+    let (x, y) = point;
+    if width == 0
+        || height == 0
+        || vw <= 0.0
+        || vh <= 0.0
+        || ![vw, vh, x, y].iter().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    let (w, h) = (f64::from(width), f64::from(height));
+    let scale = (vw / w).min(vh / h);
+    let px = (x - (vw - w * scale) * 0.5) / scale;
+    let py = ((vh - y) - (vh - h * scale) * 0.5) / scale;
+    if !clamp && (px < 0.0 || px >= w || py < 0.0 || py >= h) {
+        return None;
+    }
+    Some(Pixel {
+        x: px.clamp(0.0, w - 1.0) as i32,
+        y: py.clamp(0.0, h - 1.0) as i32,
+        width,
+        height,
+    })
 }
 
-/// 一个表面的可驱动部分。
-struct SurfaceState {
-    slot: FrameSlot,
-    view: Retained<NSView>,
-    uploaded: u64,
+pub struct CanvasState {
+    input: Box<dyn Fn(InputEvent)>,
+    resize: Option<Box<dyn Fn(u16, u16)>>,
+    display_size: DisplayResize,
+    size: Cell<(u16, u16)>,
+    buttons: Cell<u32>,
+    last_pointer: Cell<Option<Pixel>>,
 }
 
-impl SurfaceState {
-    /// 把最新一帧画到视图上。
-    fn upload_latest(&mut self) {
-        let Some(frame) = self.slot.lock().ok().and_then(|mut s| s.take()) else {
-            return;
-        };
-        let (w, h) = (frame.width, frame.height);
-        if w == 0 || h == 0 {
-            return;
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = CanvasState]
+    #[name = "WindroidVideoCanvas"]
+    pub struct Canvas;
+    unsafe impl NSObjectProtocol for Canvas {}
+    impl Canvas {
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool { true }
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool { true }
+        #[unsafe(method(mouseDown:))]
+        fn left_down(&self, event: &NSEvent) { self.pointer(event, 0, 1); }
+        #[unsafe(method(mouseUp:))]
+        fn left_up(&self, event: &NSEvent) { self.pointer(event, 1, 1); }
+        #[unsafe(method(mouseDragged:))]
+        fn left_drag(&self, event: &NSEvent) { self.pointer(event, 2, 1); }
+        #[unsafe(method(rightMouseDown:))]
+        fn right_down(&self, event: &NSEvent) { self.pointer(event, 0, 2); }
+        #[unsafe(method(rightMouseUp:))]
+        fn right_up(&self, event: &NSEvent) { self.pointer(event, 1, 2); }
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_drag(&self, event: &NSEvent) { self.pointer(event, 2, 2); }
+        #[unsafe(method(otherMouseDown:))]
+        fn other_down(&self, event: &NSEvent) { if event.buttonNumber() == 2 { self.pointer(event, 0, 4); } }
+        #[unsafe(method(otherMouseUp:))]
+        fn other_up(&self, event: &NSEvent) { if event.buttonNumber() == 2 { self.pointer(event, 1, 4); } }
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_drag(&self, event: &NSEvent) { if event.buttonNumber() == 2 { self.pointer(event, 2, 4); } }
+        #[unsafe(method(scrollWheel:))]
+        fn scroll(&self, event: &NSEvent) {
+            let Some(p) = self.pixel(event, false) else { return; };
+            let unit = if event.hasPreciseScrollingDeltas() { 10.0 } else { 1.0 };
+            (self.ivars().input)(InputEvent::Scroll { x:p.x, y:p.y, width:p.width, height:p.height,
+                h:(-event.scrollingDeltaX()/unit) as f32, v:(event.scrollingDeltaY()/unit) as f32,
+                buttons:self.ivars().buttons.get() });
         }
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            self.sync_display_size(self.inLiveResize());
+        }
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn backing_changed(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+            self.sync_display_size(self.inLiveResize());
+        }
+        #[unsafe(method(viewDidEndLiveResize))]
+        fn end_live_resize(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
+            self.sync_display_size(false);
+        }
+        #[unsafe(method(performKeyEquivalent:))]
+        fn key_equivalent(&self, event: &NSEvent) -> bool {
+            if event.modifierFlags().contains(Mod::Command) && event.charactersIgnoringModifiers().is_some_and(|s|s.to_string().eq_ignore_ascii_case("w")) {
+                if let Some(window) = self.window() { window.performClose(None); }
+                true
+            } else { unsafe { msg_send![super(self), performKeyEquivalent:event] } }
+        }
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) { self.keyboard(event, true); }
+        #[unsafe(method(keyUp:))]
+        fn key_up(&self, event: &NSEvent) { self.keyboard(event, false); }
+    }
+);
 
-        let Some(image) = make_image(&frame.bytes, w, h) else {
-            return;
-        };
+impl Canvas {
+    pub(crate) fn make(
+        mtm: MainThreadMarker,
+        input: Box<dyn Fn(InputEvent)>,
+        resize: Option<Box<dyn Fn(u16, u16)>>,
+    ) -> Retained<Self> {
+        let allocated = mtm.alloc::<Self>().set_ivars(CanvasState {
+            input,
+            resize,
+            display_size: DisplayResize::default(),
+            size: Cell::new((0, 0)),
+            buttons: Cell::new(0),
+            last_pointer: Cell::new(None),
+        });
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(640.0, 360.0));
+        let view: Retained<Self> = unsafe { msg_send![super(allocated), initWithFrame: rect] };
+        view.setWantsLayer(true);
+        view.setToolTip(Some(&NSString::from_str("Esc 返回，F2 打开 Android 菜单")));
+        view.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::Never);
+        view.setLayerContentsPlacement(NSViewLayerContentsPlacement::ScaleProportionallyToFit);
+        view
+    }
 
+    pub(crate) fn draw_frame(&self, frame: Frame) -> Result<(), String> {
+        let width = u16::try_from(frame.width).map_err(|_| "视频宽度超出控制协议范围")?;
+        let height = u16::try_from(frame.height).map_err(|_| "视频高度超出控制协议范围")?;
+        let image = make_image(frame.bytes, width, height).ok_or("无法建立视频帧图像")?;
+        let layer = self.layer().ok_or("视频图层未挂载")?;
+        // 逐帧替换，不给 contents 附加隐式过渡动画。CALayer 持有该帧直到下一次提交。
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
         unsafe {
-            if let Some(layer) = self.view.layer() {
-                // CGImage 是 CoreFoundation 对象，转成 AnyObject 交给 CALayer。
-                // SAFETY: CGImage 是 CoreFoundation 对象，CALayer.contents 接受它；
-                // 引用在 setContents 返回前保持有效（image 活得比调用久）。
-                let obj: &nsh_platform_macos::objc2::runtime::AnyObject =
-                    &*objc2_core_foundation::CFRetained::as_ptr(&image)
-                        .cast::<nsh_platform_macos::objc2::runtime::AnyObject>()
-                        .as_ptr();
-                layer.setContents(Some(obj));
-            }
+            let ptr =
+                CFRetained::as_ptr(&image).cast::<nsh_platform_macos::objc2::runtime::AnyObject>();
+            layer.setContents(Some(ptr.as_ref()));
         }
+        CATransaction::commit();
+        if self.ivars().size.replace((width, height)) == (0, 0) {
+            // 在首帧到达前，AppKit 可能已把画布从初始尺寸挂载、平铺或缩放到最终位置。
+            self.sync_display_size(self.inLiveResize());
+        }
+        Ok(())
+    }
 
-        self.uploaded += 1;
-        if self.uploaded == 1 || self.uploaded.is_multiple_of(60) {
-            log::info!("视频表面已显示 {} 帧 ({}x{})", self.uploaded, w, h);
+    fn sync_display_size(&self, live: bool) {
+        let state = self.ivars();
+        let Some(resize) = &state.resize else { return };
+        if self.window().is_none() {
+            return;
+        }
+        let backing = self.convertSizeToBacking(self.bounds().size);
+        if let Some(target) = video_size(backing.width, backing.height)
+            && state
+                .display_size
+                .should_send(target, state.size.get(), live)
+        {
+            resize(target.0, target.1);
+        }
+    }
+
+    fn pixel(&self, event: &NSEvent, clamp: bool) -> Option<Pixel> {
+        let bounds = self.bounds();
+        let p = self.convertPoint_fromView(event.locationInWindow(), None);
+        map_pixel(
+            (bounds.size.width, bounds.size.height),
+            (p.x - bounds.origin.x, p.y - bounds.origin.y),
+            self.ivars().size.get(),
+            clamp,
+        )
+    }
+
+    fn pointer(&self, event: &NSEvent, action: u8, button: u32) {
+        let state = self.ivars();
+        let pressed = state.buttons.get();
+        if action != 0 && pressed & button == 0 {
+            return;
+        }
+        let p = self.pixel(event, action != 0).or_else(|| {
+            if action == 1 {
+                state.last_pointer.get()
+            } else {
+                None
+            }
+        });
+        let Some(p) = p else {
+            return;
+        };
+        let buttons = match action {
+            0 => pressed | button,
+            1 => pressed & !button,
+            _ => pressed,
+        };
+        state.buttons.set(buttons);
+        state.last_pointer.set(Some(p));
+        (state.input)(InputEvent::Touch {
+            action,
+            x: p.x,
+            y: p.y,
+            width: p.width,
+            height: p.height,
+            action_button: if action == 2 { 0 } else { button },
+            buttons,
+        });
+    }
+
+    fn keyboard(&self, event: &NSEvent, down: bool) {
+        let flags = event.modifierFlags();
+        let bare = event
+            .charactersIgnoringModifiers()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if flags.contains(Mod::Command) && bare.eq_ignore_ascii_case("w") {
+            if down
+                && !event.isARepeat()
+                && let Some(window) = self.window()
+            {
+                window.performClose(None);
+            }
+            return;
+        }
+        if self.ivars().size.get() == (0, 0) {
+            return;
+        }
+        let raw = event
+            .characters()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let meta_state = if flags.contains(Mod::Shift) { 1 } else { 0 }
+            | if flags.contains(Mod::Option) { 2 } else { 0 }
+            | if flags.contains(Mod::Control) {
+                0x1000
+            } else {
+                0
+            }
+            | if flags.contains(Mod::Command) {
+                0x10000
+            } else {
+                0
+            }
+            | if flags.contains(Mod::CapsLock) {
+                0x100000
+            } else {
+                0
+            };
+        let text = flags.contains(Mod::Option)
+            && !flags.intersects(Mod::Command | Mod::Control)
+            && !raw.is_ascii();
+        let key = android_key(event.keyCode(), &bare).filter(|_| !text);
+        if let Some(keycode) = key {
+            (self.ivars().input)(InputEvent::Key {
+                down,
+                keycode,
+                repeat: u32::from(down && event.isARepeat()),
+                meta_state,
+            });
+        } else if down
+            && !raw.is_empty()
+            && raw
+                .chars()
+                .all(|c| !c.is_control() && !(''..='').contains(&c))
+        {
+            (self.ivars().input)(InputEvent::Text(raw));
         }
     }
 }
 
-/// 把 BGRA 字节构造成 CGImage。
-///
-/// 每次分配新图而不是复用缓冲：CALayer 会持有旧图直到下次替换，
-/// 复用同一块内存会让正在显示的帧被改写，表现为撕裂或花屏。
-fn make_image(bytes: &[u8], width: u32, height: u32) -> Option<objc2_core_foundation::CFRetained<CGImage>> {
-    let data = CFData::from_bytes(bytes);
-    let provider = CGDataProvider::with_cf_data(Some(&data))?;
+/// 方向键等特殊键由硬件码识别，字母与数字按当前键盘布局的字符识别。
+/// Android 键码见 https://developer.android.com/reference/android/view/KeyEvent 。
+fn android_key(hardware: u16, characters: &str) -> Option<u32> {
+    match hardware {
+        36 | 76 => return Some(66),
+        48 => return Some(61),
+        51 => return Some(67),
+        53 => return Some(4),   // Esc → Back
+        120 => return Some(82), // F2 → Menu
+        115 => return Some(122),
+        116 => return Some(92),
+        117 => return Some(112),
+        119 => return Some(123),
+        121 => return Some(93),
+        123 => return Some(21),
+        124 => return Some(22),
+        125 => return Some(20),
+        126 => return Some(19),
+        _ => {}
+    }
+    let [b] = *characters.as_bytes() else {
+        return None;
+    };
+    let b = b.to_ascii_lowercase();
+    Some(match b {
+        b'a'..=b'z' => u32::from(b - b'a') + 29,
+        b'0'..=b'9' => u32::from(b - b'0') + 7,
+        b' ' => 62,
+        b',' => 55,
+        b'.' => 56,
+        b'/' => 76,
+        b';' => 74,
+        b'-' => 69,
+        b'=' => 70,
+        b'[' => 71,
+        b']' => 72,
+        b'\\' => 73,
+        b'\'' => 75,
+        _ => return None,
+    })
+}
 
-    // BGRA 在内存里是 B,G,R,A。小端机上按 u32 读就是 A,R,G,B，
-    // 因此用 32Little + NoneSkipFirst：跳过最高字节，剩下 R,G,B。
-    // 写错的表现是红蓝互换——画面看起来"能显示但有病"。
+#[derive(Default)]
+struct DisplayResize {
+    last_target: Cell<Option<(u16, u16)>>,
+}
+
+impl DisplayResize {
+    fn should_send(&self, target: (u16, u16), wire: (u16, u16), live: bool) -> bool {
+        if live || wire.0 == 0 || wire.1 == 0 {
+            return false;
+        }
+        // 首次对照视频尺寸，以后对照最近的目标。新帧与编码对齐可能滞后于用户连续调窗。
+        self.last_target.replace(Some(target)).unwrap_or(wire) != target
+    }
+}
+
+/// 在 backing 像素空间保持内容比例，限制最长边以控制单会话显存与解码开销。
+fn video_size(width: f64, height: f64) -> Option<(u16, u16)> {
+    if !width.is_finite() || !height.is_finite() || width < 2.0 || height < 2.0 {
+        return None;
+    }
+    let scale = (1920.0 / width.max(height)).min(1.0);
+    let even = |length: f64| ((length * scale).round() as u16 & !1).max(2);
+    Some((even(width), even(height)))
+}
+
+fn make_image(bytes: Vec<u8>, width: u16, height: u16) -> Option<CFRetained<CGImage>> {
+    if width == 0
+        || height == 0
+        || bytes.len()
+            != usize::from(width)
+                .checked_mul(usize::from(height))?
+                .checked_mul(4)?
+    {
+        return None;
+    }
+    // NSData 接管解码器产出的 Vec，由 provider / CGImage 持有到图层替换完成。
+    let data = NSData::from_vec(bytes);
+    let provider = CGDataProvider::with_cf_data(Some((*data).as_ref()))?;
     let bitmap_info = CGBitmapInfo(
         objc2_core_graphics::CGImageByteOrderInfo::Order32Little.0
             | CGImageAlphaInfo::NoneSkipFirst.0,
     );
-    // SAFETY: kCGColorSpaceSRGB 是 CoreGraphics 提供的常量字符串，进程期恒有效。
-    let space = unsafe { CGColorSpace::with_name(Some(objc2_core_graphics::kCGColorSpaceSRGB)) }?;
-
-    // SAFETY: decode 传空指针表示不裁剪；bytes_per_row 与 provider 的数据
-    // 长度一致（width*4 <= bytes.len()），provider 持有数据的强引用。
+    // sRGB 常量与 CoreGraphics 同寿命，provider 持有完整的一帧 BGRA 数据。
     unsafe {
+        let space = CGColorSpace::with_name(Some(objc2_core_graphics::kCGColorSpaceSRGB))?;
         CGImage::new(
             width as usize,
             height as usize,
             8,
             32,
-            (width as usize) * 4,
+            usize::from(width) * 4,
             Some(&space),
             bitmap_info,
             Some(&provider),
@@ -126,181 +402,124 @@ fn make_image(bytes: &[u8], width: u32, height: u32) -> Option<objc2_core_founda
     }
 }
 
-/// 承载视频的 NSView。
-struct VideoSurface {
-    view: Retained<NSView>,
-    _context: ComponentContext,
-    id: u64,
-}
-
-impl NativeComponent for VideoSurface {
-    fn view(&self) -> Retained<NSView> {
-        self.view.clone()
-    }
-
-    fn set_prop(&mut self, _name: &str, _value: Option<&JsonValue>) {}
-
-    fn command(&mut self, name: &str, _args: &JsonValue) {
-        if name == "frame" {
-            let state = SURFACES.with(|m| m.borrow().get(&self.id).cloned());
-            if let Some(state) = state
-                && let Ok(mut s) = state.try_borrow_mut() {
-                    s.upload_latest();
-                }
-        }
-    }
-}
-
-/// 定时器是否在推帧。
-///
-/// 必须是进程级的：写入方是流线程（断开时），读取方是主线程（定时器回调）
-/// 与引擎线程（组装快照）。用 thread_local 会让三方各持一份副本，
-/// 表现为「流断了但定时器还在跑」「状态设了但界面看不到」。
-static PUMPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 界面上显示的流状态。空串表示正常。
-static STREAM_NOTE: Mutex<Option<String>> = Mutex::new(None);
-
-/// 启动主线程定时器。可重复调用，只创建一次。
-///
-/// 必须在主线程调用：AppKit 的视图与 layer 操作都有主线程约束。
-pub fn start_pump() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        // 16ms ≈ 60Hz。比帧率略快，保证不因定时器粒度丢帧。
-        pump_with_interval(0.016);
-        log::info!("视频帧定时器已启动");
-    });
-    set_pumping(true);
-}
-
-/// 开关推帧。流断开时关，重连时开。
-pub fn set_pumping(on: bool) {
-    PUMPING.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 当前是否在推帧。
-pub fn is_pumping() -> bool {
-    PUMPING.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// 设置界面上显示的流状态。None 表示正常。
-///
-/// 流断开必须让用户看见：画面停住而窗口照开，是最容易被误认为「软件卡了」
-/// 的状态。
-pub fn set_stream_note(note: Option<String>) {
-    if let Ok(mut n) = STREAM_NOTE.lock() {
-        *n = note;
-    }
-}
-
-/// 读取当前的流状态。快照组装时调用。
-pub fn stream_note() -> Option<String> {
-    STREAM_NOTE.lock().ok().and_then(|n| n.clone())
-}
-
-fn pump_with_interval(interval: f64) {
-    use std::os::raw::c_void;
-
-    // 回调签名是 (timer, info) 两参。写成单参在多数 ABI 上"能跑"，
-    // 但那是未定义行为——多传的参数被静默丢弃，换个平台就崩。
-    extern "C" fn tick(_timer: *mut c_void, _info: *mut c_void) {
-        pump_frame();
-    }
-
-    #[repr(C)]
-    struct CFRunLoopTimerContext {
-        version: isize,
-        info: *mut c_void,
-        retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
-        release: Option<extern "C" fn(*const c_void)>,
-        copy_description: Option<extern "C" fn(*const c_void) -> *const c_void>,
-    }
-
-    unsafe extern "C" {
-        fn CFRunLoopGetMain() -> *mut c_void;
-        fn CFRunLoopTimerCreate(
-            allocator: *const c_void,
-            fire_date: f64,
-            interval: f64,
-            flags: usize,
-            order: isize,
-            callout: extern "C" fn(*mut c_void, *mut c_void),
-            context: *mut CFRunLoopTimerContext,
-        ) -> *mut c_void;
-        fn CFAbsoluteTimeGetCurrent() -> f64;
-        fn CFRunLoopAddTimer(rl: *mut c_void, timer: *mut c_void, mode: *const c_void);
-        static kCFRunLoopCommonModes: *const c_void;
-    }
-
-    let mut ctx = CFRunLoopTimerContext {
-        version: 0,
-        info: std::ptr::null_mut(),
-        retain: None,
-        release: None,
-        copy_description: None,
-    };
-    unsafe {
-        let timer = CFRunLoopTimerCreate(
-            std::ptr::null(),
-            CFAbsoluteTimeGetCurrent(),
-            interval,
-            0,
-            0,
-            tick,
-            &mut ctx,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn input_maps_displayed_pixels_and_ignores_letterbox() {
+        let view = (400.0, 400.0);
+        assert_eq!(
+            map_pixel(view, (200.0, 200.0), (1920, 1080), false),
+            Some(Pixel {
+                x: 960,
+                y: 540,
+                width: 1920,
+                height: 1080
+            })
         );
-        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        assert_eq!(map_pixel(view, (200.0, 390.0), (1920, 1080), false), None);
+        assert_eq!(
+            map_pixel(view, (-100.0, 0.0), (1920, 1080), true),
+            Some(Pixel {
+                x: 0,
+                y: 1079,
+                width: 1920,
+                height: 1080
+            })
+        );
+        assert_eq!(map_pixel(view, (10.0, 200.0), (1080, 1920), false), None);
+        assert_eq!(
+            map_pixel(view, (200.0, 300.0), (1080, 1920), false),
+            Some(Pixel {
+                x: 540,
+                y: 480,
+                width: 1080,
+                height: 1920
+            })
+        );
+        assert_eq!(map_pixel(view, (200.0, 100.0), (0, 0), false), None);
     }
-}
-
-/// 驱动所有表面各显示一次最新帧。
-pub fn pump_frame() {
-    // 没有流在跑时不做事。检查一个 bool 比遍历表面便宜得多。
-    if !is_pumping() {
-        return;
+    #[test]
+    fn keyboard_preserves_layout_and_android_navigation() {
+        assert_eq!(android_key(0, "Q"), Some(45));
+        assert_eq!(android_key(53, ""), Some(4));
+        assert_eq!(android_key(120, ""), Some(82));
+        assert_eq!(android_key(123, ""), Some(21));
+        assert_eq!(android_key(0, "é"), None);
     }
-    let ids: Vec<u64> = SURFACES.with(|m| m.borrow().keys().copied().collect());
-    for id in ids {
-        let state = SURFACES.with(|m| m.borrow().get(&id).cloned());
-        if let Some(state) = state
-            && let Ok(mut s) = state.try_borrow_mut() {
-                s.upload_latest();
-            }
+    #[test]
+    fn virtual_display_resize_is_even_and_preserves_retina_aspect() {
+        assert_eq!(video_size(3840.0, 2160.0), Some((1920, 1080)));
+        assert_eq!(video_size(721.0, 1280.0), Some((720, 1280)));
+        assert_eq!(video_size(0.0, 100.0), None);
     }
-}
 
-/// 注册名为 `windroid.video` 的原生组件。
-pub fn register(app_view: &nsh_platform_macos::AppView, mtm: MainThreadMarker, slot: FrameSlot) {
-    app_view.register_component(
-        "windroid.video",
-        Rc::new(move |ctx: ComponentContext| create(mtm, &slot, ctx)),
-    );
-}
+    #[test]
+    fn virtual_display_follows_non_live_layout_and_coalesces_live_drag() {
+        let display = DisplayResize::default();
+        let original = (720, 1280);
+        let tiled = (1090, 996);
+        assert!(!display.should_send(tiled, (0, 0), false));
+        // 首帧到达时补发程序调整的最终尺寸。重复布局与仍在途的帧都不产生额外请求。
+        assert!(display.should_send(tiled, original, false));
+        assert!(!display.should_send(tiled, original, false));
+        assert!(!display.should_send((1000, 1100), tiled, true));
+        assert!(!display.should_send(original, tiled, true));
+        assert!(display.should_send(original, original, false));
+        assert!(!display.should_send(original, tiled, false));
 
-fn create(mtm: MainThreadMarker, slot: &FrameSlot, ctx: ComponentContext) -> Box<dyn NativeComponent> {
-    let view = NSView::initWithFrame(
-        NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(640.0, 360.0)),
-    );
-    // wantsLayer 让 AppKit 创建 backing layer；不做这一步，setContents
-    // 无处可放，画面不会出现。
-    view.setWantsLayer(true);
-    // 不去重绘：内容由我们主动推送，让 AppKit 自己再画一遍是浪费。
-    view.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::Never);
+        let initial = DisplayResize::default();
+        assert!(!initial.should_send(original, original, false));
+        assert!(initial.should_send(tiled, original, false));
+    }
 
-    let id = NEXT_ID.with(|n| {
-        let id = n.get();
-        n.set(id + 1);
-        id
-    });
-    let state = Rc::new(RefCell::new(SurfaceState {
-        slot: Arc::clone(slot),
-        view: view.clone(),
-        uploaded: 0,
-    }));
-    SURFACES.with(|m| m.borrow_mut().insert(id, state));
-    log::info!("视频表面已注册 id={id}");
+    #[test]
+    fn core_graphics_roundtrip_preserves_top_and_bottom_rgb_corners() {
+        use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+        use objc2_core_graphics::{
+            CGBitmapContextCreate, CGContext, CGImageByteOrderInfo, kCGColorSpaceSRGB,
+        };
+        // 解码器 BGRA，左上红、右上绿、左下蓝、右下白。读回用大端 RGBA。
+        let image = make_image(
+            vec![
+                0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+            ],
+            2,
+            2,
+        )
+        .unwrap();
+        let mut rgba = [0u8; 16];
+        // context 仅借用本地数组，完成绘制后先释放 context 再核对像素。
+        let space = unsafe { CGColorSpace::with_name(Some(kCGColorSpaceSRGB)) }.unwrap();
+        let ctx = unsafe {
+            CGBitmapContextCreate(
+                rgba.as_mut_ptr().cast(),
+                2,
+                2,
+                8,
+                8,
+                Some(&space),
+                CGImageByteOrderInfo::Order32Big.0 | CGImageAlphaInfo::PremultipliedLast.0,
+            )
+        }
+        .unwrap();
+        CGContext::draw_image(
+            Some(&ctx),
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(2.0, 2.0)),
+            Some(&image),
+        );
+        drop(ctx);
+        assert_eq!(
+            rgba,
+            [
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255
+            ]
+        );
+    }
 
-    Box::new(VideoSurface { view, _context: ctx, id })
+    #[test]
+    fn malformed_frame_is_never_installed() {
+        assert!(make_image(Vec::new(), 0, 1).is_none());
+        assert!(make_image(vec![0; 4], 1920, 1080).is_none());
+    }
 }

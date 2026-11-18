@@ -5,6 +5,7 @@
   "build": 1,
   "capabilities": {
     "host": ["windroid.*"],
+    "openUrl": { "schemes": ["https"] },
     "statusBar": true
   }
 }

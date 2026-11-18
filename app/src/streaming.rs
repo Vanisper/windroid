@@ -1,131 +1,342 @@
-//! 把真实视频流接到窗口上。
-//!
-//! 这条链路跨三个执行上下文：socket 读取与解码在其中两个后台线程，
-//! 帧上传在主线程。它们之间只通过一个「最新帧」槽位相连——不排队、
-//! 不等待，因为视频只关心现在该显示什么。
-//!
-//! 用真实后端还是假后端由环境变量决定，见 [backend]。
+//! 一条窗口对应一条工作线程和一组 socket。关闭信号只触达这条会话。
+//! 主线程取最新帧并投递输入。adb、解码、控制写入与子进程回收均在后台。
 
+use std::collections::VecDeque;
+use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
-use host::video::FrameSlot;
-use stream::{Decoder, Packet};
+use stream::{DisplayTarget, Frame, InputEvent, SessionControl, VideoSession};
 
-/// 一条正在运行的流。Drop 时停掉所有线程并断开连接。
-pub struct Stream {
-    stop: Arc<AtomicBool>,
-    pub url: String,
+pub struct Source {
+    pub adb: PathBuf,
+    pub serial: String,
+    pub jar: PathBuf,
+    pub package: Option<String>,
 }
 
-impl Stream {
-    /// 启动流：推 server、连 socket、起解码与转发的后台线程。
-    pub fn start(serial: String, slot: FrameSlot, local_port: u16) -> Result<Self, String> {
-        let jar = server_jar();
-        stream::launch_server(&serial, local_port, &jar)
-            .map_err(|e| format!("启动 scrcpy-server 失败: {e}"))?;
+pub enum Notice {
+    Connected(u32),
+    FrameReady,
+    Ended(Result<(), String>),
+}
 
-        // server 需要一点时间开始监听。轮询比固定 sleep 更可靠：
-        // 冷启动与热启动的差别可以是几秒。
-        let mut socket = None;
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut last_err = String::new();
-        while std::time::Instant::now() < deadline {
-            match stream::VideoSocket::connect(local_port, true) {
-                Ok(s) => {
-                    socket = Some(s);
-                    break;
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    std::thread::sleep(Duration::from_millis(200));
-                }
+#[derive(Default)]
+struct Latest(Mutex<Option<Frame>>);
+
+impl Latest {
+    /// 槽位从空变为非空时才唤醒主线程。积压的帧会被新帧覆盖。
+    fn publish(&self, frame: Frame) -> bool {
+        self.0.lock().unwrap().replace(frame).is_none()
+    }
+    fn take(&self) -> Option<Frame> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+const MAX_INPUT: usize = 128;
+
+#[derive(Default)]
+struct Pending {
+    events: VecDeque<InputEvent>,
+    resize: Option<(u16, u16)>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct InputQueue {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+
+enum Outgoing {
+    Event(InputEvent),
+    Resize(u16, u16),
+}
+
+fn is_move(event: &InputEvent) -> bool {
+    matches!(event, InputEvent::Touch { action: 2, .. })
+}
+
+impl InputQueue {
+    fn push(&self, event: InputEvent) -> Result<(), ()> {
+        let mut q = self.pending.lock().unwrap();
+        if q.closed {
+            return Ok(());
+        }
+        // 每条队列只有一只鼠标。相邻移动可合并，按下/释放和键盘事件必须保序。
+        if is_move(&event) && q.events.back().is_some_and(is_move) {
+            q.events.pop_back();
+        }
+        if q.events.len() == MAX_INPUT {
+            if is_move(&event) {
+                return Ok(());
+            }
+            if let Some(i) = q.events.iter().position(is_move) {
+                q.events.remove(i);
+            } else {
+                return Err(());
             }
         }
-        let mut socket = socket.ok_or_else(|| format!("连接视频端口失败: {last_err}"))?;
-
-        let (w, h) = socket.size;
-        let decoder = Decoder::spawn(w, h).map_err(|e| format!("启动解码器失败: {e}"))?;
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
-        let url = format!("{serial}/{w}x{h}");
-        host::video::set_stream_note(None);
-
-        std::thread::Builder::new()
-            .name("stream-reader".to_owned())
-            .spawn(move || {
-                let mut decoder = decoder;
-                // config 帧必须前置拼接到下一个媒体帧：单独送给解码器没有
-                // SPS/PPS 可解，表现为「连上了但永远黑屏」。
-                let mut pending_config: Option<Vec<u8>> = None;
-
-
-                while !stop_for_thread.load(Ordering::Relaxed) {
-                    match socket.next_packet() {
-                        Ok(Some(Packet::Session(_))) => continue,
-                        Ok(Some(Packet::Media { data, config, .. })) => {
-                            if config {
-                                pending_config = Some(data);
-                                continue;
-                            }
-                            // 不合并成 let-chain：这是一个有独立含义的步骤
-                            // （把暂存的 SPS/PPS 先送进去），嵌套读起来更清楚
-                            // 它和下面的「送媒体帧」是两件事。
-                            #[allow(clippy::collapsible_if)]
-                            if let Some(cfg) = pending_config.take() {
-                                if decoder.feed(&cfg).is_err() {
-                                    break;
-                                }
-                            }
-                            if decoder.feed(&data).is_err() {
-                                break;
-                            }
-                        }
-                        // 画面静止时 scrcpy 不发帧。这不是错误。
-                        Ok(None) => continue,
-                        Err(e) => {
-                            log::warn!("视频流中断: {e}");
-                            break;
-                        }
-                    }
-
-                    // 把已解出的帧放进槽位。只保留最新一帧：旧帧没有价值，
-                    // 堆积只会让画面越来越滞后。
-                    while let Some(frame) = decoder.try_next() {
-                        if let Ok(mut s) = slot.lock() {
-                            *s = Some(frame);
-                        }
-                    }
-                }
-                socket.shutdown();
-                // 断开后停掉推帧并让用户看见。不停的话定时器会以 60Hz
-                // 空转下去，而画面停在最后一帧、窗口照开——看起来像卡死。
-                host::video::set_pumping(false);
-                host::video::set_stream_note(Some("视频流已断开".to_owned()));
-                // 界面只在收到事件时重取快照。不通知的话，提示永远不会出现。
-                host::notify();
+        q.events.push_back(event);
+        self.ready.notify_one();
+        Ok(())
+    }
+    fn resize(&self, width: u16, height: u16) {
+        let mut q = self.pending.lock().unwrap();
+        if !q.closed {
+            q.resize = Some((width, height));
+            self.ready.notify_one();
+        }
+    }
+    fn next(&self) -> Option<Outgoing> {
+        let mut q = self
+            .ready
+            .wait_while(self.pending.lock().unwrap(), |q| {
+                q.events.is_empty() && q.resize.is_none() && !q.closed
             })
-            .map_err(|e| format!("启动流线程失败: {e}"))?;
-
-        Ok(Self { stop, url })
+            .unwrap();
+        q.events
+            .pop_front()
+            .map(Outgoing::Event)
+            .or_else(|| q.resize.take().map(|(w, h)| Outgoing::Resize(w, h)))
+    }
+    fn close(&self) {
+        let mut q = self.pending.lock().unwrap();
+        q.closed = true;
+        q.events.clear();
+        q.resize = None;
+        self.ready.notify_all();
     }
 }
 
-impl Drop for Stream {
+#[derive(Default)]
+struct Connection {
+    stopped: AtomicBool,
+    socket: Mutex<Option<SessionControl>>,
+    failure: Mutex<Option<String>>,
+}
+
+impl Connection {
+    fn attach(&self, control: SessionControl) -> bool {
+        let mut socket = self.socket.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) {
+            control.shutdown();
+            return false;
+        }
+        *socket = Some(control);
+        true
+    }
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(control) = self.socket.lock().unwrap().take() {
+            control.shutdown();
+        }
+    }
+    fn fail(&self, message: String) {
+        self.failure.lock().unwrap().get_or_insert(message);
+        self.stop();
+    }
+}
+
+pub struct Worker {
+    connection: Arc<Connection>,
+    input: Arc<InputQueue>,
+    latest: Arc<Latest>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    pub fn spawn(
+        source: Source,
+        report: impl Fn(Notice) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let connection = Arc::new(Connection::default());
+        let input = Arc::new(InputQueue::default());
+        let latest = Arc::new(Latest::default());
+        let (conn, events, frames) = (connection.clone(), input.clone(), latest.clone());
+        let report = Arc::new(report);
+        let thread = thread::Builder::new()
+            .name("windroid-viewport".into())
+            .spawn(move || {
+                let run = || -> io::Result<()> {
+                    if conn.stopped.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let target = match source.package {
+                        Some(package) => DisplayTarget::App { package },
+                        None => DisplayTarget::Device,
+                    };
+                    let session = VideoSession::start_cancellable(
+                        &source.adb,
+                        &source.serial,
+                        &source.jar,
+                        target,
+                        || conn.stopped.load(Ordering::Acquire),
+                    )?;
+                    let control = session.control();
+                    // 用户可能在推送 jar 或握手时已关窗。
+                    if !conn.attach(control.clone()) {
+                        return Ok(());
+                    }
+                    report(Notice::Connected(session.display_id()));
+                    let (outgoing, writer_conn) = (events.clone(), conn.clone());
+                    let writer =
+                        thread::Builder::new()
+                            .name("windroid-input".into())
+                            .spawn(move || {
+                                while let Some(event) = outgoing.next() {
+                                    let sent = match event {
+                                        Outgoing::Event(input) => control.send(input),
+                                        Outgoing::Resize(w, h) => control.resize(w, h),
+                                    };
+                                    if let Err(error) = sent {
+                                        if !writer_conn.stopped.load(Ordering::Acquire) {
+                                            writer_conn.fail(format!("输入通道已断开：{error}"));
+                                        }
+                                        break;
+                                    }
+                                }
+                            })?;
+                    let (notify_frame, alive) = (report.clone(), conn.clone());
+                    let result = session.run(move |frame| {
+                        if !alive.stopped.load(Ordering::Acquire) && frames.publish(frame) {
+                            notify_frame(Notice::FrameReady);
+                        }
+                    });
+                    events.close();
+                    conn.stop();
+                    let _ = writer.join();
+                    result
+                };
+                let result = run().map_err(|err| err.to_string());
+                conn.stop();
+                events.close();
+                let result = conn.failure.lock().unwrap().take().map_or(result, Err);
+                report(Notice::Ended(result));
+            })?;
+        Ok(Self {
+            connection,
+            input,
+            latest,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn input_handler(&self) -> Box<dyn Fn(InputEvent)> {
+        let (input, connection) = (self.input.clone(), self.connection.clone());
+        Box::new(move |event| {
+            if input.push(event).is_err() {
+                input.close();
+                connection.fail("设备未及时接收输入，请重新打开窗口".into());
+            }
+        })
+    }
+
+    pub fn resize_handler(&self) -> Box<dyn Fn(u16, u16)> {
+        let queue = self.input.clone();
+        Box::new(move |width, height| queue.resize(width, height))
+    }
+
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.latest.take()
+    }
+
+    pub fn cancel(&self) {
+        self.connection.stop();
+        self.input.close();
+        self.latest.take();
+    }
+
+    /// 只在工作线程报告清理完毕，或 AppKit 事件循环已经退出时使用。
+    pub fn join(mut self) {
+        self.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Worker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.cancel();
     }
 }
 
-/// scrcpy-server jar 的位置。
-///
-/// M1a 先从系统安装的 scrcpy 取。生产版本应随 app 分发固定版本的 jar，
-/// 因为 server 与 client 的版本必须严格相等（协议没有版本协商）。
-fn server_jar() -> String {
-    if let Ok(p) = std::env::var("WINDROID_SERVER_JAR") {
-        return p;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(byte: u8) -> Frame {
+        Frame {
+            bytes: vec![byte; 4],
+            width: 1,
+            height: 1,
+        }
     }
-    "/opt/homebrew/Cellar/scrcpy/5.0.1/share/scrcpy/scrcpy-server".to_owned()
+    fn touch(action: u8, x: i32) -> InputEvent {
+        InputEvent::Touch {
+            action,
+            x,
+            y: 0,
+            width: 100,
+            height: 80,
+            action_button: 1,
+            buttons: 1,
+        }
+    }
+
+    #[test]
+    fn each_viewport_owns_a_single_latest_frame_and_wakeup() {
+        let (a, b) = (Latest::default(), Latest::default());
+        assert!(a.publish(frame(1)));
+        assert!(!a.publish(frame(2)));
+        assert!(b.publish(frame(3)));
+        assert_eq!(b.take().unwrap().bytes[0], 3);
+        assert_eq!(a.take().unwrap().bytes[0], 2);
+        assert!(a.take().is_none());
+        assert!(a.publish(frame(4)));
+    }
+    #[test]
+    fn motion_coalesces_between_a_down_and_its_release() {
+        let q = InputQueue::default();
+        for e in [touch(0, 0), touch(2, 10), touch(2, 20), touch(1, 20)] {
+            q.push(e).unwrap();
+        }
+        for (action, x) in [(0, 0), (2, 20), (1, 20)] {
+            assert!(
+                matches!(q.next(),Some(Outgoing::Event(InputEvent::Touch{action:a,x:b,..})) if (a,b)==(action,x))
+            );
+        }
+        q.close();
+        assert!(q.next().is_none());
+    }
+    #[test]
+    fn resize_keeps_only_latest_request_and_uses_its_own_queue() {
+        let app = InputQueue::default();
+        let device = InputQueue::default();
+        app.resize(720, 1280);
+        app.resize(1024, 768);
+        assert!(matches!(app.next(), Some(Outgoing::Resize(1024, 768))));
+        device.close();
+        assert!(device.next().is_none());
+    }
+
+    #[test]
+    fn stalled_control_fails_explicitly_and_shutdown_wakes_reader() {
+        let q = Arc::new(InputQueue::default());
+        for _ in 0..MAX_INPUT {
+            q.push(touch(0, 0)).unwrap();
+        }
+        assert!(q.push(touch(1, 0)).is_err());
+        q.close();
+        assert!(q.next().is_none());
+        let other = Arc::new(InputQueue::default());
+        let reader = other.clone();
+        let waiting = thread::spawn(move || reader.next());
+        other.close();
+        assert!(waiting.join().unwrap().is_none());
+    }
 }

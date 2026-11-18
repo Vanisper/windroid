@@ -1,206 +1,767 @@
-//! TSX 界面的集成测试：TSX → Rust 命令 → 设备域 → Rust 事件 → TSX。
-//!
-//! 这条链路跨三种执行环境：QuickJS 里的界面、Rust 的 actor 线程、nsh 引擎线程。
-//! 单测覆盖不到它们的交界，因此这里的价值在交界处。
-//!
-//! 用 nsh-testing 而不是真实窗口：界面行为与窗口无关，而窗口需要主线程，
-//! 两者放一起会让测试既慢又难定位。
+//! 原生应用库的无窗交互测试。生产 TSX、宿主桥和 Fake actor 走同一条命令与事件链。
+//! 许可和下载用内存回执控制各个阶段，测试不会下载组件或修改用户的实例。
 
-use contract::{Command, Image, InstanceId, Spec, State};
+use contract::{Ack, Command, ErrorCode, Image, InstanceId, Rejection, Spec};
 use device::FakeBackend;
-use nsh_engine::EngineConfig;
+use host::surface::{WindowCommand, WindowEvent};
+use nsh_core::{
+    Points, Size,
+    platform::{Idiom, Os},
+};
+use nsh_engine::{Bundle, EngineConfig, HostChannel};
 use nsh_testing::Headless;
-use std::path::PathBuf;
-use std::time::Duration;
+use serde_json::{Value, json};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    time::Duration,
+};
 
-fn app_dir() -> PathBuf {
-    // crates/host → crates → 工作区根，然后取 app。
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .join("app")
+const WAIT: Duration = Duration::from_secs(8);
+const READER: &str = "com.example.reader";
+
+fn config() -> EngineConfig {
+    static BUNDLE: OnceLock<Bundle> = OnceLock::new();
+    let sets = vec![nsh_base::registry()];
+    let bundle = BUNDLE.get_or_init(|| {
+        let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/App.tsx");
+        nsh_testing::compile_tsx(entry, &sets).expect("编译应用与原生控件")
+    });
+    let mut config = EngineConfig::new(bundle.clone());
+    config.ui_sets = sets;
+    config.viewport = Size::new(Points(1024.0), Points(900.0));
+    config.environment.window = config.viewport;
+    config.environment.os = Os::MacOs;
+    config.environment.idiom = Idiom::Desktop;
+    config
 }
 
-/// 启动一个带设备域的 headless 界面。
-fn start(backend: FakeBackend) -> (Headless, device::Handle) {
+fn render(config: EngineConfig) -> Headless {
+    let mut app = Headless::start(config).expect("启动应用库");
+    app.first_render().expect("首帧");
+    app
+}
+
+fn wait(app: &mut Headless, selector: &str) {
+    app.wait_for_within(selector, WAIT)
+        .unwrap_or_else(|e| panic!("{selector}: {e}"));
+}
+
+fn gone(app: &mut Headless, selector: &str) {
+    app.wait_for_gone(selector, WAIT)
+        .unwrap_or_else(|e| panic!("{selector}: {e}"));
+}
+
+fn press(app: &mut Headless, id: &str) {
+    app.press(&format!("id:{id}"))
+        .unwrap_or_else(|e| panic!("{id}: {e}"));
+}
+
+fn choose(app: &mut Headless, label: &str) {
+    app.choose_menu_item(label)
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+}
+
+struct LibraryUi {
+    app: Headless,
+    library: Arc<host::Library>,
+    windows: mpsc::Receiver<WindowCommand>,
+    events: mpsc::Sender<WindowEvent>,
+}
+
+impl LibraryUi {
+    fn new() -> Self {
+        let config = config();
+        let (tx, windows) = mpsc::channel();
+        let (events, rx) = mpsc::channel();
+        let library = host::Library::attach(
+            config.host.clone(),
+            runtime::Layout {
+                root: PathBuf::new(),
+            },
+            true,
+            tx,
+            rx,
+        )
+        .expect("挂载 Fake 应用库");
+        Self {
+            app: render(config),
+            library,
+            windows,
+            events,
+        }
+    }
+
+    fn create(&mut self) -> String {
+        wait(&mut self.app, "id:create-form");
+        press(&mut self.app, "create");
+        wait(&mut self.app, "id:start");
+        gone(&mut self.app, "id:pending");
+        self.library.snapshot()["selectedId"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+
+    fn start(&mut self) {
+        press(&mut self.app, "start");
+        wait(&mut self.app, "text:/服务 3/3/");
+        gone(&mut self.app, "id:pending");
+    }
+}
+
+/// 两个相同包名的实例通过各自实例 ID 关联。后台保留运行行，完全退出移除该行。
+#[test]
+fn windows_follow_the_instance_through_background_restore_and_quit() {
+    let mut ui = LibraryUi::new();
+    let first = ui.create();
+    ui.start();
+    let app = &mut ui.app;
+    press(app, "open-device");
+    wait(app, "text:窗口已连接");
+    gone(app, "id:pending");
+    wait(app, "id:app-com.example.reader");
+    press(app, "app-com.example.reader");
+    wait(app, "text:窗口已打开");
+    gone(app, "id:pending");
+    press(app, "background-com.example.reader");
+    wait(app, "text:后台运行");
+    gone(app, "id:pending");
+    press(app, "focus-com.example.reader");
+    wait(app, "text:窗口已打开");
+    gone(app, "id:pending");
+    press(app, "new-instance");
+    let second = ui.create();
+    assert_ne!(first, second);
+    gone(&mut ui.app, "id:focus-com.example.reader");
+    press(&mut ui.app, &format!("instance-{first}"));
+    wait(&mut ui.app, "id:focus-com.example.reader");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "quit-com.example.reader");
+    gone(&mut ui.app, "id:focus-com.example.reader");
+    wait(&mut ui.app, "text:应用已退出");
+    assert_eq!(ui.library.snapshot()["running"], json!([]));
+}
+
+#[test]
+fn custom_group_membership_is_local_and_deleting_a_group_restores_its_apps() {
+    let mut ui = LibraryUi::new();
+    let first = ui.create();
+    ui.start();
+    let app = &mut ui.app;
+    press(app, "new-group");
+    app.type_text("id:group-name", "工作").unwrap();
+    press(app, "save-group");
+    wait(app, "text:工作");
+    gone(app, "id:pending");
+    press(app, "group-installed");
+    app.right_click("id:app-com.example.reader").unwrap();
+    choose(app, "移至工作");
+    gone(app, "id:app-com.example.reader");
+    gone(app, "id:pending");
+    press(app, "group-group-1");
+    wait(app, "id:app-com.example.reader");
+    assert_eq!(
+        ui.library.snapshot()["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["apps"].as_array().unwrap())
+            .filter(|a| a["package"] == READER)
+            .count(),
+        1
+    );
+    press(app, "menu-com.example.reader");
+    choose(app, "移至原始分组");
+    wait(app, "text:这个分组还没有应用");
+    gone(app, "id:pending");
+    press(app, "group-installed");
+    app.right_click("id:app-com.example.reader").unwrap();
+    choose(app, "移至工作");
+    gone(app, "id:app-com.example.reader");
+    gone(app, "id:pending");
+    press(app, "new-instance");
+    ui.create();
+    gone(&mut ui.app, "text:工作");
+    press(&mut ui.app, &format!("instance-{first}"));
+    wait(&mut ui.app, "text:工作");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "group-group-1");
+    press(&mut ui.app, "delete-group");
+    wait(&mut ui.app, "text:删除「工作」分组？");
+    press(&mut ui.app, "confirm-action");
+    gone(&mut ui.app, "id:group-group-1");
+    press(&mut ui.app, "group-installed");
+    wait(&mut ui.app, "id:app-com.example.reader");
+}
+
+#[test]
+fn apk_picker_keeps_its_opening_instance_and_window_errors_remain_visible() {
+    let mut ui = LibraryUi::new();
+    let first = ui.create();
+    ui.start();
+    press(&mut ui.app, "add-apk");
+    let target = match ui.windows.recv_timeout(WAIT).unwrap() {
+        WindowCommand::PickApk { instance_id } => instance_id,
+        other => panic!("应弹出文件选择器: {other:?}"),
+    };
+    assert_eq!(target, first);
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "new-instance");
+    let second = ui.create();
+    ui.events
+        .send(WindowEvent::ApkPicked {
+            instance_id: target,
+            path: "/tmp/Fake.apk".into(),
+        })
+        .unwrap();
+    assert_eq!(ui.library.snapshot()["selectedId"], second);
+    press(&mut ui.app, &format!("instance-{first}"));
+    wait(&mut ui.app, "text:/APK 已安装/");
+    // 无 JS 回执的文件面板事件也走真实命令队列。空路径让内存设备产生可重复的拒绝。
+    press(&mut ui.app, "add-apk");
+    assert!(
+        matches!(ui.windows.recv_timeout(WAIT).unwrap(), WindowCommand::PickApk { instance_id } if instance_id == first)
+    );
+    ui.events
+        .send(WindowEvent::ApkPicked {
+            instance_id: first.clone(),
+            path: PathBuf::new(),
+        })
+        .unwrap();
+    wait(&mut ui.app, "id:toggle-install-diagnostic");
+    let note = &ui.library.snapshot()["operation"];
+    assert_eq!(note["instanceId"], first);
+    assert_eq!(
+        note["installError"],
+        json!({"code": ErrorCode::Other, "detail": "请选择 APK 文件"})
+    );
+    gone(&mut ui.app, "id:install-diagnostic");
+    press(&mut ui.app, "toggle-install-diagnostic");
+    wait(&mut ui.app, "text:请选择 APK 文件");
+    ui.events
+        .send(WindowEvent::Error {
+            instance_id: first.clone(),
+            message: "窗口未收到首帧".into(),
+        })
+        .unwrap();
+    wait(&mut ui.app, "text:窗口未收到首帧");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, &format!("instance-{second}"));
+    gone(&mut ui.app, "text:窗口未收到首帧");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, &format!("instance-{first}"));
+    wait(&mut ui.app, "text:窗口未收到首帧");
+}
+
+#[test]
+fn creation_template_and_instance_deletion_confirmation() {
+    let mut ui = LibraryUi::new();
+    wait(&mut ui.app, "text:创建第一个实例");
+    press(&mut ui.app, "choose-template");
+    choose(&mut ui.app, "紧凑设备 · 1280 × 720");
+    wait(&mut ui.app, "text:/紧凑设备/");
+    let id = ui.create();
+    ui.start();
+    press(&mut ui.app, "stop");
+    wait(&mut ui.app, "id:start");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "delete-instance");
+    wait(&mut ui.app, "text:删除「我的 Android」？");
+    press(&mut ui.app, "cancel-confirmation");
+    assert_eq!(ui.library.snapshot()["selectedId"], id);
+    press(&mut ui.app, "delete-instance");
+    press(&mut ui.app, "confirm-action");
+    wait(&mut ui.app, "text:创建第一个实例");
+    assert_eq!(ui.library.snapshot()["instances"], json!([]));
+}
+
+#[test]
+fn a_stalled_boot_reports_the_missing_service() {
+    let config = config();
     let (handle, events) = device::spawn(
         InstanceId::new("ui-test"),
-        "emulator-5554".to_owned(),
-        backend,
-        device::Timeouts::default(),
+        "fake-5554".into(),
+        FakeBackend::new().stalling(),
+        device::Timeouts {
+            adb: Duration::from_millis(300),
+            services: Duration::from_millis(300),
+            hard: Duration::from_secs(30),
+            poll: Duration::from_millis(10),
+        },
     );
-
-    let bundle = nsh_testing::compile_tsx(app_dir().join("App.tsx"), &[]).expect("编译 App.tsx");
-
-    let config = EngineConfig::new(bundle);
-    let channel = config.host.clone();
-    let _bridge = host::Bridge::attach(handle.clone(), channel, events);
-
-    let mut app = Headless::start(config).expect("启动界面");
-    app.first_render().expect("首帧");
-    (app, handle)
-}
-
-fn create_spec() -> Spec {
-    Spec {
+    let _bridge = host::Bridge::attach(handle.clone(), config.host.clone(), events);
+    let spec = Spec {
         template: "phone-1080".into(),
-        image: Image { api: 34, tag: "google_apis_playstore".into(), abi: "arm64-v8a".into() },
+        image: Image {
+            api: 34,
+            tag: "google_apis_playstore".into(),
+            abi: "arm64-v8a".into(),
+        },
         disk_bytes: 8 << 30,
-    }
+    };
+    assert!(handle.send(Command::Create { spec }).is_accepted());
+    let mut app = render(config);
+    wait(&mut app, "id:start");
+    press(&mut app, "start");
+    wait(&mut app, "text:等待package 服务");
+    wait(&mut app, "text:/启动较慢，服务 0/3/");
 }
 
-#[test]
-fn ui_shows_initial_absent_state() {
-    let (mut app, _h) = start(FakeBackend::new());
-    // 首次渲染后界面已经取过快照，应显示「尚未创建」。
-    // 用正则选择器而非 shows()：shows() 是整串精确匹配，而界面显示的是
-    // 「状态 · 说明」整句。
-    // 文案来自宿主的 describe()，界面不自己拼——改文案只改一处。
-    app.wait_for_within("text:/^实例尚未创建/", Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("界面应显示初始状态: {e}"));
+/// 可控回执让测试推进下载阶段或文件拖入，而不用点击真实的下载器、文件面板。
+struct Scripted {
+    app: Headless,
+    state: Arc<Mutex<Value>>,
+    commands: Arc<Mutex<Vec<Value>>>,
+    channel: HostChannel,
 }
 
-#[test]
-fn ui_snapshot_reflects_device_facts() {
-    let (mut app, h) = start(FakeBackend::new());
-    h.send(Command::Create { spec: create_spec() });
-
-    // 命令改变了事实，界面需要看到。事件会触发刷新，但要等一拍。
-    app.wait_for_within("text:/^已停止/", Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("界面未反映已创建状态: {e}"));
-}
-
-#[test]
-fn ui_start_button_drives_the_device_domain() {
-    let (mut app, h) = start(FakeBackend::new().slowed(4));
-    h.send(Command::Create { spec: create_spec() });
-    app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
-
-    // 点「启动」：界面 → host.call → Bridge → 设备域。
-    app.press("id:start").expect("按下启动");
-
-    // 设备域真的动起来了（不是界面自己改的字）。
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut moved = false;
-    while std::time::Instant::now() < deadline {
-        if matches!(h.snapshot().state, State::Starting | State::Ready) {
-            moved = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(moved, "点按启动后设备域应进入 Starting");
-}
-
-#[test]
-fn rejected_command_is_explained_in_the_ui() {
-    let (mut app, h) = start(FakeBackend::new());
-    h.send(Command::Create { spec: create_spec() });
-    app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
-
-    // 停止一个已停止的实例是幂等的：接受且无副作用。
-    // 这条不是「无所谓」——界面重试一次必然失败的命令不该让用户看到错误。
-    let ack = h.send(Command::Stop);
-    assert!(ack.is_accepted(), "停止一个已停止的实例应被幂等受理");
-    assert!(
-        matches!(h.snapshot().state, State::Stopped),
-        "幂等受理不得改变状态"
-    );
-
-    // 真正该被拒绝的是没有实例时停止——那说明界面与设备域脱节了。
-    let (mut fresh, h2) = start(FakeBackend::new());
-    let _ = &mut fresh;
-    let ack = h2.send(Command::Stop);
-    assert!(!ack.is_accepted(), "无实例时停止应被拒绝");
-
-    // 界面通过 notice 展示拒绝原因；这里验证措辞被翻译成用户能懂的话。
-    app.wait_for_within("id:notice", Duration::from_secs(2)).ok();
-}
-
-#[test]
-fn ui_tracks_boot_through_to_ready() {
-    let (mut app, h) = start(FakeBackend::new().slowed(2));
-    h.send(Command::Create { spec: create_spec() });
-    app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
-
-    app.press("id:start").expect("start");
-
-    // 一路到就绪。这是端到端最有说服力的一条：
-    // 假后端推进事实，actor 发出事件，Bridge 转发，界面刷新并显示。
-    app.wait_for_within("text:/^就绪/", Duration::from_secs(10))
-        .unwrap_or_else(|e| {
-            panic!(
-                "界面未到达就绪态: {e}\n可见文本: {:?}",
-                app.screen().texts()
-            )
+impl Scripted {
+    fn new(
+        state: Value,
+        handle: impl Fn(&Value, &mut Value) -> Value + Send + Sync + 'static,
+    ) -> Self {
+        let config = config();
+        let channel = config.host.clone();
+        let state = Arc::new(Mutex::new(state));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let view = state.clone();
+        channel.handle("windroid.snapshot", move |call| {
+            call.resolve(view.lock().unwrap().clone())
         });
+        let view = state.clone();
+        let seen = requests.clone();
+        channel.handle("windroid.command", move |call| {
+            seen.lock().unwrap().push(call.data().clone());
+            let ack = handle(call.data(), &mut view.lock().unwrap());
+            call.resolve(ack);
+        });
+        Self {
+            app: render(config),
+            state,
+            commands: requests,
+            channel,
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Value)) {
+        change(&mut self.state.lock().unwrap());
+        self.channel.send("windroid.event", Value::Null).unwrap();
+    }
+}
+
+fn ready_view() -> Value {
+    json!({"id":"a","instances":[{"id":"a","name":"工作机","state":"ready"}],"selectedId":"a",
+        "state":"ready","summary":"已就绪","capabilities":{"install":true,"launchApp":true,"deviceView":true,"stop":true,"refreshApps":true},
+        "facts":{"services":{"activity":true,"package":true,"window":true},"adbVisible":true},"groups":[],"running":[],"desktop":null,"tasksLoaded":true,
+        "preparation":{"phase":"ready","components":[],"currentComponent":null,"totalBytes":0,"downloadedBytes":0,"borrowed":false,"error":null}})
 }
 
 #[test]
-fn service_indicators_come_from_facts_not_guesswork() {
-    let (mut app, h) = start(FakeBackend::new().slowed(2));
-    h.send(Command::Create { spec: create_spec() });
-    app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
-    app.press("id:start").expect("start");
-    app.wait_for_within("text:/^就绪/", Duration::from_secs(10)).expect("ready");
-
-    // 就绪时三个服务必须都点亮。界面显示 3/3 而不是「大概齐了」。
-    // 正则里的斜杠要转义，Rust 字符串里反斜杠本身也要转义。
-    app.wait_for_within(r"text:/服务 3/3/", Duration::from_secs(3))
-        .unwrap_or_else(|e| panic!("就绪时应显示 3/3: {e}"));
-}
-
-/// 启动过程中界面要指出卡在哪一步。
-///
-/// 这不是锦上添花：adb 未出现与服务未就绪，用户的应对完全不同——前者要查
-/// 端口与 adbd，后者要查镜像与磁盘。只说「启动较慢」等于什么也没说。
-#[test]
-fn stuck_point_is_shown_while_starting() {
-    let (mut app, h) = start(FakeBackend::new().stalling().slowed(1));
-    h.send(Command::Create { spec: create_spec() });
-    app.wait_for_within("text:/^已停止/", Duration::from_secs(5)).expect("created");
-    app.press("id:start").expect("start");
-
-    // 假后端在 adb 可见后停住，卡点应指向更后面的服务层。
-    app.wait_for_within("id:stuck", Duration::from_secs(8))
-        .unwrap_or_else(|e| panic!("启动中应显示卡点: {e}\n屏幕: {:?}", app.screen().texts()));
-}
-
-/// 自检结果必须随快照到达界面。
-///
-/// 没有这条断言，自检可以静默返回空——界面会显示「一切正常」，
-/// 而用户点下去才发现缺组件。缺失信息必须由宿主给出，界面无权编造。
-#[test]
-fn readiness_reaches_the_ui() {
-    let (mut app, _h) = start(FakeBackend::new());
-    // 侧边栏一定渲染：它不依赖设备状态。
-    app.wait_for_within("text:Windroid", Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("侧边栏应渲染: {e}"));
-
-    // 本机装齐时不该出现「未就绪」；缺组件时必须出现。
-    // 两种结果都合法，但界面不能在两者之间停留——它读的是同一份自检。
-    let screen = app.screen().texts();
-    let shows_blocked = screen.iter().any(|t| t.contains("运行环境未就绪"));
-    let shows_library = screen.iter().any(|t| t.contains("应用") || t.contains("启动实例"));
-    assert!(
-        shows_blocked || shows_library,
-        "界面必须处于「未就绪」或「应用库」之一，实际: {screen:?}"
+fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_rescan() {
+    let mut view = ready_view();
+    view["instances"] = json!([]);
+    view["selectedId"] = Value::Null;
+    view["preparation"] = json!({"phase":"missing","components":[{"id":"image","name":"系统镜像","version":"34","source":"https://example.org/image.zip",
+        "license":"镜像许可","licenseUrl":"https://example.org/terms","licenseText":"镜像完整许可正文","sizeBytes":1048576,"ready":false}],
+        "currentComponent":null,"downloadedBytes":0,"totalBytes":1048576,"borrowed":false,"error":null});
+    let mut ui = Scripted::new(view, |cmd, view| {
+        let p = &mut view["preparation"];
+        match cmd["kind"].as_str().unwrap() {
+            "prepareRuntime" => {
+                assert_eq!(cmd["acceptedLicenses"], true);
+                p["phase"] = json!("downloading");
+                p["error"] = Value::Null;
+                p["currentComponent"] = json!("image");
+                p["downloadedBytes"] = json!(524288);
+            }
+            "pausePreparation" => p["phase"] = json!("paused"),
+            "recheckRuntime" => p["phase"] = json!("ready"),
+            other => panic!("意外的环境命令 {other}"),
+        }
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "text:准备 Android 环境");
+    press(&mut ui.app, "license-image");
+    wait(&mut ui.app, "text:镜像完整许可正文");
+    press(&mut ui.app, "close-license");
+    assert!(ui.commands.lock().unwrap().is_empty());
+    press(&mut ui.app, "prepare-runtime");
+    wait(&mut ui.app, "text:512 KiB / 1.0 MiB");
+    wait(&mut ui.app, "id:current-component");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "pause-preparation");
+    wait(&mut ui.app, "text:同意并继续下载");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "prepare-runtime");
+    wait(&mut ui.app, "text:正在下载组件");
+    ui.update(|view| {
+        view["preparation"]["phase"] = json!("failed");
+        view["preparation"]["error"] = json!("文件校验失败");
+    });
+    wait(&mut ui.app, "text:文件校验失败");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "prepare-runtime");
+    wait(&mut ui.app, "text:正在下载组件");
+    ui.update(|view| view["preparation"]["phase"] = json!("paused"));
+    wait(&mut ui.app, "text:下载已暂停");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "recheck-runtime");
+    wait(&mut ui.app, "text:创建第一个实例");
+    let commands = ui.commands.lock().unwrap();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|c| c["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "prepareRuntime",
+            "pausePreparation",
+            "prepareRuntime",
+            "prepareRuntime",
+            "recheckRuntime"
+        ]
     );
 }
 
-/// 切换分组必须立即反映到界面。
-///
-/// 分组选中项是纯界面状态，不经过设备域，因此没有事件推动重渲染。
-/// 派生值若用普通变量而非 computed，选中项变了内容也不会变——
-/// 表现是「点标签没反应，点一下应用才切过去」。
 #[test]
-fn switching_groups_updates_the_grid() {
-    let (mut app, _h) = start(FakeBackend::new());
-    app.wait_for_within("text:已安装", Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("分组标签应渲染: {e}"));
+fn drops_require_one_local_apk_and_render_the_install_rejection() {
+    const DIAGNOSTIC: &str = "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.example.reader signatures do not match previously installed version]";
+    let mut ui = Scripted::new(ready_view(), |_, _| {
+        json!(Ack::Rejected {
+            reason: Rejection::Error {
+                code: ErrorCode::SignatureMismatch,
+                detail: DIAGNOSTIC.into()
+            }
+        })
+    });
+    wait(&mut ui.app, "id:library");
+    for uri in [
+        "https://example.org/file.apk",
+        "file:///tmp/file.txt",
+        "file://other-host/file.apk",
+    ] {
+        ui.app.drop_files("id:apk-drop", vec![uri.into()]).unwrap();
+        wait(&mut ui.app, "text:请选择本机的 .apk 文件");
+    }
+    ui.app
+        .drop_files(
+            "id:apk-drop",
+            vec!["file:///tmp/a.apk".into(), "file:///tmp/b.apk".into()],
+        )
+        .unwrap();
+    wait(&mut ui.app, "text:每次请拖入一个 APK 文件");
+    assert!(ui.commands.lock().unwrap().is_empty());
+    ui.app
+        .drop_files("id:apk-drop", vec!["file:///tmp/my%20app.APK".into()])
+        .unwrap();
+    wait(&mut ui.app, "text:APK 签名与已安装的应用不一致。");
+    gone(&mut ui.app, "id:install-diagnostic");
+    press(&mut ui.app, "toggle-install-diagnostic");
+    wait(&mut ui.app, &format!("text:{DIAGNOSTIC}"));
+    press(&mut ui.app, "toggle-install-diagnostic");
+    gone(&mut ui.app, "id:install-diagnostic");
+    assert_eq!(
+        *ui.commands.lock().unwrap(),
+        [json!({"kind":"install","instanceId":"a","apkPath":"/tmp/my app.APK"})]
+    );
+}
 
-    // 假后端给的是两个应用，都落在「已安装」。
-    app.wait_for_within("text:阅读器", Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("已安装分组应显示应用: {e}"));
+/// 原生文件面板先返回受理，安装结果稍后作为快照事件到达。
+#[test]
+fn apk_picker_shows_the_classified_reason_and_exact_android_diagnostic() {
+    let mut ui = Scripted::new(ready_view(), |cmd, _| {
+        assert_eq!(cmd, &json!({"kind":"addApk","instanceId":"a"}));
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:add-apk");
+    for (index, (code, raw, expected)) in [
+        (
+            ErrorCode::OutOfSpace,
+            "Requested internal only, but not enough space",
+            "实例存储空间不足。",
+        ),
+        (
+            ErrorCode::InvalidApk,
+            "Failure [INSTALL_PARSE_FAILED_NO_CERTIFICATES]",
+            "APK 文件无效，请选择完整且已签名的安装包。",
+        ),
+        (
+            ErrorCode::AdbFailure,
+            "Failure [INSTALL_FAILED_NO_MATCHING_ABIS]",
+            "APK 不支持此实例的处理器架构。",
+        ),
+        (
+            ErrorCode::AdbFailure,
+            "Failure [INSTALL_FAILED_TEST_ONLY]",
+            "Android 拒绝安装这个 APK。",
+        ),
+        (
+            ErrorCode::AdbFailure,
+            "安装后无法确认 com.example.reader 的版本：设备断开",
+            "无法确认 APK 安装成功。",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        press(&mut ui.app, "add-apk");
+        gone(&mut ui.app, "id:pending");
+        gone(&mut ui.app, "id:notice");
+        ui.update(|v| v["operation"] = json!({"instanceId":"a","seq":index+1,"message":"APK 安装未完成","failed":true,
+            "installError":{"code":code,"detail":raw}}));
+        wait(&mut ui.app, &format!("text:{expected}"));
+        gone(&mut ui.app, "id:install-diagnostic");
+        press(&mut ui.app, "toggle-install-diagnostic");
+        wait(&mut ui.app, &format!("text:{raw}"));
+    }
+    assert_eq!(ui.commands.lock().unwrap().len(), 5);
+}
+
+#[test]
+fn a_delayed_install_keeps_its_own_error_while_another_instance_is_in_use() {
+    let mut view = ready_view();
+    view["instances"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"b","name":"娱乐机","state":"ready"}));
+    let stale = "APK 已安装并核实版本";
+    view["operation"] = json!({"instanceId":"a","failed":false,"message":stale,"seq":7});
+    let mut ui = Scripted::new(view, |_, _| unreachable!());
+    let state = ui.state.clone();
+    let (started, waiting) = mpsc::channel();
+    ui.channel.handle("windroid.command", move |call| {
+        match call.data()["kind"].as_str().unwrap() {
+            "install" => {
+                assert_eq!(call.data(), &json!({"kind":"install","instanceId":"a","apkPath":"/tmp/reader.apk"}));
+                started.send(call.into_reply().unwrap()).unwrap();
+            }
+            "selectInstance" => {
+                state.lock().unwrap()["selectedId"] = call.data()["instanceId"].clone();
+                call.resolve(json!({"status":"accepted"}));
+            }
+            "refreshApps" => {
+                assert_eq!(call.data()["instanceId"], "b");
+                call.resolve(json!({"status":"rejected","reason":{"kind":"error","detail":"软件包服务离线"}}));
+            }
+            kind => panic!("意外的命令 {kind}"),
+        }
+    });
+    wait(&mut ui.app, "id:library");
+    ui.app
+        .drop_files("id:apk-drop", vec!["file:///tmp/reader.apk".into()])
+        .unwrap();
+    let install = waiting.recv_timeout(WAIT).unwrap();
+    wait(&mut ui.app, "text:安装 APK…");
+    gone(&mut ui.app, &format!("text:{stale}"));
+    press(&mut ui.app, "instance-b");
+    gone(&mut ui.app, "id:pending");
+    assert_eq!(ui.state.lock().unwrap()["selectedId"], "b");
+    const DIAGNOSTIC: &str = "Failure [INSTALL_FAILED_VERSION_DOWNGRADE]";
+    install.resolve(json!(Ack::Rejected {
+        reason: Rejection::Error {
+            code: ErrorCode::VersionDowngrade,
+            detail: DIAGNOSTIC.into()
+        }
+    }));
+    press(&mut ui.app, "refresh-apps");
+    wait(&mut ui.app, "text:刷新应用失败 · 软件包服务离线");
+    gone(&mut ui.app, "id:toggle-install-diagnostic");
+    press(&mut ui.app, "instance-a");
+    wait(&mut ui.app, "text:APK 版本比已安装的版本低。");
+    gone(&mut ui.app, "text:刷新应用失败 · 软件包服务离线");
+    press(&mut ui.app, "toggle-install-diagnostic");
+    wait(&mut ui.app, &format!("text:{DIAGNOSTIC}"));
+    press(&mut ui.app, "instance-b");
+    gone(&mut ui.app, "id:install-diagnostic");
+    press(&mut ui.app, "instance-a");
+    wait(&mut ui.app, "text:查看原始诊断");
+    gone(&mut ui.app, "id:install-diagnostic");
+}
+
+#[test]
+fn destructive_app_menu_actions_require_the_original_confirmation() {
+    let mut view = ready_view();
+    view["groups"] = json!([{"id":"installed","name":"已安装","count":1,"apps":[{
+        "package":READER,"label":"阅读器","system":false,"launchable":true,"actions":[
+            {"kind":"clearData","label":"清除数据","enabled":true,"destructive":true}]}]}]);
+    let mut ui = Scripted::new(view, |_, _| json!({"status":"accepted"}));
+    wait(&mut ui.app, "id:menu-com.example.reader");
+    press(&mut ui.app, "menu-com.example.reader");
+    choose(&mut ui.app, "清除数据");
+    wait(&mut ui.app, "text:清除数据 · 阅读器");
+    press(&mut ui.app, "cancel-confirmation");
+    assert!(ui.commands.lock().unwrap().is_empty());
+    press(&mut ui.app, "menu-com.example.reader");
+    choose(&mut ui.app, "清除数据");
+    press(&mut ui.app, "confirm-action");
+    wait(&mut ui.app, "text:已提交清除数据请求");
+    assert_eq!(
+        *ui.commands.lock().unwrap(),
+        [json!({"kind":"clearData","instanceId":"a","package":READER})]
+    );
+}
+
+#[test]
+fn catalog_reports_loading_failure_and_verified_empty_separately() {
+    let mut view = ready_view();
+    view["catalogStatus"] = json!({"kind":"pending"});
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd, &json!({"kind":"refreshApps","instanceId":"a"}));
+        view["catalogStatus"] = json!({"kind":"ready"});
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "text:正在读取应用…");
+    gone(&mut ui.app, "text:拖入 APK 开始");
+    ui.update(|v| v["capabilities"]["refreshApps"] = json!(false));
+    wait(&mut ui.app, "text:实例就绪后将读取应用列表。");
+    gone(&mut ui.app, "id:empty-library");
+    ui.update(|v| {
+        v["capabilities"]["refreshApps"] = json!(true);
+        v["groups"] = json!([{"id":"installed","name":"已安装","count":1,"apps":[{"package":READER,"label":"阅读器","launchable":true,"system":false,"actions":[]}]}]);
+    });
+    wait(&mut ui.app, "id:app-com.example.reader");
+    wait(&mut ui.app, "id:catalog-pending");
+    ui.update(|v| v["catalogStatus"] = json!({"kind":"failed","message":"软件包服务未就绪"}));
+    wait(&mut ui.app, "text:应用列表读取失败 · 软件包服务未就绪");
+    wait(&mut ui.app, "id:app-com.example.reader");
+    ui.update(|v| v["groups"] = json!([]));
+    gone(&mut ui.app, "id:app-com.example.reader");
+    gone(&mut ui.app, "text:拖入 APK 开始");
+    press(&mut ui.app, "refresh-apps");
+    wait(&mut ui.app, "text:拖入 APK 开始");
+    gone(&mut ui.app, "id:catalog-error");
+}
+
+#[test]
+fn frozen_instance_resumes_via_start_and_uses_the_saved_id() {
+    let mut view = ready_view();
+    view["instances"][0]["state"] = json!("stopped");
+    view["instances"][0]["frozen"] = json!(true);
+    view["state"] = json!("stopped");
+    view["frozen"] = json!(true);
+    view["capabilities"] = json!({"start":true,"delete":true});
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd, &json!({"kind":"start","instanceId":"a"}));
+        *view = ready_view();
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "text:已冻结 · 应用与文件已保存");
+    wait(&mut ui.app, "text:恢复实例");
+    press(&mut ui.app, "start");
+    wait(&mut ui.app, "id:stop");
+    gone(&mut ui.app, "text:恢复实例");
+}
+
+#[test]
+fn recommended_template_can_be_overridden_before_creation() {
+    let mut view = ready_view();
+    view["instances"] = json!([]);
+    view["selectedId"] = Value::Null;
+    view["recommendedTemplate"] = json!("compact-720");
+    let mut ui = Scripted::new(view, |cmd, v| {
+        v["selectedId"] = json!("new");
+        v["instances"] = json!([{"id":"new","name":cmd["name"],"state":"stopped"}]);
+        v["operation"] = json!({"instanceId":"new","message":"实例已创建","failed":false,"seq":1});
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "text:/紧凑设备/");
+    press(&mut ui.app, "choose-template");
+    choose(&mut ui.app, "平板 · 1920 × 1200");
+    ui.app.type_text("id:instance-name", " 工作").unwrap();
+    ui.update(|v| v["recommendedTemplate"] = json!("phone-1080"));
+    ui.app
+        .set_viewport(Size::new(Points(480.0), Points(650.0)))
+        .unwrap();
+    wait(&mut ui.app, "text:/平板/");
+    press(&mut ui.app, "create");
+    wait(&mut ui.app, "text:实例已创建");
+    gone(&mut ui.app, "text:创建实例请求已受理");
+    assert_eq!(
+        *ui.commands.lock().unwrap(),
+        [json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作"})]
+    );
+}
+
+/// HOME 清单晚于库首帧到达；一次进入应用库即可选择只声明 HOME 的包。
+#[test]
+fn home_picker_tracks_late_candidates_and_instance_changes_in_place() {
+    let mut view = ready_view();
+    view["instances"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"b","name":"娱乐机","state":"ready"}));
+    view["catalogStatus"] = json!({"kind":"pending"});
+    let mut ui = Scripted::new(view, |cmd, view| {
+        match (cmd["kind"].as_str(), cmd["instanceId"].as_str()) {
+            (Some("setDefaultHome"), Some("a")) => {
+                assert_eq!(cmd["package"], "demo.home");
+                view["desktop"]["defaultPackage"] = cmd["package"].clone();
+            }
+            (Some("selectInstance"), Some(id)) => {
+                view["selectedId"] = json!(id);
+                view["id"] = json!(id);
+                view["desktop"] = if id == "b" {
+                    json!({"defaultPackage":null,"candidates":[]})
+                } else {
+                    json!({"defaultPackage":"demo.home","candidates":["demo.home"],"candidateLabels":{"demo.home":"书房桌面"}})
+                };
+            }
+            other => panic!("意外的命令 {other:?}"),
+        }
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:catalog-pending");
+    gone(&mut ui.app, "id:choose-desktop");
+    ui.update(|v| {
+        v["groups"] = json!([{"id":"system","name":"系统应用","count":1,"apps":[
+            {"package":"demo.store","label":"商店","system":true,"launchable":true,"actions":[]}]}]);
+        v["catalogStatus"] = json!({"kind":"ready"});
+        v["desktop"] = json!({"defaultPackage":"demo.stock","candidates":["demo.stock","demo.home"],"candidateLabels":{"demo.home":"书房桌面"}});
+    });
+    wait(&mut ui.app, "id:app-demo.store");
+    gone(&mut ui.app, "id:app-demo.home");
+    wait(&mut ui.app, "text:默认桌面 · demo.stock");
+    press(&mut ui.app, "choose-desktop");
+    choose(&mut ui.app, "书房桌面");
+    wait(&mut ui.app, "text:默认桌面 · 书房桌面");
+    assert_eq!(
+        *ui.commands.lock().unwrap(),
+        [json!({"kind":"setDefaultHome","instanceId":"a","package":"demo.home"})]
+    );
+    press(&mut ui.app, "instance-b");
+    gone(&mut ui.app, "id:choose-desktop");
+    gone(&mut ui.app, "text:默认桌面 · 书房桌面");
+    ui.update(|v| v["desktop"] = json!({"defaultPackage":"demo.work","candidates":["demo.work"]}));
+    wait(&mut ui.app, "text:默认桌面 · demo.work");
+    press(&mut ui.app, "instance-a");
+    wait(&mut ui.app, "text:默认桌面 · 书房桌面");
+    gone(&mut ui.app, "text:默认桌面 · demo.work");
+}
+
+#[test]
+fn home_only_candidates_and_loading_or_failed_task_queries_remain_distinct() {
+    let mut view = ready_view();
+    view["desktop"] = json!({"defaultPackage":null,"candidates":["demo.home"]});
+    view["tasksLoaded"] = json!(false);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        view["desktop"]["defaultPackage"] = cmd["package"].clone();
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "text:正在读取运行中的应用…");
+    press(&mut ui.app, "choose-desktop");
+    choose(&mut ui.app, "demo.home");
+    wait(&mut ui.app, "text:默认桌面 · demo.home");
+    assert_eq!(
+        *ui.commands.lock().unwrap(),
+        [json!({"kind":"setDefaultHome","instanceId":"a","package":"demo.home"})]
+    );
+    ui.update(|view| view["runningError"] = json!("设备暂时离线"));
+    wait(&mut ui.app, "text:/设备暂时离线/");
+    gone(&mut ui.app, "text:此实例没有运行中的应用");
+    ui.app
+        .set_viewport(Size::new(Points(420.0), Points(600.0)))
+        .unwrap();
+    wait(&mut ui.app, "id:workspace-scroll");
+    ui.app.scroll("id:workspace-scroll", Points(300.0)).unwrap();
 }

@@ -1,104 +1,185 @@
-//! 窗口所有权与关闭拦截。
-//!
-//! 本模块是「窗口归我们」这条约束的落地处。只在 macOS 上有实现——平台顺序是
-//! macOS → Linux → Windows，先跑通一个再谈其余。
-//!
-//! 关键点：窗口由标准 AppKit API 创建并持有，nsh 的 [AppView] 作为 content view
-//! 嵌进来。因此关闭拦截用标准 NSWindowDelegate，不依赖框架提供 hook——
-//! 这正是选 nsh 的原因：它不持有窗口，我们持有。
+//! 应用库与视频窗口都由 AppKit 主线程持有。宿主通过可跨线程的命令和事件接线。
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use block2::RcBlock;
+use dispatch2::DispatchQueue;
 use nsh_platform_macos::objc2::rc::Retained;
 use nsh_platform_macos::objc2::runtime::ProtocolObject;
-use nsh_platform_macos::objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use nsh_platform_macos::objc2::{
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+};
 use nsh_platform_macos::objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplication,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSBackingStoreType, NSControlStateValueOn,
+    NSEvent, NSEventModifierFlags, NSEventType, NSModalResponseOK, NSOpenPanel, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use nsh_platform_macos::objc2_foundation::{
-    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use nsh_platform_macos::{AppOptions, AppView};
 
-/// 关闭决策。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloseIntent {
-    /// 允许关闭，进程可以退出。
-    Close,
-    /// 拒绝关闭，交给产品决定后续（询问用户、隐藏、保留实例）。
-    Keep,
+/// package 为 None 时是该实例的设备视图。窗口从创建到回收始终携带同一把键。
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct WindowKey {
+    pub instance_id: String,
+    pub package: Option<String>,
 }
 
-/// 关闭拦截的决策点。
-///
-/// 用回调而不是固定策略：具体动作（询问、记住偏好、直接执行）属于产品决策，
-/// 会随策略演进。本模块只负责「拦得住」，不替产品决定「拦下来做什么」。
+#[derive(Debug)]
+pub enum WindowCommand {
+    /// 宿主已核对实例归属与状态。重复打开聚焦已有窗口。
+    Open {
+        key: WindowKey,
+        title: String,
+        serial: String,
+        adb: PathBuf,
+        jar: PathBuf,
+    },
+    Background {
+        key: WindowKey,
+    },
+    /// 宿主已确认 Android 退出，直接回收其窗口。
+    Dismiss {
+        key: WindowKey,
+    },
+    /// 完全退出执行失败，窗口保留，可再次操作。
+    QuitFailed {
+        key: WindowKey,
+    },
+    CloseInstance {
+        instance_id: String,
+    },
+    PickApk {
+        instance_id: String,
+    },
+    /// 最近一次成功读取的完整活动任务集合。查询失败时应保留上次事实。
+    Reconcile {
+        instance_id: String,
+        tasks: Vec<(String, u32)>,
+    },
+}
+
+#[derive(Debug)]
+pub enum WindowEvent {
+    Opened {
+        key: WindowKey,
+    },
+    FirstFrame {
+        key: WindowKey,
+    },
+    Closed {
+        key: WindowKey,
+    },
+    InstanceClosed {
+        instance_id: String,
+    },
+    QuitRequested {
+        key: WindowKey,
+    },
+    ApkPicked {
+        instance_id: String,
+        path: PathBuf,
+    },
+    Error {
+        instance_id: String,
+        message: String,
+    },
+}
+
+/// 无轮询定时器。命令、首帧与流结束均可从工作线程投递到 AppKit。
+pub fn on_main(action: impl FnOnce(MainThreadMarker) + Send + 'static) {
+    DispatchQueue::main().exec_async(move || {
+        action(MainThreadMarker::new().expect("AppKit 主队列"));
+    });
+}
+
+/// 安排一次性的启动超时检查，无需常驻定时器。
+pub fn on_main_after(
+    delay: std::time::Duration,
+    action: impl FnOnce(MainThreadMarker) + Send + 'static,
+) {
+    let when = dispatch2::DispatchTime::try_from(delay).expect("窗口超时在有效范围内");
+    DispatchQueue::main()
+        .after(when, move || {
+            action(MainThreadMarker::new().expect("AppKit 主队列"))
+        })
+        .expect("主队列允许延时回调");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseIntent {
+    Close,
+    Keep,
+}
 pub type CloseFn = Box<dyn FnMut() -> CloseIntent + 'static>;
 
 define_class!(
-    /// 关闭拦截代理。
-    ///
-    /// 必须用 define_class! 而非手写 impl：手写会缺少宏生成的 ObjC 元数据，
-    /// 编译期报 NSObjectProtocol not satisfied。
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "WindroidAppTermination"]
+    pub struct TerminationDelegate;
+    unsafe impl NSObjectProtocol for TerminationDelegate {}
+    unsafe impl NSApplicationDelegate for TerminationDelegate {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn terminate(&self, app: &NSApplication) -> NSApplicationTerminateReply {
+            // 让 main 的 run 返回后统一清理窗口、连接和实例进程。唤醒等待事件的 run loop。
+            app.stop(None);
+            if let Some(event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                NSEventType::ApplicationDefined, NSPoint::new(0.0,0.0), NSEventModifierFlags::empty(), 0.0, 0, None, 0, 0, 0,
+            ) { app.postEvent_atStart(&event, true); }
+            NSApplicationTerminateReply::TerminateCancel
+        }
+    }
+);
+
+impl TerminationDelegate {
+    pub fn install(mtm: MainThreadMarker) -> Option<Retained<Self>> {
+        let app = NSApplication::sharedApplication(mtm);
+        if app.delegate().is_some() {
+            return None;
+        }
+        let delegate: Retained<Self> = unsafe { msg_send![mtm.alloc::<Self>(), init] };
+        app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        Some(delegate)
+    }
+}
+
+pub struct CloseIvars {
+    on_close: RefCell<CloseFn>,
+}
+
+define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[ivars = CloseIvars]
     #[name = "WindroidCloseDelegate"]
     pub struct CloseDelegate;
-
     unsafe impl NSObjectProtocol for CloseDelegate {}
-
     unsafe impl NSWindowDelegate for CloseDelegate {
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _window: &NSWindow) -> bool {
-            let mut guard = self.ivars().on_close.borrow_mut();
-            match guard.as_mut().map(|f| f()) {
-                Some(CloseIntent::Keep) => false,
-                Some(CloseIntent::Close) => true,
-                // 没装回调时按标准行为关闭：不制造「点了没反应」。
-                None => true,
-            }
+            self.ivars()
+                .on_close
+                .try_borrow_mut()
+                .is_ok_and(|mut f| f() == CloseIntent::Close)
         }
     }
 );
 
-/// 代理的附加数据。objc2 的宏要求它放在 ivars 里，不能作为结构体字段。
-#[derive(Default)]
-pub struct CloseIvars {
-    on_close: RefCell<Option<CloseFn>>,
-}
-
-impl CloseDelegate {
-    fn make(mtm: MainThreadMarker, on_close: CloseFn) -> Retained<Self> {
-        let this = mtm.alloc::<Self>().set_ivars(CloseIvars {
-            on_close: RefCell::new(Some(on_close)),
-        });
-        unsafe { msg_send![super(this), init] }
-    }
-}
-
-/// 一个归我们所有的窗口，连同它的界面视图与宿主通道。
-pub struct Window {
+struct OwnedWindow {
     window: Retained<NSWindow>,
-    /// 必须持有：NSWindow.detach 后代理会被释放，delegate 变悬垂。
+    // NSWindow 只弱持有 delegate。
     _delegate: Retained<CloseDelegate>,
-    view: Rc<AppView>,
 }
 
-impl Window {
-    /// 创建窗口。返回时窗口尚未显示。
-    ///
-    /// 先建窗口、装好代理、再显示——避免出现「已显示但关闭拦不住」的时间窗。
-    pub fn new(
-        mtm: MainThreadMarker,
-        title: &str,
-        size: (f64, f64),
-        on_close: CloseFn,
-    ) -> Self {
+impl OwnedWindow {
+    fn new(mtm: MainThreadMarker, title: &str, size: (f64, f64), on_close: CloseFn) -> Self {
         let rect = NSRect::new(NSPoint::new(140.0, 140.0), NSSize::new(size.0, size.1));
-
-        let window: Retained<NSWindow> = unsafe {
+        let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
                 rect,
@@ -110,79 +191,200 @@ impl Window {
                 false,
             )
         };
+        // Rust 持有分配时的 +1。默认的 releasedWhenClosed 会在 close 时另作一次 release。
+        unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str(title));
-
-        let delegate = CloseDelegate::make(mtm, on_close);
+        let this = mtm.alloc::<CloseDelegate>().set_ivars(CloseIvars {
+            on_close: RefCell::new(on_close),
+        });
+        let delegate: Retained<CloseDelegate> = unsafe { msg_send![super(this), init] };
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-
-        // AppView 是普通 NSView，作为 content view 挂进来。
-        // 界面只是窗口里的一个视图，窗口本身仍是我们的。
-        let view = AppView::new(mtm, AppOptions::default());
-        window.setContentView(Some(&view.view()));
-
-        Self { window, _delegate: delegate, view }
+        Self {
+            window,
+            _delegate: delegate,
+        }
     }
 
-    /// 宿主通道：命令与事件的接入点。在 load 之前也可用——
-    /// 通道由 AppView 持有，先注册 handler 再载入界面可以避免漏掉启动事件。
+    fn show(&self, mtm: MainThreadMarker) {
+        if self.window.isMiniaturized() {
+            self.window.deminiaturize(None);
+        }
+        self.window.makeKeyAndOrderFront(None);
+        NSApplication::sharedApplication(mtm).activate();
+    }
+}
+
+/// 应用库的 nsh 宿主窗口。
+pub struct Window {
+    owned: OwnedWindow,
+    view: Rc<AppView>,
+}
+
+impl Window {
+    pub fn new(mtm: MainThreadMarker, title: &str, size: (f64, f64), on_close: CloseFn) -> Self {
+        let owned = OwnedWindow::new(mtm, title, size, on_close);
+        let view = AppView::new(mtm, AppOptions::default());
+        owned.window.setContentView(Some(&view.view()));
+        Self { owned, view }
+    }
+
     pub fn channel(&self) -> nsh_engine::HostChannel {
         self.view.host()
     }
 
-    /// 载入 Rust 根组件。
     pub fn load_rust(&self, root: nsh_platform_macos::Root) {
         self.view.load(nsh_engine::App::Rust(root));
     }
 
-    /// 从 nsh build 的产物目录载入界面。
-    ///
-    /// 用 [nsh_engine::Bundle::read] 而非读字符串进 Bundle::source：它会一并
-    /// 读取同目录的 source map、capabilities.json 与 app.json。手工拼 Bundle
-    /// 会漏掉 capabilities，而 capabilities.host 默认什么都不授予——漏掉的
-    /// 结果是界面上每个 host.call 都被拒，且错误出现在运行期而非构建期。
+    /// 同时载入构建产物中的 source map、能力声明与 app.json。
     pub fn load_bundle_dir(&self, bundle_js: &std::path::Path) -> Result<(), String> {
         let bundle = nsh_engine::Bundle::read(bundle_js).map_err(|e| e.to_string())?;
         self.view.load(nsh_engine::App::Js(bundle));
         Ok(())
     }
 
-    /// 从内存中的 JS 源载入，并显式给出能力声明。
-    ///
-    /// 供内嵌与测试使用。capabilities_json 不可省略：不传等于「什么都不授予」。
-    /// 格式与 nsh build 产出的 capabilities.json 一致。
     pub fn load_bundle_source(&self, code: String, capabilities_json: &str) -> Result<(), String> {
-        let bundle = nsh_engine::Bundle::source(code)
-            .with_capabilities_json(Some(capabilities_json))?;
+        let bundle =
+            nsh_engine::Bundle::source(code).with_capabilities_json(Some(capabilities_json))?;
         self.view.load(nsh_engine::App::Js(bundle));
         Ok(())
     }
 
-    /// 注册视频表面组件。
-    ///
-    /// 必须在 load 之前调用：组件注册晚于界面载入，界面上那个
-    /// `<native name="windroid.video">` 就是无效的，表现为空白区域。
-    pub fn register_video(&self, slot: &crate::video::FrameSlot, mtm: MainThreadMarker) {
-        crate::video::register(&self.view, mtm, std::sync::Arc::clone(slot));
-    }
-
-    /// 显示并激活。
     pub fn show(&self, mtm: MainThreadMarker) {
-        self.window.makeKeyAndOrderFront(None);
-        NSApplication::sharedApplication(mtm).activate();
+        self.owned.show(mtm);
     }
-
-    /// 请求关闭。走标准关闭流程，因此会经过代理——这正是可验证之处。
     pub fn request_close(&self) {
-        self.window.performClose(None);
+        self.owned.window.performClose(None);
     }
-
-    /// 窗口是否仍可见。用于验证拦截确实生效。
     pub fn is_visible(&self) -> bool {
-        self.window.isVisible()
+        self.owned.window.isVisible()
+    }
+    pub fn title(&self) -> String {
+        self.owned.window.title().to_string()
+    }
+}
+
+/// 视频窗口直接承载响应鼠键的 NSView。每个实例独占一层像素和一条输入通道。
+pub struct VideoWindow {
+    owned: OwnedWindow,
+    canvas: Retained<crate::video::Canvas>,
+}
+
+impl VideoWindow {
+    pub fn new(
+        mtm: MainThreadMarker,
+        title: &str,
+        size: (f64, f64),
+        on_close: CloseFn,
+        input: Box<dyn Fn(stream::InputEvent)>,
+        resize: Option<Box<dyn Fn(u16, u16)>>,
+    ) -> Self {
+        let owned = OwnedWindow::new(mtm, title, size, on_close);
+        let canvas = crate::video::Canvas::make(mtm, input, resize);
+        owned.window.setBackgroundColor(Some(
+            &nsh_platform_macos::objc2_app_kit::NSColor::blackColor(),
+        ));
+        owned.window.setContentMinSize(NSSize::new(240.0, 180.0));
+        owned.window.setContentView(Some(&canvas));
+        owned.window.setInitialFirstResponder(Some(&canvas));
+        owned.window.makeFirstResponder(Some(&canvas));
+        // AppKit 逐窗错开顶部坐标，防止新显示恰好盖住旧窗口。
+        thread_local! { static NEXT: std::cell::Cell<NSPoint> = const { std::cell::Cell::new(NSPoint::new(0.0, 0.0)) }; }
+        NEXT.with(|p| p.set(owned.window.cascadeTopLeftFromPoint(p.get())));
+        Self { owned, canvas }
     }
 
-    /// 窗口标题，供断言。
-    pub fn title(&self) -> String {
-        self.window.title().to_string()
+    pub fn show(&self, mtm: MainThreadMarker) {
+        self.owned.show(mtm);
+    }
+    pub fn set_title(&self, title: &str) {
+        self.owned.window.setTitle(&NSString::from_str(title));
+    }
+    pub fn draw(&self, frame: stream::Frame) -> Result<(), String> {
+        self.canvas.draw_frame(frame)
+    }
+
+    /// 异步 sheet 只锁定所属窗口。关闭窗口时取消尚未答复的 sheet。
+    pub fn ask_close(
+        &self,
+        mtm: MainThreadMarker,
+        label: &str,
+        reply: impl Fn(Option<CloseChoice>, bool) + 'static,
+    ) {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(&format!("关闭「{label}」？")));
+        alert.setInformativeText(&NSString::from_str(
+            "保留后台后，可从应用库的“运行中”重新打开。完全退出将结束应用并移除其任务。",
+        ));
+        alert.addButtonWithTitle(&NSString::from_str("保留后台"));
+        alert.addButtonWithTitle(&NSString::from_str("完全退出"));
+        alert
+            .addButtonWithTitle(&NSString::from_str("取消"))
+            .setKeyEquivalent(&NSString::from_str("\x1b"));
+        alert.setShowsSuppressionButton(true);
+        let checkbox = alert.suppressionButton();
+        if let Some(check) = &checkbox {
+            check.setTitle(&NSString::from_str("对所有应用窗口记住我的选择"));
+        }
+        let done = RcBlock::new(move |code| {
+            let choice = if code == NSAlertFirstButtonReturn {
+                Some(CloseChoice::Background)
+            } else if code == NSAlertSecondButtonReturn {
+                Some(CloseChoice::Quit)
+            } else {
+                None
+            };
+            reply(
+                choice,
+                choice.is_some()
+                    && checkbox
+                        .as_ref()
+                        .is_some_and(|c| c.state() == NSControlStateValueOn),
+            );
+        });
+        alert.beginSheetModalForWindow_completionHandler(&self.owned.window, Some(&done));
+    }
+}
+
+impl Drop for VideoWindow {
+    fn drop(&mut self) {
+        let window = &self.owned.window;
+        if let Some(sheet) = window.attachedSheet() {
+            window.endSheet(&sheet);
+        }
+        window.setDelegate(None);
+        // 管理器已完成策略判断，close 执行回收；performClose 则会重入询问。
+        window.close();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseChoice {
+    Background,
+    Quit,
+}
+
+/// picker 绑定发起请求时的实例。取消只产生 None。
+pub fn pick_apk(mtm: MainThreadMarker, chosen: impl Fn(Option<PathBuf>) + 'static) {
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(false);
+    panel.setAllowsMultipleSelection(false);
+    panel.setPrompt(Some(&NSString::from_str("添加 APK")));
+    #[allow(deprecated)]
+    panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[NSString::from_str(
+        "apk",
+    )])));
+    let selection = panel.clone();
+    let reply = RcBlock::new(move |code| {
+        chosen(
+            (code == NSModalResponseOK)
+                .then(|| selection.URL()?.to_file_path())
+                .flatten(),
+        );
+    });
+    match NSApplication::sharedApplication(mtm).keyWindow() {
+        Some(parent) => panel.beginSheetModalForWindow_completionHandler(&parent, &reply),
+        None => panel.beginWithCompletionHandler(&reply),
     }
 }

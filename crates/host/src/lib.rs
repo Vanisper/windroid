@@ -9,15 +9,19 @@
 //!
 //! 窗口所有权与关闭拦截见 [surface]，那部分依赖平台。
 
-use std::sync::mpsc;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::thread;
 
-use contract::{Ack, Command, Facts, Phase, Rejection, Snapshot, State};
+#[cfg(test)]
+use contract::Ack;
+use contract::{Command, Facts, Phase, Rejection, Snapshot, State};
 use device::Handle;
-use nsh_engine::{HostCall, HostChannel, JsonValue};
+use nsh_engine::{HostChannel, JsonValue};
 
 pub mod actions;
+mod groups;
+mod library;
+pub use library::Library;
 pub mod surface;
 pub mod video;
 
@@ -33,179 +37,60 @@ pub mod names {
     pub const READINESS: &str = "windroid.readiness";
 }
 
-/// 运行时自检结果，序列化为界面可读的 JSON。
-///
-/// 界面拿到的是「缺什么、后果是什么」，而不是错误码——用户在首次启动时
-/// 需要的是一句能照做的话。
-fn readiness_view() -> ReadinessView {
-    // 自检要扫文件系统，而快照在每次点击时都会被取。运行时组件在进程
-    // 生命周期内不会变（变了要重启），因此第一次扫描后复用结果。
-    static CACHE: std::sync::OnceLock<ReadinessView> = std::sync::OnceLock::new();
-    CACHE.get_or_init(scan_readiness).clone()
-}
+/// 界面绑定的宿主能力。许可页只使用 HTTPS。
+pub const CAPABILITIES_JSON: &str = r#"{"host":["windroid.*"],"openUrl":{"schemes":["https"]}}"#;
 
-fn scan_readiness() -> ReadinessView {
-    let r = runtime::prepare::check();
-    ReadinessView {
-        usable: r.usable(),
-        avds: r.avds,
-        components: r
-            .components
-            .iter()
-            .map(|c| ComponentView {
-                name: c.name,
-                ok: c.ok,
-                path: c.path.as_ref().map(|p| p.display().to_string()),
-                remedy: c.remedy,
-            })
-            .collect(),
-    }
-}
-
-/// 界面所需的能力声明，对应 nsh build 产出的 capabilities.json。
-///
-/// 必须显式声明：没有 capabilities 的 app，host 一项是空的——
-/// 每个 host.call 都会被拒。用前缀 "windroid.*" 而不是 true，
-/// 后者展开成 ["*"]，等于把整套宿主接口全开。
-pub const CAPABILITIES_JSON: &str = r#"{"host":["windroid.*"]}"#;
-
-/// 把设备域接到界面。
+/// 为宿主测试挂载一个设备，使用与应用相同的快照和命令通道。
 pub struct Bridge {
+    _library: Arc<Library>,
     handle: Handle,
     channel: HostChannel,
 }
 
-/// 全局的界面通道。
-///
-/// 视频流的生命周期不归设备域管（它由应用组装），但它变化时界面必须知道，
-/// 否则「流已断开」这件事永远到不了界面。因此留一个进程级入口，
-/// 由组装方在创建窗口时设置一次。
-static CHANNEL: std::sync::OnceLock<HostChannel> = std::sync::OnceLock::new();
-
-/// 登记界面通道，供非设备域的模块推送通知。
-pub fn register_channel(channel: HostChannel) {
-    let _ = CHANNEL.set(channel);
-}
-
-/// 通知界面数据变了。
-///
-/// 载荷为空：界面收到即重取快照。事件只承担「有变化」这一个语义，
-/// 不携带状态副本——两份状态必然不同步。
-pub fn notify() {
-    if let Some(ch) = CHANNEL.get() {
-        let _ = ch.send(names::EVENT, JsonValue::Null);
-    }
-}
-
 impl Bridge {
-    /// 建立桥并启动后台线程。
-    ///
-    /// 两个线程：
-    /// - 分发线程串行执行命令。串行是必要的：命令有先后依赖（先 Create 才能 Start），
-    ///   并发执行会让准入判断与实际状态错位。
-    /// - 转发线程把事件推给界面。
-    ///
-    /// 不用「每条命令一个线程」：用户连点时线程数无界，且顺序失去保证。
     pub fn attach(handle: Handle, channel: HostChannel, events: device::Events) -> Arc<Self> {
-        register_channel(channel.clone());
-        let bridge = Arc::new(Self {
-            handle: handle.clone(),
-            channel: channel.clone(),
-        });
-
-        // 命令：handler 只入队，立即返回，引擎线程不受阻。
-        let (tx, rx) = mpsc::channel::<HostCall>();
-        channel.handle(names::COMMAND, move |call: HostCall| {
-            if let Err(e) = tx.send(call) {
-                // 分发线程已退出：直接拒绝，不让界面无限等待。
-                e.0.reject("命令分发线程已退出");
-            }
-        });
-
-        let dispatcher = handle.clone();
-        thread::Builder::new()
-            .name("windroid-dispatch".into())
-            .spawn(move || {
-                for call in rx {
-                    let reply = execute(&dispatcher, call.data());
-                    call.resolve(reply);
-                }
-            })
-            .expect("spawn command dispatcher");
-
-        // 快照：纯读，就地回复。
-        let snap_handle = handle.clone();
-        // 自检：读本机现状，不启动任何进程，因此可以直接在引擎线程上做。
-        channel.handle(names::READINESS, move |call: HostCall| {
-            call.resolve(to_json(&readiness_view()));
-        });
-
-        channel.handle(names::SNAPSHOT, move |call: HostCall| {
-            let snap = snap_handle.snapshot();
-            let apps = snap.apps.clone();
-            // 桌面状态随快照一起来，不在这里现查：查一次是一条 30ms 的 adb
-            // 命令，而这个 handler 跑在引擎线程上，等于给每次点击加延迟。
-            let home = snap.desktop.clone();
-            let mut view = SnapshotView::of(snap);
-            view.readiness = Some(readiness_view());
-            view.stream_note = crate::video::stream_note();
-            view = view.with_apps(&apps, &home);
-            call.resolve(to_json(&view));
-        });
-
-        // 事件：独立线程转发。
-        let ch = channel.clone();
-        thread::Builder::new()
-            .name("windroid-events".into())
-            .spawn(move || {
-                while let Some(e) = events.recv() {
-                    if ch.send(names::EVENT, to_json(&e)).is_err() {
-                        log::warn!("事件名被拒绝，转发停止");
-                        break;
-                    }
-                }
-            })
-            .expect("spawn event forwarder");
-
-        bridge
+        let library = Library::fixture(channel.clone(), handle.clone(), events);
+        Arc::new(Self {
+            _library: library,
+            handle,
+            channel,
+        })
     }
 
-    /// 当前快照。
     pub fn snapshot(&self) -> Snapshot {
         self.handle.snapshot()
     }
-
-    /// 底层句柄，供不需要界面的调用方（例如集成测试）使用。
     pub fn handle(&self) -> &Handle {
         &self.handle
     }
-
-    /// 通道，供测试断言推送内容。
     pub fn channel(&self) -> &HostChannel {
         &self.channel
     }
 }
 
-/// 把界面的调用翻译成命令，结果编码成回传 JSON。
+fn device_command(data: &JsonValue) -> Result<Command, Rejection> {
+    if let Some(cmd) = translate_action(data) {
+        return Ok(cmd);
+    }
+    if data["kind"] == "install" {
+        let path = data["apkPath"]
+            .as_str()
+            .or_else(|| data["apk_path"].as_str())
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| library::error("请选择 APK 文件"))?;
+        return Ok(Command::Install {
+            apk_path: path.to_owned(),
+        });
+    }
+    serde_json::from_value(data.clone()).map_err(|e| library::error(format!("命令无法解析: {e}")))
+}
+
+#[cfg(test)]
 fn execute(handle: &Handle, data: &JsonValue) -> JsonValue {
-    // 两种输入形状：完整的命令（create/start/stop/install），或一条操作
-    // （launch/setDefaultHome/...）。操作只带 kind 与包名，因此先试操作。
-    let cmd = match translate_action(data) {
-        Some(c) => c,
-        None => match serde_json::from_value(data.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                // 解析失败是界面侧的 bug，不能静默：回一个明确的拒绝。
-                return to_json(&Ack::Rejected {
-                    reason: Rejection::Error {
-                        code: contract::ErrorCode::Other,
-                        detail: format!("命令无法解析: {e}"),
-                    },
-                });
-            }
-        },
-    };
-    to_json(&handle.send(cmd))
+    to_json(&match device_command(data) {
+        Ok(cmd) => handle.send(cmd),
+        Err(reason) => Ack::Rejected { reason },
+    })
 }
 
 /// 把界面回传的操作翻译成设备域命令。
@@ -276,15 +161,8 @@ pub struct SnapshotView {
     pub stuck_at: Option<&'static str>,
     /// 当前可执行的操作。界面按钮的禁用以此为准，不自己判断状态。
     pub capabilities: contract::Capabilities,
-    /// 桌面状态。派生操作时需要，不直接下发。
-    #[serde(skip)]
-    pub home_state: Option<contract::Desktop>,
-    /// 运行时自检。null 表示还没查。
-    pub readiness: Option<ReadinessView>,
     /// 应用库分组。界面直接渲染，不自己判断归属。
     pub groups: Vec<GroupView>,
-    /// 视频流状态。None 表示正常；有值时界面必须显示出来。
-    pub stream_note: Option<String>,
     /// 桌面状态（哪些能当桌面、当前是谁）。界面用它在卡片上标记。
     ///
     /// 与 groups 分开：这是设备的一类能力状态，不是应用分组。
@@ -297,6 +175,8 @@ pub struct SnapshotView {
 pub struct DesktopView {
     /// 当前默认桌面的包名。
     pub default_package: Option<String>,
+    pub candidates: Vec<String>,
+    pub candidate_labels: BTreeMap<String, String>,
 }
 
 /// 一个应用分组。
@@ -306,8 +186,8 @@ pub struct DesktopView {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupView {
-    pub id: &'static str,
-    pub name: &'static str,
+    pub id: String,
+    pub name: String,
     /// 组内应用数。
     pub count: usize,
     pub apps: Vec<AppItemView>,
@@ -327,24 +207,6 @@ pub struct AppItemView {
     pub actions: Vec<crate::actions::Action>,
 }
 
-/// 自检结果的界面形态。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadinessView {
-    pub usable: bool,
-    pub avds: Vec<String>,
-    pub components: Vec<ComponentView>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComponentView {
-    pub name: &'static str,
-    pub ok: bool,
-    pub path: Option<String>,
-    pub remedy: &'static str,
-}
-
 impl SnapshotView {
     pub fn of(snapshot: Snapshot) -> Self {
         let summary = describe(snapshot.state, snapshot.phase, &snapshot.facts);
@@ -354,11 +216,8 @@ impl SnapshotView {
             stuck_at: stuck,
             summary,
             capabilities,
-            readiness: None,
             groups: Vec::new(),
             desktop: None,
-            stream_note: None,
-            home_state: None,
             snapshot,
         }
     }
@@ -368,12 +227,12 @@ impl SnapshotView {
     /// 三条规则：
     /// - **能否启动**由 LAUNCHER 决定，这是进「已安装 / 系统应用」的硬条件；
     /// - **桌面**由 HOME 决定，与系统/用户正交——用户装的第三方桌面是合格的；
-    /// - 没有任何 LAUNCHER 但声明了 HOME 的（只作桌面），单独成组，
-    ///   否则它们在界面上无处可去。
+    /// - 只声明 HOME 的应用出现在桌面选择器。
     pub fn with_apps(mut self, apps: &[contract::AppEntry], home: &contract::Desktop) -> Self {
-        self.home_state = Some(home.clone());
         self.desktop = Some(DesktopView {
             default_package: home.default.as_ref().map(|p| p.to_string()),
+            candidates: home.candidates.iter().map(ToString::to_string).collect(),
+            candidate_labels: home.candidate_labels.clone(),
         });
         let item = |a: &contract::AppEntry| AppItemView {
             package: a.package.to_string(),
@@ -413,8 +272,8 @@ impl SnapshotView {
                 return;
             }
             groups.push(GroupView {
-                id,
-                name,
+                id: id.to_owned(),
+                name: name.to_owned(),
                 count: list.len(),
                 apps: list.iter().map(item).collect(),
             });

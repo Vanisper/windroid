@@ -8,3 +8,6 @@ description = "流域：scrcpy 协议握手、视频包解析、帧解码。不�
 
 [dependencies]
 adb = { path = "../adb" }
+
+[build-dependencies]
+cc = "1"

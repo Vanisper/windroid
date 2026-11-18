@@ -7,7 +7,7 @@
 use runtime::catalog;
 
 fn serial() -> String {
-    std::env::var("WINDROID_SERIAL").unwrap_or_else(|_| "emulator-5554".to_owned())
+    std::env::var("WINDROID_SERIAL").expect("请指定本次验收实例的 WINDROID_SERIAL")
 }
 
 #[test]

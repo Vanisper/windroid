@@ -1921,11 +1921,13 @@ checksum = "5286b48a73829e3541cd9f533359c01150f7879e2716796eda0631ad5fe7e668"
 name = "host"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "contract",
  "device",
  "dispatch2",
  "env_logger",
  "log",
+ "nsh-base",
  "nsh-core",
  "nsh-engine",
  "nsh-platform-macos",
@@ -5914,6 +5916,7 @@ name = "stream"
 version = "0.1.0"
 dependencies = [
  "adb",
+ "cc",
 ]
 
 [[package]]
@@ -7335,6 +7338,7 @@ dependencies = [
  "nsh-core",
  "nsh-platform-macos",
  "runtime",
+ "stream",
 ]
 
 [[package]]

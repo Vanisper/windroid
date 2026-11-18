@@ -1,144 +1,281 @@
-//! 应用展示名。
-//!
-//! 包名对用户没有意义，必须换成应用自己声明的名字（`application-label`）。
-//! 名字在 APK 的资源里，只能拉下 APK 用 aapt2 读。
-//!
-//! 每个应用要拉一次 APK（可达数十 MB），因此必须缓存：按
-//! `包名-版本号` 建键，应用更新后自动失效。缓存放在实例目录之外，
-//! 因为同一份 APK 跨实例相同。
+//! 按实例缓存应用展示名。每次刷新先向用户 0 的包索引核对完整 versionCode 和安装路径。
+//! 读取失败时省略该项，应用库使用包名，下次刷新继续尝试。
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-/// 标签缓存。
+use contract::InstanceId;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::catalog::{error_line, valid_package};
+use crate::provision::RuntimePaths;
+
+const INDEX: &str = "pm list packages -f --show-versioncode --user 0";
+const REFRESH_BUDGET: Duration = Duration::from_secs(15);
+const COMMAND_BUDGET: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstalledApk {
+    version: u64,
+    path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedLabel {
+    apk: InstalledApk,
+    name: String,
+}
+
 pub struct Labels {
     dir: PathBuf,
-    /// 内存缓存，避免每次读盘。
-    memory: BTreeMap<String, String>,
+    paths: RuntimePaths,
 }
 
 impl Labels {
-    pub fn new(cache_root: &Path) -> Self {
-        let dir = cache_root.join("labels");
-        let _ = std::fs::create_dir_all(&dir);
-        Self { dir, memory: BTreeMap::new() }
+    pub fn new(home: &Path, instance: &InstanceId) -> Self {
+        // 实例 ID 随清单持久化。模拟器端口在删除实例后可能分配给其他设备。
+        let key = format!("{:x}", Sha256::digest(instance.as_str().as_bytes()));
+        Self {
+            dir: home.join("cache/labels").join(key),
+            paths: RuntimePaths::discover(home),
+        }
     }
 
-    /// 取一批应用的展示名。已有的走缓存，缺的补齐。
-    ///
-    /// 返回 `包名 → 名字`。取不到的不出现在结果里——调用方用包名兜底，
-    /// 而不是显示一个空白项。
+    /// 返回成功核验的包名与展示名。单轮预算覆盖索引、APK 拉取及资源解析。
     pub fn resolve(&mut self, serial: &str, packages: &[String]) -> BTreeMap<String, String> {
-        let mut out = BTreeMap::new();
-        for pkg in packages {
-            if let Some(name) = self.memory.get(pkg) {
-                out.insert(pkg.clone(), name.clone());
+        let deadline = Instant::now() + REFRESH_BUDGET;
+        let mut names = BTreeMap::new();
+        if packages.is_empty() {
+            return names;
+        }
+        let Some(index) = self.index(serial, deadline) else {
+            return names;
+        };
+        let mut missing = Vec::new();
+        for package in packages {
+            let Some(apk) = index.get(package) else {
                 continue;
-            }
-            if let Some((version, name)) = self.read_cache(pkg) {
-                self.memory.insert(pkg.clone(), name.clone());
-                let _ = version;
-                out.insert(pkg.clone(), name);
-                continue;
-            }
-            if let Some((version, name)) = self.fetch(serial, pkg) {
-                self.store(pkg, &version, &name);
-                self.memory.insert(pkg.clone(), name.clone());
-                out.insert(pkg.clone(), name);
+            };
+            let saved: Option<CachedLabel> = fs::read(self.cache_file(package))
+                .ok()
+                .and_then(|buf| serde_json::from_slice(&buf).ok());
+            if let Some(saved) = saved.filter(|saved| &saved.apk == apk && usable(&saved.name)) {
+                names.insert(package.clone(), saved.name);
+            } else {
+                missing.push((package, apk));
             }
         }
-        out
+        if missing.is_empty() || !self.paths.aapt.is_file() {
+            return names;
+        }
+        let Ok(scratch) = Scratch::create(&self.dir) else {
+            return names;
+        };
+        // 把末次索引查询的时间留出来，慢包耗尽预算时也能保留本轮已核验的结果。
+        let fetch_until =
+            deadline - (deadline.saturating_duration_since(Instant::now()) / 3).min(COMMAND_BUDGET);
+        let mut fetched = Vec::new();
+        for (package, apk) in missing {
+            if Instant::now() >= fetch_until {
+                break;
+            }
+            // 每个批次独占暂存目录，每次只保留一个 APK，数百 MB 的拉取也不累计磁盘占用。
+            let local = scratch.0.join(format!("{package}.apk"));
+            let name = self.fetch(serial, package, apk, &local, fetch_until);
+            let _ = fs::remove_file(&local);
+            if let Some(name) = name {
+                fetched.push((package, apk, name));
+            }
+        }
+        if fetched.is_empty() && names.is_empty() {
+            return names;
+        }
+        // 拉取期间应用可能更新。只发布结束时仍对应同一版本、同一路径的名称。
+        let Some(current) = self.index(serial, deadline) else {
+            return BTreeMap::new();
+        };
+        names.retain(|package, _| current.get(package) == index.get(package));
+        for (package, apk, name) in fetched {
+            if current.get(package) != Some(apk) {
+                continue;
+            }
+            let saved = CachedLabel {
+                apk: apk.clone(),
+                name,
+            };
+            let temp = scratch.0.join("label.json");
+            if let Ok(buf) = serde_json::to_vec(&saved)
+                && fs::write(&temp, buf).is_ok()
+            {
+                let _ = fs::rename(temp, self.cache_file(package));
+            }
+            names.insert(package.clone(), saved.name);
+        }
+        names
     }
 
-    fn cache_key(&self, pkg: &str) -> PathBuf {
-        self.dir.join(format!("{pkg}.txt"))
+    fn cache_file(&self, package: &str) -> PathBuf {
+        // macOS 文件系统通常忽略大小写，摘要使大小写不同的 Android 包名仍有各自的缓存。
+        self.dir
+            .join(format!("{:x}.json", Sha256::digest(package.as_bytes())))
     }
 
-    fn read_cache(&self, pkg: &str) -> Option<(String, String)> {
-        let text = std::fs::read_to_string(self.cache_key(pkg)).ok()?;
-        let mut lines = text.lines();
-        let version = lines.next()?.to_owned();
-        let name = lines.next()?.to_owned();
-        (!name.is_empty()).then_some((version, name))
+    fn index(&self, serial: &str, deadline: Instant) -> Option<BTreeMap<String, InstalledApk>> {
+        let mut cmd = Command::new(&self.paths.adb);
+        cmd.args(["-s", serial, "shell", INDEX]);
+        let text = stdout(cmd, deadline)?;
+        let mut packages = BTreeMap::new();
+        // -f 取 applicationInfo.sourceDir，--show-versioncode 取 longVersionCode。
+        // 安装路径中的随机目录名可以带多个 '='，从右侧切分。
+        // https://android.googlesource.com/platform/frameworks/base/+/android-14.0.0_r75/services/core/java/com/android/server/pm/PackageManagerShellCommand.java
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let (entry, version) = line
+                .strip_prefix("package:")?
+                .rsplit_once(" versionCode:")?;
+            let (path, package) = entry.rsplit_once('=')?;
+            if !valid_package(package) || !path.starts_with('/') || !path.ends_with(".apk") {
+                continue;
+            }
+            let apk = InstalledApk {
+                version: version.parse().ok()?,
+                path: path.into(),
+            };
+            if packages.insert(package.to_string(), apk).is_some() {
+                return None;
+            }
+        }
+        Some(packages)
     }
 
-    fn store(&self, pkg: &str, version: &str, name: &str) {
-        let _ = std::fs::write(self.cache_key(pkg), format!("{version}\n{name}"));
-    }
-
-    /// 拉 APK 并读标签。
-    fn fetch(&self, serial: &str, pkg: &str) -> Option<(String, String)> {
-        let version = version_of(serial, pkg)?;
-        // 版本号已变过说明有缓存也是旧的，先删。
-        let _ = std::fs::remove_file(self.cache_key(pkg));
-
-        let path = adb::shell(serial, &format!("pm path {pkg}")).ok()?;
-        let apk = path
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("package:"))?
-            .to_owned();
-
-        let tmp = std::env::temp_dir().join(format!("windroid-label-{}.apk", std::process::id()));
-        let pulled = adb::run(serial, &["pull", &apk, tmp.to_str()?]).ok()?;
-        if !pulled.has("1 file pulled") {
-            let _ = std::fs::remove_file(&tmp);
+    fn fetch(
+        &self,
+        serial: &str,
+        package: &str,
+        apk: &InstalledApk,
+        local: &Path,
+        deadline: Instant,
+    ) -> Option<String> {
+        let mut pull = Command::new(&self.paths.adb);
+        pull.args(["-s", serial, "pull", &apk.path]).arg(local);
+        stdout(pull, deadline)?;
+        let metadata = fs::metadata(local).ok()?;
+        if !metadata.is_file() || metadata.len() == 0 {
             return None;
         }
 
-        let name = aapt_label(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        let name = name?;
-        Some((version, name))
+        let mut badging = Command::new(&self.paths.aapt);
+        badging.args(["dump", "badging"]).arg(local);
+        let text = stdout(badging, deadline)?;
+        // aapt 的 badging 只报告低 32 位，完整版本在两次设备索引中核对。
+        let expected = format!(
+            "package: name='{package}' versionCode='{}'",
+            apk.version as u32
+        );
+        if !text.lines().any(|line| line.starts_with(&expected)) {
+            return None;
+        }
+        for key in [
+            "application-label-zh-CN:",
+            "application-label-zh-Hans:",
+            "application-label-zh:",
+            "application-label:",
+        ] {
+            if let Some(name) = text
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .and_then(|s| s.trim().strip_prefix('\'')?.strip_suffix('\''))
+                .map(str::trim)
+                .filter(|s| usable(s))
+            {
+                return Some(name.to_owned());
+            }
+        }
+        // 没有资源表的 APK 可能只有清单里的字面量标签，badging 不会列出它。
+        let mut tree = Command::new(&self.paths.aapt);
+        tree.args(["dump", "xmltree"])
+            .arg(local)
+            .arg("AndroidManifest.xml");
+        literal_label(&stdout(tree, deadline)?)
     }
 }
 
-/// 版本号。用于缓存失效。
-fn version_of(serial: &str, pkg: &str) -> Option<String> {
-    let out = adb::shell(serial, &format!("dumpsys package {pkg}")).ok()?;
-    out.lines()
-        .find_map(|l| l.trim().strip_prefix("versionName="))
-        .map(|v| v.trim().to_owned())
+fn literal_label(tree: &str) -> Option<String> {
+    let mut lines = tree.lines().map(str::trim);
+    lines.find(|line| {
+        line.strip_prefix("E: ")
+            .and_then(|v| v.split_whitespace().next())
+            == Some("application")
+    })?;
+    lines
+        .take_while(|line| !line.starts_with("E: "))
+        .find_map(|line| {
+            let (key, value) = line.strip_prefix("A: ")?.split_once('=')?;
+            if !key.ends_with(":label(0x01010001)") {
+                return None;
+            }
+            let value = value.split_once(" (Raw: ").map_or(value, |(v, _)| v);
+            let name = value.strip_prefix('"')?.strip_suffix('"')?.trim();
+            usable(name).then(|| name.to_owned())
+        })
 }
 
-/// 用 aapt2 读 `application-label`。
-///
-/// 优先取中文标签：应用名是给中文用户看的，很多应用有单独的 zh-CN 名字。
-fn aapt_label(apk: &Path) -> Option<String> {
-    let aapt = aapt2()?;
-    let out = Command::new(aapt).arg("dump").arg("badging").arg(apk).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-
-    let pick = |key: &str| -> Option<String> {
-        text.lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split(':').nth(1))
-            .map(|v| v.trim().trim_matches('\'').to_owned())
-            .filter(|v| !v.is_empty())
-    };
-    pick("application-label-zh-CN")
-        .or_else(|| pick("application-label-zh"))
-        .or_else(|| pick("application-label"))
+fn usable(name: &str) -> bool {
+    !name.trim().is_empty() && name.len() <= 1024 && !name.chars().any(char::is_control)
 }
 
-/// aapt2 的位置。发布版随运行时组件分发；开发期用系统 SDK。
-fn aapt2() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("WINDROID_AAPT2") {
-        return Some(PathBuf::from(p));
+fn stdout(cmd: Command, deadline: Instant) -> Option<String> {
+    let budget = deadline
+        .checked_duration_since(Instant::now())?
+        .min(COMMAND_BUDGET);
+    let out = adb::output_with_timeout(cmd, budget).ok()?;
+    if !out.status.success() || String::from_utf8_lossy(&out.stderr).lines().any(error_line) {
+        return None;
     }
-    let home = std::env::var_os("HOME")?;
-    let root = PathBuf::from(home).join("Library/Android/sdk/build-tools");
-    let mut versions: Vec<PathBuf> = std::fs::read_dir(&root)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect();
-    // 取最高版本。目录名是版本号，按字符串排序在个位数上够用；
-    // 将来跨到两位数时再改成解析版本号。
-    versions.sort();
-    versions
-        .into_iter()
-        .rev()
-        .map(|d| d.join("aapt2"))
-        .find(|p| p.is_file())
+    let text = String::from_utf8(out.stdout).ok()?;
+    (!text.lines().any(error_line)).then_some(text)
+}
+
+/// create_dir 以独占方式取得目录。进程内序号与已有目录检查覆盖并发刷新和 PID 复用。
+struct Scratch(PathBuf);
+impl Scratch {
+    fn create(parent: &Path) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        fs::create_dir_all(parent)?;
+        loop {
+            let path = parent.join(format!(
+                ".pull-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_label_command_yields_to_the_refresh_deadline() {
+        let mut stalled = Command::new("/bin/sleep");
+        stalled.arg("1");
+        assert!(stdout(stalled, Instant::now() + Duration::from_millis(40)).is_none());
+    }
 }

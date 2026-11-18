@@ -391,7 +391,7 @@ fn hard_limit_aborts_and_reports_failure() {
 
 /// 强制终止后仍可重新启动：资源已回收，不是死路。
 #[test]
-fn instance_can_restart_after_abort() {
+fn each_retry_has_fresh_soft_and_hard_limits() {
     let (h, ev) = spawn_test(
         id(),
         FakeBackend::new().stalling(),
@@ -405,7 +405,11 @@ fn instance_can_restart_after_abort() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image {
+                api: 34,
+                tag: "g".into(),
+                abi: "a".into(),
+            },
             disk_bytes: 1,
         },
     });
@@ -414,6 +418,17 @@ fn instance_can_restart_after_abort() {
 
     let ack = h.send(Command::Start);
     assert!(ack.is_accepted(), "Failed 之后应能重新启动: {ack:?}");
+    let Event::StateChanged { facts, .. } =
+        until_state(&ev, State::Starting, Duration::from_secs(5))
+            .expect("retry should begin a new attempt")
+    else {
+        unreachable!()
+    };
+    assert!(!facts.aborted && !facts.boot_stalled);
+    until_state(&ev, State::Stalled, Duration::from_secs(5)).expect("retry has its own soft limit");
+    until_state(&ev, State::Failed, Duration::from_secs(5)).expect("retry has its own hard limit");
+    let snapshot = h.snapshot();
+    assert!(snapshot.facts.aborted && !snapshot.facts.process_alive);
 }
 
 /// 停止后必须能重新启动。
@@ -447,4 +462,235 @@ fn start_clears_the_previous_stop_request() {
         snap.facts
     );
     until_state(&ev, State::Ready, Duration::from_secs(10)).expect("应能重新就绪");
+}
+
+/// 由测试精确控制下一次观测，避免靠短暂的中间态来撞发布顺序。
+#[derive(Default)]
+struct Controlled {
+    facts: Facts,
+    desktop: Desktop,
+}
+
+#[derive(Clone, Default)]
+struct ControlledBackend(std::sync::Arc<std::sync::Mutex<Controlled>>);
+
+impl Backend for ControlledBackend {
+    fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+        match cmd {
+            Command::SetDefaultHome { package } => {
+                self.0.lock().unwrap().desktop.default = Some(package.clone());
+            }
+            Command::Start => {
+                // actor 的失败标记留给 actor 管，模拟拒绝前后端已部分写入 facts。
+                if self.0.lock().unwrap().facts.aborted {
+                    facts.ever_launched = false;
+                    return Err(Rejection::NotReady {
+                        state: State::Failed,
+                    });
+                }
+                facts.ever_launched = true;
+                facts.process_alive = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self, facts: &mut Facts) {
+        facts.process_alive = false;
+        self.0.lock().unwrap().facts.aborted = true;
+    }
+
+    fn observe(&mut self, facts: &mut Facts) {
+        let g = self.0.lock().unwrap();
+        facts.dir_exists = true;
+        facts.adb_visible = g.facts.adb_visible;
+        facts.boot_completed = g.facts.boot_completed;
+        facts.services = g.facts.services;
+    }
+
+    fn desktop(&self) -> Desktop {
+        self.0.lock().unwrap().desktop.clone()
+    }
+}
+
+#[test]
+fn same_state_fact_and_desktop_only_changes_publish_current_snapshots() {
+    let b = ControlledBackend::default();
+    {
+        let mut g = b.0.lock().unwrap();
+        g.facts.adb_visible = true;
+        g.facts.services = Services {
+            activity: true,
+            package: true,
+            window: true,
+        };
+        g.desktop.candidates = vec![PackageName::new("test.home")];
+    }
+    let (h, ev) = spawn_test(id(), b.clone(), short_timeouts());
+    assert!(h.send(Command::Start).is_accepted());
+    until_state(&ev, State::Ready, Duration::from_secs(2)).expect("ready");
+    b.0.lock().unwrap().facts.boot_completed = true;
+    let changed =
+        until_state(&ev, State::Ready, Duration::from_secs(2)).expect("ready facts update");
+    let snapshot = h.snapshot();
+    assert!(snapshot.seq >= changed.seq());
+    assert!(
+        matches!(changed, Event::StateChanged { from: Some(State::Ready), ref facts, .. }
+        if facts.boot_completed && *facts == snapshot.facts)
+    );
+
+    let package = PackageName::new("test.home");
+    // 并发消费者与命令回执没有先后依赖，收到事件就应当能读到默认桌面。
+    let sender = h.clone();
+    let target = package.clone();
+    let cmd = std::thread::spawn(move || sender.send(Command::SetDefaultHome { package: target }));
+    let changed = ev
+        .recv_timeout(Duration::from_secs(2))
+        .expect("desktop-only event");
+    let snapshot = h.snapshot();
+    assert!(snapshot.seq >= changed.seq());
+    assert!(matches!(changed, Event::AppsChanged { ref apps, .. } if apps.is_empty()));
+    assert_eq!(snapshot.desktop.default, Some(package));
+    assert!(cmd.join().unwrap().is_accepted());
+    assert!(
+        ev.recv_timeout(Duration::from_millis(100)).is_none(),
+        "unchanged facts should stay quiet"
+    );
+}
+
+#[test]
+fn services_get_a_full_wait_after_adb_recovers() {
+    let b = ControlledBackend::default();
+    let (h, ev) = spawn_test(
+        id(),
+        b.clone(),
+        Timeouts {
+            adb: Duration::from_millis(120),
+            services: Duration::from_millis(50),
+            hard: Duration::from_secs(3),
+            poll: Duration::from_millis(5),
+        },
+    );
+    assert!(h.send(Command::Start).is_accepted());
+    let first = until_state(&ev, State::Stalled, Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        first,
+        Event::StateChanged {
+            phase: Some(Phase::WaitingAdb),
+            ..
+        }
+    ));
+    b.0.lock().unwrap().facts.adb_visible = true;
+    let recovered = until_state(&ev, State::Starting, Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        recovered,
+        Event::StateChanged {
+            phase: Some(Phase::Warming),
+            ..
+        }
+    ));
+    let later = until_state(&ev, State::Stalled, Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        later,
+        Event::StateChanged {
+            phase: Some(Phase::Warming),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejected_retry_keeps_the_previous_failure_diagnosis() {
+    let b = ControlledBackend::default();
+    let (h, ev) = spawn_test(
+        id(),
+        b,
+        Timeouts {
+            hard: Duration::from_millis(50),
+            ..short_timeouts()
+        },
+    );
+    assert!(h.send(Command::Start).is_accepted());
+    until_state(&ev, State::Failed, Duration::from_secs(2)).expect("aborted");
+    let failed = h.snapshot();
+    assert!(!h.send(Command::Start).is_accepted());
+    assert_eq!(failed, h.snapshot());
+    assert!(failed.facts.aborted && failed.facts.ever_launched);
+}
+
+#[test]
+fn stop_capability_includes_boot_and_stall() {
+    for state in [
+        State::Starting,
+        State::Stalled,
+        State::Ready,
+        State::Streaming,
+    ] {
+        assert!(Capabilities::of(state).stop, "cannot stop {state}");
+    }
+    for state in [
+        State::Absent,
+        State::Stopped,
+        State::Stopping,
+        State::Failed,
+    ] {
+        assert!(!Capabilities::of(state).stop, "redundant stop in {state}");
+    }
+    let b = ControlledBackend::default();
+    let (h, _ev) = spawn_test(id(), b, Timeouts::default());
+    assert!(h.send(Command::Start).is_accepted());
+    assert_eq!(h.snapshot().state, State::Starting);
+    assert!(h.send(Command::Stop).is_accepted());
+    // 该后端仍观测到原进程，二次 Stop 是幂等回执。
+    let stopping = h.snapshot();
+    assert_eq!(stopping.state, State::Stopping);
+    assert!(h.send(Command::Stop).is_accepted());
+    assert_eq!(h.snapshot(), stopping);
+}
+
+#[test]
+fn session_count_updates_publish_only_current_instance_facts() {
+    let (h, ev) = spawn_test(id(), FakeBackend::new(), short_timeouts());
+    assert!(!h.set_session_count(1).is_accepted());
+    let spec = Spec {
+        template: "t".into(),
+        image: Image {
+            api: 34,
+            tag: "g".into(),
+            abi: "a".into(),
+        },
+        disk_bytes: 1,
+    };
+    assert!(h.send(Command::Create { spec }).is_accepted());
+    assert!(h.send(Command::Start).is_accepted());
+    until_state(&ev, State::Ready, Duration::from_secs(2)).unwrap();
+    for (count, expected) in [
+        (1, State::Streaming),
+        (2, State::Streaming),
+        (0, State::Ready),
+    ] {
+        assert!(h.set_session_count(count).is_accepted());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let event = ev
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            if let Event::StateChanged { to, seq, facts, .. } = event
+                && facts.session_count == count
+            {
+                assert_eq!(to, expected);
+                let snapshot = h.snapshot();
+                assert!(snapshot.seq >= seq);
+                assert_eq!(snapshot.facts.session_count, count);
+                assert_eq!(snapshot.state, expected);
+                break;
+            }
+        }
+    }
+    assert!(h.set_session_count(1).is_accepted());
+    assert!(h.send(Command::Stop).is_accepted());
+    assert_eq!(h.snapshot().facts.session_count, 0);
+    assert!(!h.set_session_count(1).is_accepted());
+    assert!(h.set_session_count(0).is_accepted());
 }

@@ -38,7 +38,7 @@ impl HomeState {
 pub fn snapshot(serial: &str) -> Result<Vec<AppEntry>, String> {
     let user = packages(serial, "-3")?;
     let system = packages(serial, "-s")?;
-    let launcher = component_packages(serial, "android.intent.category.LAUNCHER")?;
+    let launcher = component_packages(serial, LAUNCHER)?;
 
     let mut out = Vec::new();
     for (pkgs, is_system) in [(user, false), (system, true)] {
@@ -63,95 +63,224 @@ pub fn snapshot(serial: &str) -> Result<Vec<AppEntry>, String> {
     Ok(out)
 }
 
-/// 读桌面状态：哪些应用能当桌面、当前默认是谁。
+/// 读桌面候选与默认桌面。系统选择器是占位解析结果，只有候选可以成为默认桌面。
 pub fn home_state(serial: &str) -> Result<HomeState, String> {
+    let candidates = component_packages(serial, HOME)?;
+    let default = default_home_package(serial)?.filter(|package| candidates.contains(package));
     Ok(HomeState {
-        candidates: component_packages(serial, "android.intent.category.HOME")?,
-        default: default_home_package(serial)?,
+        candidates,
+        default,
     })
 }
 
-/// 列出包名。`kind` 为 `-3`（用户安装）或 `-s`（系统）。
+const HOME: &str = "android.intent.category.HOME";
+const LAUNCHER: &str = "android.intent.category.LAUNCHER";
+
+/// Android 包名会进入设备端 shell。各段以 ASCII 字母开头，后接字母、数字、下划线。
+/// 单段系统包（例如 android）同样允许。
+pub fn valid_package(package: &str) -> bool {
+    !package.is_empty()
+        && package.split('.').all(|part| {
+            let mut chars = part.bytes();
+            chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        })
+}
+
+pub(crate) fn require_package(package: &str) -> Result<(), String> {
+    if valid_package(package) {
+        Ok(())
+    } else {
+        Err("Android 包名无效".into())
+    }
+}
+
+/// adb 或 Android shell 可能在输出错误时仍退出 0。错误不能变成空目录或任务消失。
+pub(crate) fn checked_shell(serial: &str, cmd: &str) -> Result<adb::AdbOutput, String> {
+    check_output(adb::shell(serial, cmd))
+}
+
+fn check_output(output: std::io::Result<adb::AdbOutput>) -> Result<adb::AdbOutput, String> {
+    let out = output.map_err(|e| format!("设备命令未能完成：{e}"))?;
+    if out.code != Some(0) || out.stdout.lines().chain(out.stderr.lines()).any(error_line) {
+        return Err(diagnostic(&out));
+    }
+    Ok(out)
+}
+
+pub(crate) fn error_line(line: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with("*** SERVICE") && line.contains("DUMP TIMEOUT") {
+        return true;
+    }
+    [
+        "Error:",
+        "Error type ",
+        "error:",
+        "Failure",
+        "Failed",
+        "failed",
+        "adb: failed",
+        "adb: error:",
+        "Exception occurred",
+        "Security exception",
+        "java.lang.",
+        "Can't find service:",
+        "cmd: Can't find service:",
+        "Unknown command",
+        "Permission Denial:",
+        "DUMP TIMEOUT",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+pub(crate) fn diagnostic(out: &adb::AdbOutput) -> String {
+    out.stderr
+        .lines()
+        .chain(out.stdout.lines())
+        .find(|l| error_line(l))
+        .or_else(|| {
+            out.stderr
+                .lines()
+                .chain(out.stdout.lines())
+                .find(|l| !l.trim().is_empty())
+        })
+        .map(|l| l.trim().to_owned())
+        .unwrap_or_else(|| format!("adb 未返回诊断（退出码 {:?}）", out.code))
+}
+
 fn packages(serial: &str, kind: &str) -> Result<Vec<String>, String> {
-    let out = adb::shell(serial, &format!("pm list packages {kind}"))
-        .map_err(|e| format!("查询应用清单失败: {e}"))?;
-    Ok(out
-        .lines()
-        .filter_map(|l| l.strip_prefix("package:"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect())
+    let out = checked_shell(serial, &format!("pm list packages {kind} --user 0"))?;
+    let mut packages = Vec::new();
+    for line in out.lines() {
+        let pkg = line
+            .strip_prefix("package:")
+            .filter(|p| valid_package(p))
+            .ok_or("无法解析包索引")?;
+        packages.push(pkg.to_owned());
+    }
+    if kind == "-s" && !packages.iter().any(|pkg| pkg == "android") {
+        return Err("未取得系统包索引".into());
+    }
+    Ok(packages)
 }
 
-/// 声明了某 category 的组件，取其包名集合。
-///
-/// `query-activities` 即使带 `--brief` 也会输出带缩进的多行块，组件行形如
-/// `com.example/.MainActivity`。因此不能按首列取，要找出含斜杠的行。
-fn component_packages(serial: &str, category: &str) -> Result<std::collections::BTreeSet<String>, String> {
+fn component_package(component: &str) -> Option<&str> {
+    let (package, class) = component.split_once('/')?;
+    (valid_package(package)
+        && !class.is_empty()
+        && class
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '$')))
+    .then_some(package)
+}
+
+/// --brief 的组件行独占一行，旁边是优先级、计数等元数据。
+fn components(serial: &str, category: &str) -> Result<Vec<String>, String> {
     let cmd = format!(
-        "cmd package query-activities --brief -a android.intent.action.MAIN -c {category}"
+        "cmd package query-activities --brief --user 0 -a android.intent.action.MAIN -c {category}"
     );
-    let out = adb::shell(serial, &cmd).map_err(|e| format!("查询 {category} 失败: {e}"))?;
-    Ok(out
+    let out = checked_shell(serial, &cmd)?;
+    let result: Vec<_> = out
         .lines()
-        .map(str::trim)
-        .filter(|l| l.contains('/'))
-        .filter_map(|l| l.split('/').next())
-        .filter(|p| !p.is_empty() && !p.contains(' '))
+        .filter(|l| component_package(l).is_some())
         .map(str::to_owned)
+        .collect();
+    if result.is_empty()
+        && !out
+            .lines()
+            .any(|l| l == "No activities found" || l == "0 activities found:")
+    {
+        return Err(format!("无法读取 {category} 候选组件"));
+    }
+    Ok(result)
+}
+
+fn component_packages(
+    serial: &str,
+    category: &str,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    Ok(components(serial, category)?
+        .iter()
+        .filter_map(|l| component_package(l).map(str::to_owned))
         .collect())
 }
 
-/// 当前默认桌面所属包名。
-///
-/// `resolve-activity` 的正文在最后一行，前面是优先级等元信息。
-pub fn default_home_package(serial: &str) -> Result<Option<String>, String> {
-    let cmd = "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME";
-    let out = adb::shell(serial, cmd).map_err(|e| format!("查询默认桌面失败: {e}"))?;
-    Ok(out
-        .lines()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .find(|l| l.contains('/'))
-        .and_then(|l| l.split('/').next())
-        .map(|p| p.trim().to_owned()))
+fn resolve(serial: &str, category: &str, package: Option<&str>) -> Result<Option<String>, String> {
+    let mut cmd = format!(
+        "cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c {category}"
+    );
+    if let Some(package) = package {
+        require_package(package)?;
+        cmd.push_str(&format!(" -p {package}"));
+    }
+    let out = checked_shell(serial, &cmd)?;
+    if let Some(component) = out.lines().find(|line| component_package(line).is_some()) {
+        return Ok(Some(component.to_owned()));
+    }
+    if out.lines().any(|l| l == "No activity found") {
+        Ok(None)
+    } else {
+        Err(format!("无法解析 {category} 的默认组件"))
+    }
 }
 
-/// 把一个应用设为默认桌面。
-///
-/// 需要完整的组件名（`包名/Activity`），因此先查 HOME 候选取其组件。
-/// 不能接受任意包名：Android 要求的是一个声明了 HOME 的组件。
-pub fn set_default_home(serial: &str, package: &str) -> Result<bool, String> {
-    let cmd = "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.HOME";
-    let out = adb::shell(serial, cmd).map_err(|e| format!("查询桌面候选失败: {e}"))?;
-    let component = out
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.contains('/'))
-        .find(|l| l.split('/').next() == Some(package));
+/// 返回当前 HOME 解析到的包。home_state 会再按候选集合剔除系统选择器。
+pub fn default_home_package(serial: &str) -> Result<Option<String>, String> {
+    Ok(resolve(serial, HOME, None)?
+        .as_deref()
+        .and_then(component_package)
+        .map(str::to_owned))
+}
 
-    let Some(component) = component else {
+/// 确认是 HOME 候选，并以同一用户再次解析 HOME，得到目标包后才完成。
+pub fn set_default_home(serial: &str, package: &str) -> Result<bool, String> {
+    require_package(package)?;
+    let Some(component) = components(serial, HOME)?
+        .into_iter()
+        .find(|line| component_package(line) == Some(package))
+    else {
         return Ok(false);
     };
-    let out = adb::shell(
+    // 单引号保护 class 名中合法的 '$'；component_package 已拒绝引号。
+    checked_shell(
         serial,
-        &format!("cmd package set-home-activity --user 0 {component}"),
-    )
-    .map_err(|e| format!("设置默认桌面失败: {e}"))?;
-    // 同样只能看输出：这条命令失败时退出码也是 0。
-    Ok(!out.has("Error") && !out.has("Exception"))
+        &format!("cmd package set-home-activity --user 0 '{component}'"),
+    )?;
+    let actual = default_home_package(serial)?;
+    if actual.as_deref() != Some(package) {
+        return Err(format!(
+            "设备未确认默认桌面 {package}（当前为 {}）",
+            actual.as_deref().unwrap_or("未设置")
+        ));
+    }
+    Ok(true)
 }
 
-/// 启动一个应用。
-///
-/// 成功与否必须回读验证：`am start` 在目标不存在时也退出 0。
+/// 在默认显示启动一个 LAUNCHER 组件。应用独立窗口由 scrcpy 的目标显示会话启动。
 pub fn launch(serial: &str, package: &str) -> Result<bool, String> {
-    let cmd = format!(
-        "monkey -p {package} -c android.intent.category.LAUNCHER 1"
+    require_package(package)?;
+    let Some(component) = resolve(serial, LAUNCHER, Some(package))? else {
+        return Ok(false);
+    };
+    if component_package(&component) != Some(package) {
+        return Ok(false);
+    }
+    let start = format!(
+        "am start -W --user 0 --display 0 -a android.intent.action.MAIN -c {LAUNCHER} -n '{component}'"
     );
-    let out = adb::shell(serial, &cmd).map_err(|e| format!("启动失败: {e}"))?;
-    // monkey 的失败特征：输出里含 "No activities found" 或 "aborted"。
-    Ok(!out.has("No activities found") && !out.has("aborted"))
+    // -W 等待首帧。冷启动可能超过普通 adb 探测的时间预算。
+    check_output(adb::run_with_timeout(
+        serial,
+        &["shell", &start],
+        std::time::Duration::from_secs(20),
+    ))?;
+    let resumed = crate::running::snapshot(serial)?
+        .iter()
+        .any(|t| t.package == package && t.display_id == 0 && t.resumed);
+    if !resumed {
+        return Err(format!("未在主显示确认 {package} 已启动"));
+    }
+    Ok(true)
 }

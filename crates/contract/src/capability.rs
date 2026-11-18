@@ -62,13 +62,12 @@ impl Capabilities {
                 device_view: false,
                 transitioning: false,
             },
-            // 启动中与 Stalled：设备还没准备好，任何依赖设备的操作都不该放开。
-            // 停止也禁——当前实现不支持取消启动，放开会让用户以为能取消。
+            // 启动中允许取消，尤其是 Stalled 时用户需要能主动回收资源。
             State::Starting | State::Stalled => Self {
                 create: false,
                 delete: false,
                 start: false,
-                stop: false,
+                stop: true,
                 launch_app: false,
                 install: false,
                 refresh_apps: false,

@@ -1,8 +1,6 @@
 //! 副作用边界：设备域的 actor 通过它碰真实世界。
 //!
-//! 定义在契约层而非设备域，是为了让依赖方向成立：真实实现属于运行环境域，
-//! 而运行环境域在设备域**之下**。若 trait 留在设备域，底层实现就得反向依赖
-//! 上层——这正是 M0 阶段假后端能糊过去、真后端一接就暴露的问题。
+//! 设备 actor 和运行时实现都依赖这份契约，分别负责串行状态更新和外部操作。
 
 use std::time::Duration;
 
@@ -15,9 +13,8 @@ use crate::{AppEntry, Command, Desktop, Facts, Rejection};
 pub trait Backend: Send + 'static {
     /// 执行命令中「发起动作」的部分。
     ///
-    /// 返回值只表示**命令是否被受理**，不表示动作已完成。安装是否成功必须
-    /// 通过后续的 [Backend::observe] 回读验证——adb 的退出码与 Success 文本
-    /// 都不是证据（见 docs/架构/02-设备域.md 第七节）。
+    /// 启停进度由 [Backend::observe] 回报。安装等变更命令先从 Android
+    /// 回读结果，更新目录或返回带诊断的拒绝。
     fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection>;
 
     /// 强制终止进程，用于超过硬上限时回收端口与磁盘。
@@ -41,6 +38,10 @@ pub trait Backend: Send + 'static {
     /// 默认空实现：不关心应用的实现（如假后端）不必实现它。
     fn apps(&self) -> Vec<AppEntry> {
         Vec::new()
+    }
+
+    fn catalog_status(&self) -> crate::CatalogStatus {
+        crate::CatalogStatus::Ready
     }
 
     /// 桌面状态。与 [Self::apps] 同属按需刷新的目录，理由相同。
@@ -91,6 +92,10 @@ impl Backend for Box<dyn Backend> {
 
     fn apps(&self) -> Vec<AppEntry> {
         (**self).apps()
+    }
+
+    fn catalog_status(&self) -> crate::CatalogStatus {
+        (**self).catalog_status()
     }
 
     fn desktop(&self) -> Desktop {

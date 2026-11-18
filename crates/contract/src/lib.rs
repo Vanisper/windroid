@@ -14,6 +14,7 @@ pub use backend::{Backend, Timeouts};
 pub use capability::Capabilities;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[cfg(test)]
@@ -408,6 +409,9 @@ impl ErrorCode {
 pub struct Desktop {
     /// 声明了 HOME intent 的包名。
     pub candidates: Vec<PackageName>,
+    /// 已核实的候选应用名称。缺项时使用包名。
+    #[serde(default)]
+    pub candidate_labels: BTreeMap<String, String>,
     /// 当前默认桌面。
     pub default: Option<PackageName>,
 }
@@ -491,6 +495,18 @@ pub enum LogStream {
 // 快照
 // ---------------------------------------------------------------------------
 
+/// 应用目录的最近一次读取结果。失败时可以继续展示上次成功的目录。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CatalogStatus {
+    #[default]
+    Pending,
+    Ready,
+    Failed {
+        message: String,
+    },
+}
+
 /// 某一时刻的完整事实集合。
 ///
 /// 快照带 seq：调用方先取快照、再订阅事件时，靠 seq 丢弃已被快照覆盖的旧事件。
@@ -509,6 +525,8 @@ pub struct Snapshot {
     pub phase: Option<Phase>,
     pub facts: Facts,
     pub apps: Vec<AppEntry>,
+    #[serde(default)]
+    pub catalog_status: CatalogStatus,
     /// 桌面状态：哪些应用能当桌面、当前默认是谁。
     ///
     /// 与 apps 同样属于「按需刷新的目录」而非状态事实，随观测一并采集。

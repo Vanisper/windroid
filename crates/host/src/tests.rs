@@ -86,6 +86,29 @@ fn snapshot_is_serialisable_for_tsx() {
 }
 
 #[test]
+fn desktop_view_carries_home_only_names_and_accepts_older_snapshots() {
+    let (bridge, _channel) = setup();
+    let mut home: Desktop = serde_json::from_value(serde_json::json!({
+        "candidates": ["dev.homeonly", "dev.unknown"],
+        "default": "dev.homeonly"
+    }))
+    .unwrap();
+    assert!(home.candidate_labels.is_empty());
+    home.candidate_labels
+        .insert("dev.homeonly".into(), "测试桌面".into());
+
+    let view = SnapshotView::of(bridge.snapshot()).with_apps(&[], &home);
+    assert_eq!(
+        to_json(&view)["desktop"],
+        serde_json::json!({
+            "candidates": ["dev.homeonly", "dev.unknown"],
+            "defaultPackage": "dev.homeonly",
+            "candidateLabels": {"dev.homeonly": "测试桌面"}
+        })
+    );
+}
+
+#[test]
 fn events_are_forwarded_to_the_channel() {
     // 事件必须真的从设备域流到通道上。用一个自定义 HostChannel 观察不到
     // 内部发送，因此改为验证「设备域事件流在推进」这一必要条件：
