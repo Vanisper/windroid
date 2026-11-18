@@ -118,26 +118,41 @@ fn picker_keeps_its_instance_when_selection_changes() {
 }
 
 #[test]
-fn background_close_and_quit_have_distinct_observable_outcomes() {
+fn same_package_windows_close_and_restore_on_the_original_instance() {
     let (lib, _) = library();
-    let id = create(&lib, "手机");
-    lib.perform(&json!({"kind":"start","instanceId":id}))
-        .unwrap();
-    until(|| lib.snapshot()["state"] == "ready");
-    let action = |kind: &str| {
+    let a = create(&lib, "手机 A");
+    let first = ready(&lib, &a);
+    let b = create(&lib, "手机 B");
+    let second = ready(&lib, &b);
+    let action = |kind: &str, id: &str| {
         lib.perform(&json!({"kind":kind,"instanceId":id,"package":"com.example.reader"}))
             .unwrap()
     };
-    action("launch");
-    action("launch");
-    assert_eq!(lib.snapshot()["facts"]["sessionCount"], 1);
-    action("backgroundApp");
-    assert_eq!(lib.snapshot()["running"][0]["windowOpen"], false);
-    assert_eq!(lib.snapshot()["facts"]["sessionCount"], 0);
-    action("focusApp");
+    action("launch", &a);
+    action("launch", &b);
+    action("focusApp", &a);
+    assert_eq!(first.handle.snapshot().facts.session_count, 1);
+    assert_eq!(second.handle.snapshot().facts.session_count, 1);
+
+    action("backgroundApp", &a);
+    assert_eq!(first.handle.snapshot().facts.session_count, 0);
+    assert_eq!(lib.snapshot()["selectedId"], b);
     assert_eq!(lib.snapshot()["running"][0]["windowOpen"], true);
-    action("quitApp");
-    assert!(lib.snapshot()["running"].as_array().unwrap().is_empty());
+    action("selectInstance", &a);
+    assert_eq!(lib.snapshot()["running"][0]["windowOpen"], false);
+    action("focusApp", &a);
+    action("selectInstance", &b);
+    lib.window_event(WindowEvent::QuitRequested {
+        key: WindowKey {
+            instance_id: a.clone(),
+            package: Some("com.example.reader".into()),
+        },
+    });
+    until(|| first.handle.snapshot().facts.session_count == 0);
+    assert_eq!(second.handle.snapshot().facts.session_count, 1);
+    assert_eq!(lib.snapshot()["running"][0]["instanceId"], b);
+    action("selectInstance", &a);
+    until(|| lib.snapshot()["running"].as_array().unwrap().is_empty());
 }
 
 #[test]
