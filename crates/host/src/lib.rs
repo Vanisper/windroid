@@ -68,6 +68,28 @@ pub struct Bridge {
     channel: HostChannel,
 }
 
+/// 全局的界面通道。
+///
+/// 视频流的生命周期不归设备域管（它由应用组装），但它变化时界面必须知道，
+/// 否则「流已断开」这件事永远到不了界面。因此留一个进程级入口，
+/// 由组装方在创建窗口时设置一次。
+static CHANNEL: std::sync::OnceLock<HostChannel> = std::sync::OnceLock::new();
+
+/// 登记界面通道，供非设备域的模块推送通知。
+pub fn register_channel(channel: HostChannel) {
+    let _ = CHANNEL.set(channel);
+}
+
+/// 通知界面数据变了。
+///
+/// 载荷为空：界面收到即重取快照。事件只承担「有变化」这一个语义，
+/// 不携带状态副本——两份状态必然不同步。
+pub fn notify() {
+    if let Some(ch) = CHANNEL.get() {
+        let _ = ch.send(names::EVENT, JsonValue::Null);
+    }
+}
+
 impl Bridge {
     /// 建立桥并启动后台线程。
     ///
@@ -78,6 +100,7 @@ impl Bridge {
     ///
     /// 不用「每条命令一个线程」：用户连点时线程数无界，且顺序失去保证。
     pub fn attach(handle: Handle, channel: HostChannel, events: device::Events) -> Arc<Self> {
+        register_channel(channel.clone());
         let bridge = Arc::new(Self {
             handle: handle.clone(),
             channel: channel.clone(),
@@ -116,16 +139,8 @@ impl Bridge {
             let home = runtime::catalog::home_state(&snap.serial).unwrap_or_default();
             let mut view = SnapshotView::of(snap);
             view.readiness = Some(readiness_view());
+            view.stream_note = crate::video::stream_note();
             view = view.with_apps(&apps, &home);
-            if std::env::var_os("WINDROID_DEBUG_APPS").is_some() {
-                eprintln!(
-                    "[snapshot] apps={} groups={} home={:?} id={}",
-                    apps.len(),
-                    view.groups.len(),
-                    home.default,
-                    view.snapshot.serial
-                );
-            }
             call.resolve(to_json(&view));
         });
 
@@ -259,6 +274,8 @@ pub struct SnapshotView {
     pub readiness: Option<ReadinessView>,
     /// 应用库分组。界面直接渲染，不自己判断归属。
     pub groups: Vec<GroupView>,
+    /// 视频流状态。None 表示正常；有值时界面必须显示出来。
+    pub stream_note: Option<String>,
     /// 桌面状态（哪些能当桌面、当前是谁）。界面用它在卡片上标记。
     ///
     /// 与 groups 分开：这是设备的一类能力状态，不是应用分组。
@@ -331,6 +348,7 @@ impl SnapshotView {
             readiness: None,
             groups: Vec::new(),
             desktop: None,
+            stream_note: None,
             home_state: None,
             snapshot,
         }

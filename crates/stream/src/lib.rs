@@ -160,13 +160,22 @@ pub fn launch_server(serial: &str, local_port: u16, server_jar: &str) -> io::Res
         crate::SERVER_VERSION
     );
     // 后台启动：server 会一路推流直到连接断开，不能等它返回。
-    std::process::Command::new(
+    let mut child = std::process::Command::new(
         std::env::var("WINDROID_ADB").unwrap_or_else(|_| "adb".to_owned()),
     )
     .args(["-s", serial, "shell", &cmd])
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null())
     .spawn()?;
+
+    // 必须有人回收这个子进程。丢弃 Child 会让它在退出后变成僵尸——
+    // 每断开一次流就留下一个进程表项，长时间运行会积累。
+    // 回收线程阻塞在 wait 上，进程退出即返回，开销为零。
+    std::thread::Builder::new()
+        .name("server-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        })?;
     Ok(())
 }
 

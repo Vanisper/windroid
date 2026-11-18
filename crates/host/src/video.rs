@@ -151,13 +151,52 @@ impl NativeComponent for VideoSurface {
     }
 }
 
-/// 启动主线程定时器，按固定节奏把最新帧推上屏。
+/// 定时器是否在推帧。
+///
+/// 必须是进程级的：写入方是流线程（断开时），读取方是主线程（定时器回调）
+/// 与引擎线程（组装快照）。用 thread_local 会让三方各持一份副本，
+/// 表现为「流断了但定时器还在跑」「状态设了但界面看不到」。
+static PUMPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 界面上显示的流状态。空串表示正常。
+static STREAM_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 启动主线程定时器。可重复调用，只创建一次。
 ///
 /// 必须在主线程调用：AppKit 的视图与 layer 操作都有主线程约束。
 pub fn start_pump() {
-    // 16ms ≈ 60Hz。比帧率略快，保证不因定时器粒度丢帧。
-    pump_with_interval(0.016);
-    log::info!("视频帧定时器已启动");
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        // 16ms ≈ 60Hz。比帧率略快，保证不因定时器粒度丢帧。
+        pump_with_interval(0.016);
+        log::info!("视频帧定时器已启动");
+    });
+    set_pumping(true);
+}
+
+/// 开关推帧。流断开时关，重连时开。
+pub fn set_pumping(on: bool) {
+    PUMPING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前是否在推帧。
+pub fn is_pumping() -> bool {
+    PUMPING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 设置界面上显示的流状态。None 表示正常。
+///
+/// 流断开必须让用户看见：画面停住而窗口照开，是最容易被误认为「软件卡了」
+/// 的状态。
+pub fn set_stream_note(note: Option<String>) {
+    if let Ok(mut n) = STREAM_NOTE.lock() {
+        *n = note;
+    }
+}
+
+/// 读取当前的流状态。快照组装时调用。
+pub fn stream_note() -> Option<String> {
+    STREAM_NOTE.lock().ok().and_then(|n| n.clone())
 }
 
 fn pump_with_interval(interval: f64) {
@@ -217,6 +256,10 @@ fn pump_with_interval(interval: f64) {
 
 /// 驱动所有表面各显示一次最新帧。
 pub fn pump_frame() {
+    // 没有流在跑时不做事。检查一个 bool 比遍历表面便宜得多。
+    if !is_pumping() {
+        return;
+    }
     let ids: Vec<u64> = SURFACES.with(|m| m.borrow().keys().copied().collect());
     for id in ids {
         let state = SURFACES.with(|m| m.borrow().get(&id).cloned());

@@ -51,6 +51,7 @@ impl Stream {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let url = format!("{serial}/{w}x{h}");
+        host::video::set_stream_note(None);
 
         std::thread::Builder::new()
             .name("stream-reader".to_owned())
@@ -99,6 +100,12 @@ impl Stream {
                     }
                 }
                 socket.shutdown();
+                // 断开后停掉推帧并让用户看见。不停的话定时器会以 60Hz
+                // 空转下去，而画面停在最后一帧、窗口照开——看起来像卡死。
+                host::video::set_pumping(false);
+                host::video::set_stream_note(Some("视频流已断开".to_owned()));
+                // 界面只在收到事件时重取快照。不通知的话，提示永远不会出现。
+                host::notify();
             })
             .map_err(|e| format!("启动流线程失败: {e}"))?;
 

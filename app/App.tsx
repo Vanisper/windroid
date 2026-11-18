@@ -111,6 +111,8 @@ interface Snapshot {
   groups: Group[];
   /** 当前默认桌面的包名。空表示没有。 */
   desktop: { defaultPackage: string | null } | null;
+  /** 视频流状态。非空时必须显示——画面停住而窗口照开最容易被误认为卡死。 */
+  streamNote: string | null;
 }
 
 interface Ack {
@@ -303,6 +305,14 @@ function App() {
             defaultPackage={snap()?.desktop?.defaultPackage ?? null}
           />
         )}
+
+        {snap()?.streamNote ? (
+          <View style={{ paddingHorizontal: 16, paddingVertical: 8 }}>
+            <Text testID="stream-note" style={{ fontSize: 12, color: "#c8a06a" }}>
+              {snap()?.streamNote}
+            </Text>
+          </View>
+        ) : null}
 
         {notice() ? (
           <View style={{ paddingHorizontal: 16, paddingVertical: 8 }}>
