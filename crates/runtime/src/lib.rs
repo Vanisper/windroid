@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod install;
 pub mod labels;
 pub mod prepare;
+pub mod provision;
 
 use std::io;
 use std::path::PathBuf;
