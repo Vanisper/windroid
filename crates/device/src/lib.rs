@@ -306,6 +306,15 @@ impl Actor {
             };
         }
 
+        // 启动是一次新的意图，先清掉上一次的停止请求。
+        //
+        // 放在这里而不是各后端里：stop_requested 记录的是「用户想让它停」，
+        // 它的生命周期归设备域，不归某个后端的实现细节。留着不清，状态推导
+        // 会在进程存活判断之前命中 Stopping，表现为「点了启动但一直显示停止中」。
+        if matches!(cmd, Command::Start) {
+            self.facts.stop_requested = false;
+        }
+
         if let Err(reason) = backend.exec(cmd, &mut self.facts) {
             return Ack::Rejected { reason };
         }
@@ -340,6 +349,7 @@ impl Actor {
         // 应用清单变化也要通知界面。它不是状态事实，但界面同样需要知道：
         // 留着不发，界面只会在首次快照里看到一份空清单，之后永远不再取。
         if self.apps != self.last_apps {
+            log::debug!("应用清单发布: {} 个应用", self.apps.len());
             self.seq += 1;
             self.last_apps = self.apps.clone();
             self.emit(Event::AppsChanged {

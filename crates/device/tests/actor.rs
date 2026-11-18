@@ -415,3 +415,36 @@ fn instance_can_restart_after_abort() {
     let ack = h.send(Command::Start);
     assert!(ack.is_accepted(), "Failed 之后应能重新启动: {ack:?}");
 }
+
+/// 停止后必须能重新启动。
+///
+/// stop_requested 是粘性事实，而状态推导里 Stopping 排在进程存活判断之前。
+/// 启动时若不清除它，重新启动后状态会一直停在「正在停止」——设备其实已经
+/// 起来了，界面却说停不下来。
+#[test]
+fn start_clears_the_previous_stop_request() {
+    let (h, ev) = spawn_test(id(), FakeBackend::new(), Timeouts::default());
+    h.send(Command::Create {
+        spec: Spec {
+            template: "t".into(),
+            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            disk_bytes: 1,
+        },
+    });
+    h.send(Command::Start);
+    until_state(&ev, State::Ready, Duration::from_secs(10)).expect("应能就绪");
+
+    h.send(Command::Stop);
+    until_state(&ev, State::Stopped, Duration::from_secs(10)).expect("应能停止");
+
+    h.send(Command::Start);
+    // 关键：不应停在 Stopping。它必须在启动后重新走向就绪。
+    let snap = h.snapshot();
+    assert_ne!(
+        snap.state,
+        State::Stopping,
+        "重新启动后不该停在 Stopping，实际 facts={:?}",
+        snap.facts
+    );
+    until_state(&ev, State::Ready, Duration::from_secs(10)).expect("应能重新就绪");
+}
