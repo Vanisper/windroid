@@ -59,11 +59,7 @@ impl Action {
 ///
 /// 判据集中在这里，不散在界面。新增一类能力时，先加查询（见
 /// runtime::catalog::HomeState），再在这里加一条派生规则。
-pub fn for_app(
-    app: &AppEntry,
-    home: &runtime::catalog::HomeState,
-    device_usable: bool,
-) -> Vec<Action> {
+pub fn for_app(app: &AppEntry, home: &contract::Desktop, device_usable: bool) -> Vec<Action> {
     let mut out = Vec::new();
 
     // 打开：需要设备可用，且应用声明了 LAUNCHER。

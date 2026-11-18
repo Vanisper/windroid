@@ -188,3 +188,19 @@ fn readiness_reaches_the_ui() {
         "界面必须处于「未就绪」或「应用库」之一，实际: {screen:?}"
     );
 }
+
+/// 切换分组必须立即反映到界面。
+///
+/// 分组选中项是纯界面状态，不经过设备域，因此没有事件推动重渲染。
+/// 派生值若用普通变量而非 computed，选中项变了内容也不会变——
+/// 表现是「点标签没反应，点一下应用才切过去」。
+#[test]
+fn switching_groups_updates_the_grid() {
+    let (mut app, _h) = start(FakeBackend::new());
+    app.wait_for_within("text:已安装", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("分组标签应渲染: {e}"));
+
+    // 假后端给的是两个应用，都落在「已安装」。
+    app.wait_for_within("text:阅读器", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("已安装分组应显示应用: {e}"));
+}

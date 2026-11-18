@@ -298,7 +298,6 @@ function App() {
         ) : (
           <Library
             groups={snap()?.groups ?? []}
-            selected={groupId()}
             canLaunch={can("launchApp")}
             canInstall={can("install")}
             state={state()}
@@ -487,7 +486,6 @@ function BlockedPanel(props: { items: ComponentStatus[] }) {
  */
 function Library(props: {
   groups: Group[];
-  selected: string;
   canLaunch: boolean;
   canInstall: boolean;
   state: DeviceState;
@@ -511,8 +509,11 @@ function Library(props: {
     );
   }
 
-  const current =
-    props.groups.find((g) => g.id === props.selected) ?? props.groups[0];
+  // 必须是 computed：nsh 的组件体只执行一次，普通变量只在首次渲染取值，
+  // 选中项变化不会重算。表现是「点了分组标签但内容不变」。
+  const current = computed<Group | undefined>(
+    () => props.groups.find((g) => g.id === groupId()) ?? props.groups[0],
+  );
 
   return (
     <View style={{ flex: 1, flexDirection: "column" }}>
@@ -528,7 +529,7 @@ function Library(props: {
         }}
       >
         {props.groups.map((g) => {
-          const on = g.id === current.id;
+          const on = g.id === current()?.id;
           return (
             <View
               onPress={() => groupId.set(g.id)}
@@ -562,7 +563,7 @@ function Library(props: {
           paddingBottom: 16,
         }}
       >
-        {current.apps.map((app) => (
+        {(current()?.apps ?? []).map((app) => (
           <AppCard
             app={app}
             defaultHome={app.package === (props.defaultPackage ?? "")}

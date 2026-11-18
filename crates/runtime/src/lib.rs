@@ -79,6 +79,8 @@ pub struct EmulatorBackend {
     apps_dirty: bool,
     /// 应用展示名缓存。
     labels: labels::Labels,
+    /// 桌面状态缓存，与清单一并刷新。
+    desktop: contract::Desktop,
     /// 该实例不是本进程启动的，而是接管了一个已在运行的实例。
     ///
     /// 用户可能先手动起了模拟器，或上一次退出时没来得及清理。设备域必须
@@ -101,6 +103,7 @@ impl EmulatorBackend {
             apps_dirty: true,
             adopted: false,
             labels: labels::Labels::new(&layout_cache),
+            desktop: contract::Desktop::default(),
         }
     }
 
@@ -309,6 +312,10 @@ impl Backend for EmulatorBackend {
         self.apps.clone()
     }
 
+    fn desktop(&self) -> contract::Desktop {
+        self.desktop.clone()
+    }
+
     fn abort(&mut self, facts: &mut Facts) {
         if let Some(mut child) = self.process.take() {
             let _ = child.kill();
@@ -379,6 +386,16 @@ impl Backend for EmulatorBackend {
                         a.label = labels.get(a.package.as_str()).cloned();
                     }
                     self.apps = apps;
+                    self.desktop = catalog::home_state(&serial)
+                        .map(|h| contract::Desktop {
+                            candidates: h
+                                .candidates
+                                .iter()
+                                .map(contract::PackageName::new)
+                                .collect(),
+                            default: h.default.as_deref().map(contract::PackageName::new),
+                        })
+                        .unwrap_or_default();
                     self.apps_dirty = false;
                 }
                 // 刷新失败不影响状态判定：清单是目录，不是状态事实。

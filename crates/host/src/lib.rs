@@ -136,7 +136,9 @@ impl Bridge {
         channel.handle(names::SNAPSHOT, move |call: HostCall| {
             let snap = snap_handle.snapshot();
             let apps = snap.apps.clone();
-            let home = runtime::catalog::home_state(&snap.serial).unwrap_or_default();
+            // 桌面状态随快照一起来，不在这里现查：查一次是一条 30ms 的 adb
+            // 命令，而这个 handler 跑在引擎线程上，等于给每次点击加延迟。
+            let home = snap.desktop.clone();
             let mut view = SnapshotView::of(snap);
             view.readiness = Some(readiness_view());
             view.stream_note = crate::video::stream_note();
@@ -269,7 +271,7 @@ pub struct SnapshotView {
     pub capabilities: contract::Capabilities,
     /// 桌面状态。派生操作时需要，不直接下发。
     #[serde(skip)]
-    pub home_state: Option<runtime::catalog::HomeState>,
+    pub home_state: Option<contract::Desktop>,
     /// 运行时自检。null 表示还没查。
     pub readiness: Option<ReadinessView>,
     /// 应用库分组。界面直接渲染，不自己判断归属。
@@ -361,14 +363,10 @@ impl SnapshotView {
     /// - **桌面**由 HOME 决定，与系统/用户正交——用户装的第三方桌面是合格的；
     /// - 没有任何 LAUNCHER 但声明了 HOME 的（只作桌面），单独成组，
     ///   否则它们在界面上无处可去。
-    pub fn with_apps(
-        mut self,
-        apps: &[contract::AppEntry],
-        home: &runtime::catalog::HomeState,
-    ) -> Self {
+    pub fn with_apps(mut self, apps: &[contract::AppEntry], home: &contract::Desktop) -> Self {
         self.home_state = Some(home.clone());
         self.desktop = Some(DesktopView {
-            default_package: home.default.clone(),
+            default_package: home.default.as_ref().map(|p| p.to_string()),
         });
         let item = |a: &contract::AppEntry| AppItemView {
             package: a.package.to_string(),

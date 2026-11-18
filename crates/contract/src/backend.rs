@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crate::{AppEntry, Command, Facts, Rejection};
+use crate::{AppEntry, Command, Desktop, Facts, Rejection};
 
 /// 执行命令的真实副作用，并回报观测到的事实。
 ///
@@ -41,6 +41,11 @@ pub trait Backend: Send + 'static {
     /// 默认空实现：不关心应用的实现（如假后端）不必实现它。
     fn apps(&self) -> Vec<AppEntry> {
         Vec::new()
+    }
+
+    /// 桌面状态。与 [Self::apps] 同属按需刷新的目录，理由相同。
+    fn desktop(&self) -> Desktop {
+        Desktop::default()
     }
 }
 
@@ -86,6 +91,10 @@ impl Backend for Box<dyn Backend> {
 
     fn apps(&self) -> Vec<AppEntry> {
         (**self).apps()
+    }
+
+    fn desktop(&self) -> Desktop {
+        (**self).desktop()
     }
 
     fn abort(&mut self, facts: &mut Facts) {

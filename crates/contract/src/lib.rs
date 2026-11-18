@@ -398,6 +398,30 @@ impl ErrorCode {
 // 事件
 // ---------------------------------------------------------------------------
 
+/// 桌面状态：哪些应用能当桌面、当前默认是谁。
+///
+/// 与 [AppEntry] 分开，因为它不是应用的固有属性，而是一类**设备能力**的查询
+/// 结果。新增同类能力（通知监听、后台限制）时只需新增同样形状的类型，
+/// 应用结构不动。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Desktop {
+    /// 声明了 HOME intent 的包名。
+    pub candidates: Vec<PackageName>,
+    /// 当前默认桌面。
+    pub default: Option<PackageName>,
+}
+
+impl Desktop {
+    pub fn is_candidate(&self, package: &str) -> bool {
+        self.candidates.iter().any(|p| p.as_str() == package)
+    }
+
+    pub fn is_default(&self, package: &str) -> bool {
+        self.default.as_ref().map(PackageName::as_str) == Some(package)
+    }
+}
+
 /// 应用条目。label 与 icon 异步补全，列表中先以包名占位。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -485,5 +509,11 @@ pub struct Snapshot {
     pub phase: Option<Phase>,
     pub facts: Facts,
     pub apps: Vec<AppEntry>,
+    /// 桌面状态：哪些应用能当桌面、当前默认是谁。
+    ///
+    /// 与 apps 同样属于「按需刷新的目录」而非状态事实，随观测一并采集。
+    /// 放在快照里而不是让调用方现查：查一次要跑一条 30ms 的 adb 命令，
+    /// 而快照在界面每次点击时都会被取——放在调用方等于把延迟加到交互上。
+    pub desktop: Desktop,
     pub seq: Seq,
 }

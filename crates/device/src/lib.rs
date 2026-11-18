@@ -139,6 +139,7 @@ pub fn spawn<B: Backend>(
         phase: None,
         facts: Facts::default(),
         apps: Vec::new(),
+        desktop: contract::Desktop::default(),
         seq: 0,
     };
     let shared = Arc::new(Shared {
@@ -165,6 +166,7 @@ pub fn spawn<B: Backend>(
                 aborted_once: false,
                 pending_abort: false,
                 last_apps: Vec::new(),
+                desktop: contract::Desktop::default(),
             };
             actor.run(rx, &mut backend);
         })
@@ -188,6 +190,8 @@ struct Actor {
     events: Sender<Event>,
     /// 上一次发布的清单，用于判断是否需要通知界面。
     last_apps: Vec<AppEntry>,
+    /// 桌面状态。与清单同源。
+    desktop: contract::Desktop,
     /// 已因硬上限强制终止过，避免重复触发。
     aborted_once: bool,
     /// 本轮需要调用后端终止。放在字段里而不是当场调用：`apply_timeouts`
@@ -214,6 +218,7 @@ impl Actor {
             }
             // 清单随观测同步。它不参与状态推导，但快照要带上，否则界面拿不到。
             self.apps = backend.apps();
+            self.desktop = backend.desktop();
             self.apply_timeouts();
             // 终止必须发生在观测之后：先看到最新事实，再决定收手。
             if std::mem::take(&mut self.pending_abort) {
@@ -364,6 +369,7 @@ impl Actor {
         g.phase = phase;
         g.facts = self.facts.clone();
         g.apps = self.apps.clone();
+        g.desktop = self.desktop.clone();
         g.seq = self.seq;
         g.id = self.id.clone();
         g.serial = self.serial.clone();
