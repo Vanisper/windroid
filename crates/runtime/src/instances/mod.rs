@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{Layout, serial_for};
 pub(crate) use avd::{data_dir, image_relative};
-pub use hardware::InstanceConfig;
 use contract::{InstanceId, Spec};
+pub use hardware::InstanceConfig;
 use serde::{Deserialize, Serialize};
 
 /// 各模板分配的客户机内存，用于 AVD 配置与设备域资源准入。
