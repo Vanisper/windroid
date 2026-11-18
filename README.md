@@ -1,58 +1,54 @@
 # Windroid
 
-在自己的电脑上运行 Android 应用，每个应用以独立原生窗口出现。
+Windroid 让 Android 应用以独立的原生窗口运行在桌面上。用户从应用库管理实例、安装 APK 和打开应用，也可以单独打开设备视图，操作同一实例的 Android 主屏。
 
-当前进度：M1a 完成——真实模拟器接入，真实 Android 画面（1920×1080）显示在
-本项目自己的窗口里，随设备输入实时更新。协议层自研（非官方 client），
-H.264 解码走 ffmpeg 独立进程。
+## 平台进度
 
-## 文档入口
+| 平台 | 开发进度 |
+|---|---|
+| macOS（Apple 芯片） | 首个可用版本。托管运行环境、实例隔离和独立应用窗口均已在 M4 上实测。 |
+| Linux | 下一个桌面目标，兼顾客厅电视场景。需要提供 Linux 运行时组件，验证 GTK4 窗口、视频解码和输入。 |
+| Windows | 第三个桌面目标。需要适配运行时组件、进程和文件管理，验证 Win32 窗口、视频解码和输入。 |
 
-- [产品形态与交互](docs/产品/01-产品形态与交互.md) — 做成什么样：三个界面、关闭语义、资源治理
-- [架构总览](docs/架构总览.md) — 系统如何切分、依赖方向、不可违反的约束、里程碑
+实例状态机、应用命令和 scrcpy 协议属于共享核心。桌面端按平台接入模拟器、解码器和原生窗口。[产品形态](docs/产品/01-产品形态与交互.md) · [平台适配与验收](docs/架构/04-呈现域.md#七跨平台表面策略)
 
-各域设计文档与实测证据在 `docs/架构/` 与 `docs/实测/` 下，按依赖顺序编号。
+## 首次使用（macOS）
 
-## 代码结构
+1. 打开 `Windroid.app`。首次启动会列出 Android 运行时、系统镜像和投屏服务的版本、大小和许可。点击「同意并下载」后开始准备，下载期间可以暂停，失败后可以重试。
+2. 环境就绪后，新建实例，选择设备模板并启动。实例间共享系统镜像，各自保存应用和数据。
+3. 等实例就绪后，从应用库打开已安装的应用或安装 APK。点击「设备视图」可打开主屏，每个应用窗口有自己的 Android 显示和输入通道。再次打开同一实例的同一应用会聚焦原窗口。
+4. 关闭应用窗口时选择「保留后台」「完全退出」或「取消」，前两项可记为所有应用窗口的默认选择。在应用库的「运行中」可再次打开 Android 仍保留的应用。关闭设备窗口只结束该路投屏。
 
-```
-crates/contract   数据与纯函数：命令、事件、快照、状态推导、副作用边界
-crates/adb        adb 调用封装：只执行与取输出，不判断成功
-crates/runtime    运行环境域：实例目录、模拟器进程、adb 就绪判定
-crates/device     设备域：单一写者 actor
-crates/stream     流域：scrcpy 协议、视频包解析、H.264 解码
-crates/host       呈现域：窗口所有权、关闭拦截、视频表面、设备域到界面的桥
-app/              应用入口与 TSX 界面
-```
+## 开发命令
 
-依赖方向单向向下：`app → host → stream/device → runtime → adb → contract`。
-契约不依赖任何 GUI 或平台 API，这是设备域将来可能拆成独立进程的前提。
+在仓库根目录运行 `npm run` 可列出所有命令，也可用 `pnpm run <脚本名>`。装有 Node.js 和 npm 即可使用脚本入口，各命令直接调用相应的开发工具。[命令清单](package.json)
 
-`Backend`（副作用边界）定义在 `contract` 而非 `device`：真实实现在
-`runtime`，位于设备域之下，trait 留在设备域会让依赖边倒着画。
+| 命令 | 用途 |
+|---|---|
+| `npm run check` / `npm test` | 编译检查、测试四个共享 Rust 模块，涵盖契约、设备状态、adb 和 scrcpy 协议。开发这些模块只需 Rust 1.97+ 和宿主编译工具链。 |
+| `npm run check:ui` / `npm run build:ui` | 检查 TSX 类型、构建开发界面。需要 nsh 0.5.x CLI，首次类型检查会下载并校验 TypeScript 编译器。 |
+| `npm run dev:macos` | 构建界面并从源码启动应用库。 |
+| `npm run check:macos` / `npm run test:macos` | 检查界面和整个 Rust 工作区（Clippy），或运行整个工作区的测试。 |
+| `npm run package:macos` | 构建 release、打包界面并签名，默认输出 `dist/Windroid.app`。 |
+| `npm run fixtures:apk` | 构建 Alpha、Beta 两个签名测试 APK，默认输出到 `build/test-apks/`。需要 Bash、JDK 和 Android SDK 的 API 34 平台及构建工具。 |
 
-## 构建与运行
+完整 macOS 构建需要 Apple 芯片的 Mac、Xcode 命令行工具、Rust、nsh CLI 和 Python 3。运行 `open dist/Windroid.app` 可打开打好的应用。两个打包命令均接受自定义输出目录，如 `npm run package:macos -- "./build/mac app"`。[Mac 打包脚本](scripts/package-macos.sh) · [测试 APK 构建脚本](scripts/build-test-apks.sh)
 
-```bash
-nsh check app                   # 生成类型声明并类型检查
-nsh build app -o app/.nsh/out   # 编译界面
-cargo run -p windroid           # 启动窗口（假后端）
-cargo test --workspace          # 全部测试
-```
+开发启动和打包启动默认都使用真实后端。开发时可通过环境变量切换数据位置或使用测试模式。
 
-接真实模拟器：
+| 变量 | 用途 |
+|---|---|
+| `WINDROID_HOME` | 指定数据根目录，默认为 `~/.windroid`。隔离测试时指定单独目录。 |
+| `WINDROID_SDK`、`WINDROID_SERVER_JAR` | 显式借用本机已有的兼容 Android SDK 与 scrcpy 5.0.1 server。应用会检查它们，实例仍保存在 Windroid 自己的数据目录。 |
+| `WINDROID_FAKE=1` | 启用用于开发与测试的假后端。 |
 
-```bash
-# 需要 SDK、一个 AVD、以及 scrcpy-server jar
-WINDROID_REAL=1 WINDROID_PORT=5554 cargo run -p windroid
-```
+## 实现与验证
 
-可选环境变量：`WINDROID_AVD`（AVD 名）、`WINDROID_EMULATOR`、`WINDROID_ADB`、
-`WINDROID_SERVER_JAR`、`WINDROID_HOME`、`WINDROID_GPU`（默认 `host`）。
+Rust 负责实例进程、每实例的设备状态、scrcpy 5.0.1 协议和 macOS 窗口。H.264 通过系统 VideoToolbox 解码为 BGRA 帧。TSX/nsh 实现应用库、运行环境准备和实例管理界面。
 
-`app/.nsh/` 是生成物，不入库。首次检出后先跑一次 `nsh check app`：其中的
-类型声明 `.nsh/types` 决定了编辑器能否解析 `from "nsh"`，缺了会导致满屏
-报错而构建本身正常。
+四个共享模块已在 Linux ARM64 容器中通过 `npm test`。从 macOS 运行 `npm run check` 并指定目标，也已通过 Linux x86_64 和 Windows x86_64（MSVC）的交叉编译检查。GitHub Actions 工作流为 Linux、Windows 和 macOS 配置了同一条 `npm test` 命令。adb 进程与协议回环的集成用例使用 Unix 夹具，像素解码用例使用 macOS VideoToolbox。[核心测试工作流](.github/workflows/core.yml)
 
-界面构建用 nsh 官方 CLI，不自建构建工具。`nsh check` 自带 TypeScript 编译器
-（首次运行自动下载并校验），无需 Node 或 `node_modules`。
+macOS 上的工作区测试覆盖实例状态、APK 安装、双显示协议、VideoToolbox 像素解码、窗口回收和应用库交互。需要真实模拟器的用例单独运行。实测记录包含[私有实例的冷启动与快照恢复](docs/实测/01-运行环境域.md)、[主屏与应用窗口的尺寸和输入](docs/实测/03-流域.md)，以及[从应用库安装、切换桌面和关窗](docs/实测/04-呈现域.md)。
+
+- [产品形态与交互](docs/产品/01-产品形态与交互.md)
+- [架构总览与各域索引](docs/架构总览.md)
