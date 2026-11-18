@@ -2,7 +2,7 @@ import { computed, signal, Text, View } from "nsh";
 import { Input } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
-import { busy, instances, report, screen, send, snapshot } from "./model";
+import { busy, environmentReady, instances, navigate, report, screen, send, snapshot } from "./model";
 
 const templates = [
   { id: "phone-1080", name: "手机", dimensions: "1080 × 2400" },
@@ -21,8 +21,8 @@ export function CreateInstance() {
     return !value || Array.from(value).length > 64 || /[\u0000-\u001f\u007f-\u009f]/.test(value);
   });
   async function create() {
-    if (invalid() || busy()) return;
-    if (await send({ kind: "createInstance", name: name().trim(), template: template().id }, "创建实例")) screen.set("library");
+    if (invalid() || busy() || !environmentReady()) return;
+    if (await send({ kind: "createInstance", name: name().trim(), template: template().id }, "创建实例") && screen() === "create") navigate("library");
   }
   const chooseTemplate = () => Menu.popup(templates.map(t => ({ label: t.name + " · " + t.dimensions, checked: template().id === t.id, onSelect: () => template.set(t) })))
     .catch(e => report("无法显示设备模板 · " + String(e), true));
@@ -39,8 +39,8 @@ export function CreateInstance() {
       <Button id="choose-template" label={template().name + " · " + template().dimensions + "  ▾"} press={chooseTemplate} />
       <Detail text="Android 14   ·   8 GiB 用户盘" />
       <View style={row}>
-        <Button id="create" label="创建实例" primary disabled={invalid() || busy()} press={create} />
-        {instances().length ? <Button id="cancel-create" label="取消" disabled={busy()} press={() => screen.set("library")} /> : null}
+        <Button id="create" label="创建实例" primary disabled={invalid() || busy() || !environmentReady()} press={create} />
+        <Button id="cancel-create" label="取消" disabled={busy()} press={() => navigate("instances")} />
       </View>
     </View>
   </View>;

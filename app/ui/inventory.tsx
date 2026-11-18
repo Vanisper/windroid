@@ -1,0 +1,101 @@
+import { computed, Text, View, windowSize } from "nsh";
+import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
+import { DeviceControls } from "./library";
+import { environmentReady, instances, instanceState, managementBack, navigate, openInstance, preparation, selected, switching, type Instance } from "./model";
+
+const unknown = "未知";
+const cores = (n?: number | null) => n == null ? unknown : n + " 核";
+function memory(mib?: number | null) {
+  if (mib == null) return unknown;
+  return mib % 1024 === 0 ? mib / 1024 + " GiB" : mib + " MiB";
+}
+function specs(item?: Instance | null) {
+  const c = item?.config;
+  return [
+    { label: "CPU", value: cores(c?.cpuCores) },
+    { label: "内存", value: memory(c?.ramMiB) },
+    { label: "主屏尺寸", value: c?.screenWidth && c.screenHeight ? c.screenWidth + " × " + c.screenHeight : unknown },
+    { label: "用户空间", value: c?.diskBytes == null ? unknown : memory(c.diskBytes / 1024 ** 2) },
+  ];
+}
+
+function NextAction() {
+  const active = computed(() => ["downloading", "verifying", "installing"].includes(preparation()?.phase ?? ""));
+  return <View style={{ gap: 12, alignItems: "flex-start" }}>
+    <Detail text={environmentReady() ? "运行环境已就绪，可以创建第一台 Android 实例。" :
+      active() ? "正在准备运行环境，可查看下载与安装进度。" : "先准备这台 Mac 共用的 Android 运行环境，再创建实例。"} />
+    <Button id="workspace-next" primary label={environmentReady() ? "创建实例" : active() ? "查看准备进度" : "查看运行环境"}
+      press={() => navigate(environmentReady() ? "create" : "environment")} />
+  </View>;
+}
+
+function InventoryRow(props: { item: Instance }) {
+  const stacked = computed(() => windowSize().width < 880);
+  return <View testID={"row-" + props.item.id} style={{ flexDirection: stacked() ? "column" : "row", gap: 12, paddingVertical: 12,
+    borderTopWidth: 1, borderColor: colors().line, alignItems: stacked() ? "stretch" : "center" }}>
+    <View style={{ flexGrow: 1, flexBasis: stacked() ? undefined : 90, minWidth: 0, gap: 4 }}>
+      <View testID={"enter-" + props.item.id} role="button" accessibilityLabel={"打开 " + props.item.name} tooltip={props.item.name}
+        disabled={switching()} onPress={() => void openInstance(props.item.id, "library")}
+        style={{ alignSelf: "flex-start", maxWidth: "100%", padding: 3, borderRadius: 4 }} focusVisibleStyle={{ backgroundColor: colors().selected }}>
+        <Text style={{ fontSize: 15, fontWeight: 650, numberOfLines: 1, color: colors().accent }}>{props.item.name}</Text>
+      </View>
+      <Detail text={instanceState(props.item)} />
+    </View>
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12, flex: stacked() ? undefined : 3, minWidth: 0 }}>
+      <Each of={specs(props.item)} key={s => s.label}>{field => <View style={{ flexGrow: 1, flexBasis: 58, gap: 4 }}>
+        <Text style={{ fontSize: 11, color: colors().muted }}>{field().label}</Text>
+        <Text style={{ fontSize: 13, fontWeight: 550, color: colors().ink }}>{field().value}</Text>
+      </View>}</Each>
+    </View>
+    <Button id={"manage-" + props.item.id} label="设置" accessibilityLabel={"管理 " + props.item.name} tooltip={"管理实例 · " + props.item.name}
+      disabled={switching()} press={() => void openInstance(props.item.id, "manage")} />
+  </View>;
+}
+
+export function Inventory() {
+  return <View testID="inventory" style={{ gap: 18 }}>
+    <Title text="全部实例" />
+    {instances().length ? <View style={card()}>
+      <Each of={instances()} key={item => item.id}>{item => <InventoryRow item={item()} />}</Each>
+      <Detail text="批量启停将在后续版本提供。当前可在各实例的管理页启停。" />
+    </View> : <View style={card()}>
+      <Heading text="还没有实例" />
+      <NextAction />
+    </View>}
+  </View>;
+}
+
+export function ManageInstance() {
+  const config = computed(() => selected()?.config);
+  const observed = computed(() => selected()?.observed);
+  return <View testID="manage-instance" style={{ gap: 16 }}>
+    <Button id="manage-back" label={managementBack() === "library" ? "返回应用面板" : "返回全部实例"} press={() => navigate(managementBack())} />
+    <Title text={selected()?.name ?? "管理实例"} />
+    <View style={card()}>
+      <Heading text="实例配置" />
+      <Detail text={"设备模板 · " + (config()?.template ?? unknown)} />
+      <Detail text={"系统镜像 · " + (config()?.image ? "Android API " + config()!.image.api + " · " + config()!.image.tag + " · " + config()!.image.abi : unknown)} />
+      <Each of={specs(selected())} key={s => s.label}>{s => <Detail text={s().label + " · " + s().value} />}</Each>
+      <Detail text="自定义硬件配置将在后续版本提供。" />
+    </View>
+    <View style={card()}>
+      <Heading text="本次运行" />
+      <Detail text={"观测到的 CPU · " + cores(observed()?.cpuCores) + "     内存 · " + memory(observed()?.ramMiB)} />
+      {!environmentReady() ? <Button id="manage-environment" label="准备运行环境" press={() => navigate("environment")} /> : null}
+    </View>
+    <DeviceControls />
+    <View style={card()}><Heading text="模拟器日志" /><Detail text="按实例查看启动记录将在日志采集接入后提供。" /></View>
+  </View>;
+}
+
+export function Guide() {
+  return <View testID="guide" style={{ gap: 16 }}>
+    <Title text="使用引导" />
+    <View style={card()}>
+      <Heading text={environmentReady() ? "创建实例" : "准备运行环境"} />
+      <Detail text="每台实例独立保存应用和文件。启动后可打开应用窗口，再从「运行中」恢复后台应用。" />
+      <NextAction />
+    </View>
+    <View style={row}><Button id="guide-back" label="返回设置" press={() => navigate("settings")} /></View>
+  </View>;
+}
