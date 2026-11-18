@@ -50,6 +50,14 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
         (&b, "tv-4k", 3840, 2160, 320),
     ] {
         let dir = avd(&root.0, record);
+        let saved = record.config(&layout);
+        assert_eq!(saved.cpu_cores, Some(2));
+        assert_eq!(saved.ram_mib, Some(ram_mib(template) as u32));
+        assert_eq!(
+            (saved.screen_width, saved.screen_height),
+            (Some(w), Some(h))
+        );
+        assert_eq!(saved.spec.disk_bytes, record.spec.disk_bytes);
         let config = fs::read_to_string(dir.join("config.ini")).unwrap();
         for expected in [
             format!("hw.lcd.width={w}"),
@@ -73,6 +81,19 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
                 .any(|l| l == format!("path={}", dir.display()))
         );
     }
+    // 旧清单没有专门的硬件字段，展示磁盘上已有的值。残缺项不套用当前模板默认值。
+    let config_path = avd(&root.0, &a).join("config.ini");
+    fs::write(
+        &config_path,
+        "hw.cpu.ncore = 4\nhw.ramSize=invalid\nhw.lcd.width=1\nhw.lcd.width=2",
+    )
+    .unwrap();
+    let saved = reopened.get(&a.id).unwrap().config(&layout);
+    assert_eq!(saved.cpu_cores, Some(4));
+    assert_eq!(saved.ram_mib, None);
+    assert_eq!((saved.screen_width, saved.screen_height), (None, None));
+    fs::remove_file(config_path).unwrap();
+    assert_eq!(reopened.get(&a.id).unwrap().config(&layout).spec, a.spec);
     assert!(physical_memory_mib().unwrap() > 0);
     store.delete(&a.id).unwrap();
     store.delete(&a.id).unwrap();

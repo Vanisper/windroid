@@ -13,7 +13,7 @@ use device::{Events, Handle};
 use nsh_engine::{HostCall, HostChannel, JsonValue};
 use runtime::{
     Layout,
-    instances::{InstanceRecord, InstanceStore},
+    instances::{InstanceConfig, InstanceRecord, InstanceStore},
     provision::{Provisioner, RuntimePaths},
 };
 use serde_json::json;
@@ -49,6 +49,7 @@ struct Instance {
     name: String,
     handle: Handle,
     record: Option<InstanceRecord>,
+    config: Option<InstanceConfig>,
     lane: Lane,
 }
 
@@ -199,6 +200,7 @@ impl Library {
             name,
             handle,
             lane: self.lane(),
+            config: record.as_ref().map(|r| r.config(&self.layout)),
             record,
         };
         {
@@ -345,7 +347,19 @@ impl Library {
         let mut view = SnapshotView::of(snap.clone()).with_apps(&snap.apps, &snap.desktop);
         self.groups.lock().unwrap().apply(&id, &mut view.groups);
         let mut out = crate::to_json(&view);
-        out["instances"]=state.instances.iter().map(|(id,i)|json!({"id":id,"name":i.name,"state":i.handle.snapshot().state,"frozen":state.frozen.contains(id)})).collect();
+        out["instances"] = state
+            .instances
+            .iter()
+            .map(|(id, instance)| {
+                let device = instance.handle.snapshot();
+                json!({
+                    "id": id, "name": instance.name, "state": device.state,
+                    "frozen": state.frozen.contains(id),
+                    "summary": crate::describe(device.state, device.phase, &device.facts),
+                    "config": instance.config
+                })
+            })
+            .collect();
         out["selectedId"] = json!(state.selected);
         out["frozen"] = json!(state.frozen.contains(&id));
         out["operation"] = state
@@ -362,6 +376,13 @@ impl Library {
         out["runningError"] = json!(state.task_errors.get(&id));
         out["tasksLoaded"] = json!(state.tasks.contains_key(&id));
         out["preparation"] = preparation;
+        if let Some(runtime) = &self.runtime {
+            let paths = runtime.paths();
+            out["storage"] = json!({
+                "home": self.layout.root, "sdk": paths.sdk,
+                "images": paths.sdk.join("system-images")
+            });
+        }
         out["recommendedTemplate"] = self.recommended_template.into();
         out
     }

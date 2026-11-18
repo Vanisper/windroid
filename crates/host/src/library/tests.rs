@@ -431,3 +431,58 @@ fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
     assert!(matches!(recv(), WindowCommand::QuitFailed { .. }));
     assert_eq!(handle.snapshot().facts.session_count, 1);
 }
+
+#[test]
+fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
+    use std::{fs, time::SystemTime};
+    let token = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("windroid-workspace-{}-{token}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let layout = Layout { root: root.clone() };
+    let store = InstanceStore::new(layout.clone());
+    let spec = contract::Spec {
+        template: "compact-720".into(),
+        image: contract::Image {
+            api: 34,
+            tag: "google_apis_playstore".into(),
+            abi: "arm64-v8a".into(),
+        },
+        disk_bytes: 6 << 30,
+    };
+    let a = store.create("副屏", spec.clone()).unwrap();
+    let b = store
+        .create(
+            "主屏",
+            contract::Spec {
+                template: "phone-1080".into(),
+                disk_bytes: 8 << 30,
+                ..spec
+            },
+        )
+        .unwrap();
+    let (tx, _) = mpsc::channel();
+    let (_events, rx) = mpsc::channel();
+    let lib = Library::attach(HostChannel::new(), layout, false, tx, rx).unwrap();
+    until(|| lib.snapshot()["state"] == "stopped");
+    let snap = lib.snapshot();
+    let rows = snap["instances"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(snap["selectedId"], b.id.as_str());
+    let config = |id: &InstanceId| &rows.iter().find(|r| r["id"] == id.as_str()).unwrap()["config"];
+    assert_eq!(config(&a.id)["screenWidth"], 1280);
+    assert_eq!(config(&b.id)["screenWidth"], 1080);
+    assert_eq!(config(&a.id)["ramMiB"], 1536);
+    assert_eq!(config(&b.id)["cpuCores"], 2);
+    assert_eq!(config(&b.id)["diskBytes"], 8_u64 << 30);
+    assert_eq!(config(&a.id)["image"]["api"], 34);
+    assert_eq!(snap["storage"]["home"], json!(root));
+    let sdk = RuntimePaths::discover(&root).sdk;
+    assert_eq!(snap["storage"]["sdk"], json!(sdk));
+    assert_eq!(snap["storage"]["images"], json!(sdk.join("system-images")));
+    lib.shutdown();
+    fs::remove_dir_all(root).unwrap();
+}
