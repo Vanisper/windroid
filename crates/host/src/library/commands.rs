@@ -167,6 +167,7 @@ impl Library {
                 }
                 self.window(WindowCommand::PickApk {
                     instance_id: id.into(),
+                    instance_name: instance.name.clone(),
                 })?;
             }
             "install" | "start" | "stop" | "refreshApps" | "setDefaultHome" | "clearData" => {

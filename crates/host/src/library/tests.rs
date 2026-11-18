@@ -79,7 +79,8 @@ fn picker_keeps_its_instance_when_selection_changes() {
     lib.perform(&json!({"kind":"addApk","instanceId":a}))
         .unwrap();
     assert!(
-        matches!(windows.recv().unwrap(), WindowCommand::PickApk{instance_id} if instance_id==a)
+        matches!(windows.recv().unwrap(), WindowCommand::PickApk {instance_id, instance_name}
+            if instance_id == a && instance_name == "平板")
     );
     let b = create(&lib, "手机");
     lib.window_event(WindowEvent::ApkPicked {

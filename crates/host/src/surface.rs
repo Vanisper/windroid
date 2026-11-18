@@ -55,6 +55,7 @@ pub enum WindowCommand {
     },
     PickApk {
         instance_id: String,
+        instance_name: String,
     },
     /// 最近一次成功读取的完整活动任务集合。查询失败时应保留上次事实。
     Reconcile {
@@ -364,13 +365,23 @@ pub enum CloseChoice {
     Quit,
 }
 
-/// picker 绑定发起请求时的实例。取消只产生 None。
-pub fn pick_apk(mtm: MainThreadMarker, chosen: impl Fn(Option<PathBuf>) + 'static) {
+/// 非模态选择器允许操作主窗口；目标实例在显示面板前确定。取消只产生 None。
+pub fn pick_apk(
+    mtm: MainThreadMarker,
+    instance_name: &str,
+    chosen: impl Fn(Option<PathBuf>) + 'static,
+) -> Retained<NSOpenPanel> {
     let panel = NSOpenPanel::openPanel(mtm);
     panel.setCanChooseFiles(true);
     panel.setCanChooseDirectories(false);
     panel.setAllowsMultipleSelection(false);
-    panel.setPrompt(Some(&NSString::from_str("添加 APK")));
+    panel.setTitle(Some(&NSString::from_str(&format!(
+        "安装 APK · {instance_name}"
+    ))));
+    panel.setMessage(Some(&NSString::from_str(&format!(
+        "安装至「{instance_name}」"
+    ))));
+    panel.setPrompt(Some(&NSString::from_str("安装 APK")));
     #[allow(deprecated)]
     panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[NSString::from_str(
         "apk",
@@ -383,8 +394,6 @@ pub fn pick_apk(mtm: MainThreadMarker, chosen: impl Fn(Option<PathBuf>) + 'stati
                 .flatten(),
         );
     });
-    match NSApplication::sharedApplication(mtm).keyWindow() {
-        Some(parent) => panel.beginSheetModalForWindow_completionHandler(&parent, &reply),
-        None => panel.beginWithCompletionHandler(&reply),
-    }
+    panel.beginWithCompletionHandler(&reply);
+    panel
 }

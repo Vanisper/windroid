@@ -14,6 +14,8 @@ use host::surface::{
 };
 use nsh_engine::HostChannel;
 use nsh_platform_macos::objc2::MainThreadMarker;
+use nsh_platform_macos::objc2::rc::Retained;
+use nsh_platform_macos::objc2_app_kit::NSOpenPanel;
 
 use crate::streaming::{Notice, Source, Worker};
 use registry::{MAX_APP_WINDOWS, Registry, Route};
@@ -49,8 +51,8 @@ struct Manager {
     preferences: Preferences,
     channel: HostChannel,
     events: Sender<WindowEvent>,
-    picking: bool,
-    _termination: Option<nsh_platform_macos::objc2::rc::Retained<surface::TerminationDelegate>>,
+    picker: Option<Retained<NSOpenPanel>>,
+    _termination: Option<Retained<surface::TerminationDelegate>>,
 }
 
 thread_local! { static MANAGER: RefCell<Option<Manager>> = const { RefCell::new(None) }; }
@@ -97,7 +99,7 @@ pub fn install(
             preferences: Preferences::load(&home),
             channel,
             events,
-            picking: false,
+            picker: None,
             _termination: surface::TerminationDelegate::install(mtm),
         });
     });
@@ -205,7 +207,10 @@ impl Manager {
                     self.close(&key);
                 }
             }
-            WindowCommand::PickApk { instance_id } => self.pick(mtm, instance_id),
+            WindowCommand::PickApk {
+                instance_id,
+                instance_name,
+            } => self.pick(mtm, instance_id, &instance_name),
         }
     }
 
@@ -455,19 +460,19 @@ impl Manager {
         }
     }
 
-    fn pick(&mut self, mtm: MainThreadMarker, instance_id: String) {
-        if self.picking {
+    fn pick(&mut self, mtm: MainThreadMarker, instance_id: String, instance_name: &str) {
+        if let Some(panel) = &self.picker {
+            panel.makeKeyAndOrderFront(None);
             return;
         }
-        self.picking = true;
-        surface::pick_apk(mtm, move |path| {
+        self.picker = Some(surface::pick_apk(mtm, instance_name, move |path| {
             let instance_id = instance_id.clone();
             post(move |manager, _mtm| {
-                manager.picking = false;
+                manager.picker = None;
                 if let Some(path) = path {
                     manager.send(WindowEvent::ApkPicked { instance_id, path });
                 }
             });
-        });
+        }));
     }
 }

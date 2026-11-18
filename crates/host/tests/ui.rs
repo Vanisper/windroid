@@ -202,7 +202,7 @@ fn apk_picker_keeps_its_opening_instance_and_window_errors_remain_visible() {
     ui.start();
     press(&mut ui.app, "add-apk");
     let target = match ui.windows.recv_timeout(WAIT).unwrap() {
-        WindowCommand::PickApk { instance_id } => instance_id,
+        WindowCommand::PickApk { instance_id, .. } => instance_id,
         other => panic!("应弹出文件选择器: {other:?}"),
     };
     assert_eq!(target, first);
@@ -221,7 +221,7 @@ fn apk_picker_keeps_its_opening_instance_and_window_errors_remain_visible() {
     // 无 JS 回执的文件面板事件也走真实命令队列。空路径让内存设备产生可重复的拒绝。
     press(&mut ui.app, "add-apk");
     assert!(
-        matches!(ui.windows.recv_timeout(WAIT).unwrap(), WindowCommand::PickApk { instance_id } if instance_id == first)
+        matches!(ui.windows.recv_timeout(WAIT).unwrap(), WindowCommand::PickApk { instance_id, .. } if instance_id == first)
     );
     ui.events
         .send(WindowEvent::ApkPicked {
