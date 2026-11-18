@@ -31,11 +31,51 @@ fn until(predicate: impl Fn() -> bool) {
 
 #[test]
 fn picker_keeps_its_instance_when_selection_changes() {
+    struct WaitForInstall {
+        inner: device::FakeBackend,
+        started: mpsc::Sender<String>,
+        proceed: mpsc::Receiver<()>,
+    }
+    impl device::Backend for WaitForInstall {
+        fn exec(&mut self, command: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if let Command::Install { apk_path } = command {
+                self.started.send(apk_path.clone()).unwrap();
+                self.proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.inner.exec(command, facts)
+        }
+        fn observe(&mut self, facts: &mut Facts) {
+            self.inner.observe(facts);
+        }
+        fn abort(&mut self, facts: &mut Facts) {
+            self.inner.abort(facts);
+        }
+    }
     let (lib, windows) = library();
-    let a = create(&lib, "平板");
-    lib.perform(&json!({"kind":"start","instanceId":a}))
-        .unwrap();
-    until(|| lib.snapshot()["capabilities"]["install"] == true);
+    let a = "installer";
+    let (started, install_path) = mpsc::channel();
+    let (allow, proceed) = mpsc::channel();
+    let (handle, events) = device::spawn(
+        InstanceId::new(a),
+        a.into(),
+        WaitForInstall {
+            inner: device::FakeBackend::new(),
+            started,
+            proceed,
+        },
+        Default::default(),
+    );
+    lib.add("平板".into(), handle.clone(), events, None);
+    assert!(matches!(
+        handle.send(Command::Create { spec: fake_spec() }),
+        Ack::Accepted { .. }
+    ));
+    let select = |id: &str| {
+        lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
+            .unwrap()
+    };
+    select(a);
+    ready(&lib, a);
     lib.perform(&json!({"kind":"addApk","instanceId":a}))
         .unwrap();
     assert!(
@@ -43,19 +83,34 @@ fn picker_keeps_its_instance_when_selection_changes() {
     );
     let b = create(&lib, "手机");
     lib.window_event(WindowEvent::ApkPicked {
-        instance_id: a.clone(),
+        instance_id: a.into(),
         path: "/fixture/two words.apk".into(),
     });
+    assert_eq!(
+        install_path.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "/fixture/two words.apk"
+    );
+    assert_eq!(lib.snapshot()["selectedId"], b);
+    assert_ne!(lib.snapshot()["operation"]["instanceId"], a);
+    select(a);
+    assert_eq!(lib.snapshot()["operation"]["message"], "正在安装 APK…");
+    select(&b);
+    allow.send(()).unwrap();
     until(|| {
         lib.state
             .lock()
             .unwrap()
             .operations
-            .get(&a)
-            .is_some_and(|op| op["message"].as_str().is_some_and(|s| s.contains("APK")))
+            .get(a)
+            .is_some_and(|op| op["message"] == "APK 已安装并核实版本")
     });
     assert_eq!(lib.snapshot()["selectedId"], b);
     assert_ne!(lib.snapshot()["operation"]["instanceId"], a);
+    select(a);
+    assert_eq!(
+        lib.snapshot()["operation"]["message"],
+        "APK 已安装并核实版本"
+    );
     assert!(
         lib.perform(&json!({"kind":"install","apkPath":"/fixture/package.apk"}))
             .is_err()
