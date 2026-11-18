@@ -72,10 +72,25 @@ impl Preferences {
         Self { path, choice }
     }
 
-    pub fn remember(&mut self, choice: CloseChoice, checked: bool) -> io::Result<()> {
-        if !checked {
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({ "closeAction": match self.choice {
+            Some(CloseChoice::Background) => "background",
+            Some(CloseChoice::Quit) => "quit",
+            None => "ask",
+        } })
+    }
+
+    pub fn set(&mut self, choice: Option<CloseChoice>) -> io::Result<()> {
+        // 老工作区用缺少偏好文件表示「每次询问」。恢复此选项时保持该格式。
+        let Some(choice) = choice else {
+            match fs::remove_file(&self.path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            }
+            self.choice = None;
             return Ok(());
-        }
+        };
         static NUMBER: AtomicU64 = AtomicU64::new(1);
         fs::create_dir_all(self.path.parent().expect("preference has parent"))?;
         let temp = self.path.with_extension(format!(
@@ -147,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_close_choices_do_not_become_a_default() {
+    fn window_settings_round_trip_and_restore_the_original_ask_state() {
         let home = std::env::temp_dir().join(format!(
             "windroid-window-prefs-{}-{}",
             std::process::id(),
@@ -158,18 +173,20 @@ mod tests {
         ));
         let mut prefs = Preferences::load(&home);
         assert_eq!(prefs.choice, None);
-        prefs.remember(CloseChoice::Quit, false).unwrap();
-        assert_eq!(Preferences::load(&home).choice, None);
+        assert_eq!(prefs.snapshot()["closeAction"], "ask");
+        prefs.set(None).unwrap();
         assert!(!home.exists());
-        prefs.remember(CloseChoice::Background, true).unwrap();
+        prefs.set(Some(CloseChoice::Background)).unwrap();
+        assert_eq!(prefs.snapshot()["closeAction"], "background");
         assert_eq!(
             Preferences::load(&home).choice,
             Some(CloseChoice::Background)
         );
-        prefs.remember(CloseChoice::Quit, false).unwrap();
-        assert_eq!(prefs.choice, Some(CloseChoice::Background));
-        prefs.remember(CloseChoice::Quit, true).unwrap();
+        prefs.set(Some(CloseChoice::Quit)).unwrap();
         assert_eq!(Preferences::load(&home).choice, Some(CloseChoice::Quit));
+        prefs.set(None).unwrap();
+        assert_eq!(Preferences::load(&home).choice, None);
+        assert!(!prefs.path.exists());
         fs::remove_dir_all(&home).unwrap();
     }
     #[test]

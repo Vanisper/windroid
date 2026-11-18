@@ -17,6 +17,8 @@ host = { path = "../crates/host" }
 runtime = { path = "../crates/runtime" }
 stream = { path = "../crates/stream" }
 nsh-core = "0.5"
+nsh-engine = "0.5"
 nsh-platform-macos = "0.5"
+serde_json = { workspace = true }
 log = "0.4"
 env_logger = "0.11"
