@@ -1,0 +1,15 @@
+{
+  "name": "windroid",
+  "private": true,
+  "scripts": {
+    "check": "cargo check --locked --all-targets -p contract -p device -p adb -p stream",
+    "test": "cargo test --locked -p contract -p device -p adb -p stream",
+    "check:ui": "nsh check app",
+    "build:ui": "nsh build app -o app/.nsh/out",
+    "dev:macos": "npm run build:ui && cargo run --locked -p windroid",
+    "check:macos": "npm run check:ui && cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "test:macos": "cargo test --locked --workspace",
+    "package:macos": "bash scripts/package-macos.sh",
+    "fixtures:apk": "bash scripts/build-test-apks.sh"
+  }
+}
