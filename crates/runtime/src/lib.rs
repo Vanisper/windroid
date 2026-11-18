@@ -371,6 +371,7 @@ impl Backend for EmulatorBackend {
         if self.next_probe.is_some_and(|t| t > Instant::now()) {
             return;
         }
+        let previously_ready = facts.services.ready();
         clear_device(facts);
         let serial = self.serial();
         if let Ok(output) = adb::shell(&serial, HEALTH) {
@@ -398,7 +399,12 @@ impl Backend for EmulatorBackend {
                     Duration::from_millis(350)
                 },
         );
-        if ready && self.apps_dirty && self.apps_retry_at.is_none_or(|t| Instant::now() >= t) {
+        // 先发布第一次就绪，任务观察器即可独立读取活动栈。目录与标签读取可能需要数秒。
+        if ready
+            && previously_ready
+            && self.apps_dirty
+            && self.apps_retry_at.is_none_or(|t| Instant::now() >= t)
+        {
             let _ = self.refresh_catalog();
         }
     }

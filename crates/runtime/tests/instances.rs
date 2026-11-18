@@ -312,6 +312,12 @@ esac
     )
     .unwrap();
     await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    assert_eq!(backend.catalog_status(), CatalogStatus::Pending);
+    assert!(
+        !fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .contains("pm list packages")
+    );
     assert!(
         facts.allocation.is_none(),
         "前次启动遗留的有效参数不能算作本次观测"
