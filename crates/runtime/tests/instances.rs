@@ -268,6 +268,8 @@ esac
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(pid_marker.exists());
     fs::remove_file(pid_marker).unwrap();
+    let hardware = avd(&root, &a).join("hardware-qemu.ini");
+    fs::write(&hardware, "hw.cpu.ncore=8\nhw.ramSize=8192").unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
     assert!(store.delete(&a.id).is_err());
     let mut another = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
@@ -310,6 +312,18 @@ esac
     )
     .unwrap();
     await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    assert!(
+        facts.allocation.is_none(),
+        "前次启动遗留的有效参数不能算作本次观测"
+    );
+    fs::write(&hardware, "hw.cpu.ncore = 2\nhw.ramSize = 2560").unwrap();
+    await_observation(&mut backend, &mut facts, |f| f.allocation.is_some());
+    let allocation = facts.allocation.unwrap();
+    assert_eq!(
+        (allocation.cpu_cores, allocation.ram_mib),
+        (Some(2), Some(2560))
+    );
+    assert_eq!(a.config(&layout).ram_mib, Some(1536));
     assert_eq!(State::of(&facts), State::Ready);
     assert_eq!(backend.catalog_status(), CatalogStatus::Ready);
     assert_eq!(backend.apps()[0].package.as_str(), "dev.sample");
@@ -343,10 +357,13 @@ esac
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(store.quick_boot_saved(&a.id).unwrap());
+    assert!(facts.allocation.is_none());
     // 下一次退出时若没有写入，磁盘上残留的旧快照不能让界面误报“已冻结”。
     fs::remove_file(root.join("save-on-exit")).unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
+    await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    assert!(facts.allocation.is_none());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     assert_eq!(backend.catalog_status(), CatalogStatus::Pending);

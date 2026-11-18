@@ -356,7 +356,7 @@ impl Library {
                     "id": id, "name": instance.name, "state": device.state,
                     "frozen": state.frozen.contains(id),
                     "summary": crate::describe(device.state, device.phase, &device.facts),
-                    "config": instance.config
+                    "config": instance.config, "observed": device.facts.allocation
                 })
             })
             .collect();

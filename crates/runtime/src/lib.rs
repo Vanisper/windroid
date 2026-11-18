@@ -221,6 +221,7 @@ impl EmulatorBackend {
         self.reset_catalog();
         self.next_probe = None;
         facts.process_alive = false;
+        facts.allocation = None;
         facts.session_count = 0;
         clear_device(facts);
         Ok(())
@@ -363,6 +364,7 @@ impl Backend for EmulatorBackend {
             false
         });
         if !facts.process_alive {
+            facts.allocation = None;
             clear_device(facts);
             return;
         }
@@ -381,6 +383,13 @@ impl Backend for EmulatorBackend {
             }
         }
         let ready = facts.services.ready();
+        if ready
+            && facts
+                .allocation
+                .is_none_or(|a| a.cpu_cores.is_none() || a.ram_mib.is_none())
+        {
+            facts.allocation = self.process.as_ref().and_then(OwnedEmulator::allocation);
+        }
         self.next_probe = Some(
             Instant::now()
                 + if ready {
