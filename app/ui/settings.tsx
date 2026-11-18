@@ -58,7 +58,7 @@ export function Settings() {
       <Detail text={"系统镜像目录 · " + (snapshot()?.storage?.images ?? "未知")} />
     </View>
     <View style={card()}>
-      <Heading text="应用日志" /><Detail text="Windroid 运行记录将在日志采集接入后提供。单台模拟器的入口位于「管理实例」。" />
+      <Heading text="应用日志" /><Detail text="Windroid 当前将运行记录写到标准错误。按启动记录浏览历史将在后续版本提供。" />
     </View>
   </View>;
 }
