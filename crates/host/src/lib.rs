@@ -38,6 +38,13 @@ pub mod names {
 /// 界面拿到的是「缺什么、后果是什么」，而不是错误码——用户在首次启动时
 /// 需要的是一句能照做的话。
 fn readiness_view() -> ReadinessView {
+    // 自检要扫文件系统，而快照在每次点击时都会被取。运行时组件在进程
+    // 生命周期内不会变（变了要重启），因此第一次扫描后复用结果。
+    static CACHE: std::sync::OnceLock<ReadinessView> = std::sync::OnceLock::new();
+    CACHE.get_or_init(scan_readiness).clone()
+}
+
+fn scan_readiness() -> ReadinessView {
     let r = runtime::prepare::check();
     ReadinessView {
         usable: r.usable(),
