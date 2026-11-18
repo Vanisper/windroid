@@ -599,3 +599,49 @@ fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
     lib.shutdown();
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn missing_runtime_blocks_create_and_start_but_keeps_selection_available() {
+    let root =
+        std::env::temp_dir().join(format!("windroid-missing-runtime-{}", std::process::id()));
+    let (tx, _) = mpsc::channel();
+    let mut lib = Library::new(
+        HostChannel::new(),
+        Layout { root: root.clone() },
+        true,
+        tx,
+        false,
+    )
+    .unwrap();
+    Arc::get_mut(&mut lib).unwrap().runtime = Some(Provisioner::managed(&root));
+    assert_ne!(lib.snapshot()["preparation"]["phase"], "ready");
+    assert_eq!(lib.snapshot()["capabilities"]["create"], false);
+    assert!(
+        lib.perform(&json!({"kind":"createInstance", "name":"新实例"}))
+            .is_err()
+    );
+
+    let id = "existing";
+    let (handle, events) = device::spawn(
+        InstanceId::new(id),
+        id.into(),
+        device::FakeBackend::new(),
+        Default::default(),
+    );
+    assert!(matches!(
+        handle.send(Command::Create { spec: fake_spec() }),
+        Ack::Accepted { .. }
+    ));
+    lib.add(id.into(), handle, events, None);
+    lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
+        .unwrap();
+    let snap = lib.snapshot();
+    assert_eq!(snap["selectedId"], id);
+    assert_eq!(snap["state"], "stopped");
+    assert_eq!(snap["capabilities"]["start"], false);
+    assert_eq!(snap["capabilities"]["delete"], true);
+    assert!(
+        lib.perform(&json!({"kind":"start", "instanceId":id}))
+            .is_err()
+    );
+}

@@ -381,6 +381,11 @@ impl Library {
             });
         let id = snap.id.to_string();
         let mut view = SnapshotView::of(snap.clone()).with_apps(&snap.apps, &snap.desktop);
+        // actor 判断设备状态，应用库再叠加同一份准备快照中的主机条件。
+        if preparation["phase"] != "ready" {
+            view.capabilities.create = false;
+            view.capabilities.start = false;
+        }
         self.groups.lock().unwrap().apply(&id, &mut view.groups);
         let mut out = crate::to_json(&view);
         out["instances"] = state
