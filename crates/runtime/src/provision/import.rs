@@ -46,14 +46,17 @@ pub(super) fn inspect(path: &Path, catalog: &[Artifact]) -> io::Result<Artifact>
     ))
 }
 
-pub(super) fn capture(shared: &Shared, source: &Path, pkg: Artifact) -> io::Result<File> {
+pub(super) fn capture(
+    shared: &Shared,
+    stage: &Path,
+    source: &Path,
+    pkg: Artifact,
+) -> io::Result<File> {
     if paths::regular(source)?.len() != pkg.bytes {
         return Err(invalid("镜像 ZIP 在确认后发生了变化，请重新选择"));
     }
     let mut source = File::open(source)?.take(pkg.bytes + 1);
-    let temp = shared
-        .stage
-        .join(format!("image-import-{}", crate::instances::nonce()?));
+    let temp = stage.join(format!("image-import-{}", crate::instances::nonce()?));
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -74,6 +77,7 @@ pub(super) fn capture(shared: &Shared, source: &Path, pkg: Artifact) -> io::Resu
             return Err(invalid("镜像 ZIP 在确认后发生了变化，请重新选择"));
         }
         file.write_all(&buffer[..count])?;
+        shared.progress(pkg, copied);
     }
     Ok(file)
 }

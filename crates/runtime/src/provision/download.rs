@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -66,8 +66,12 @@ fn transfer(
     path: &Path,
     offset: u64,
 ) -> io::Result<(ExitStatus, String)> {
-    let mut part = OpenOptions::new().append(true).create(true).open(path)?;
-    if part.metadata()?.len() != offset {
+    let mut part = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if part.metadata()?.len() != offset || part.metadata()?.nlink() != 1 {
         return Err(invalid("暂存文件已发生变化"));
     }
     // curl 只向管道写入。应用被终止时子进程会失去读端，不能继续改写磁盘。

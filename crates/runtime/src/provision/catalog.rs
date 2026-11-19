@@ -7,8 +7,6 @@
 pub(super) const SDK_LICENSE: &str = include_str!("licenses/android-sdk-license.txt");
 const IMAGE_LICENSE: &str = include_str!("licenses/android-sdk-arm-dbt-license.txt");
 const APACHE_LICENSE: &str = include_str!("licenses/scrcpy-apache-2.0.txt");
-pub(super) const IMAGE_DIR: &str = "system-images/android-34/google_apis_playstore/arm64-v8a";
-pub(super) const BUILD_TOOLS: &str = "build-tools/34.0.0";
 pub(super) const EMULATOR_VERSION: &str = "37.2.13";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +47,7 @@ pub(super) struct Artifact {
     pub unpacked: u64,
     /// 启动必需的文件及其 ZIP 内原始长度。重扫只需 stat 就能识别截断。
     pub essentials: &'static [(&'static str, u64)],
+    pub manifest: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +94,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Emulator,
         id: "emulator",
+        manifest: include_str!("manifests/emulator.tsv"),
         name: "Android Emulator",
         image_spec: None,
         version: EMULATOR_VERSION,
@@ -115,6 +115,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Adb,
         id: "platform-tools",
+        manifest: include_str!("manifests/platform-tools.tsv"),
         name: "Android SDK Platform-Tools",
         image_spec: None,
         version: "37.0.1",
@@ -128,6 +129,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Aapt,
         id: "build-tools",
+        manifest: include_str!("manifests/build-tools.tsv"),
         name: "Android SDK Build-Tools",
         image_spec: None,
         version: "34.0.0",
@@ -142,6 +144,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
         // 发布者提供的 SHA-256：<https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/SHA256SUMS.txt>
         kind: Kind::Server,
         id: "scrcpy-server",
+        manifest: include_str!("manifests/scrcpy-server.tsv"),
         name: "scrcpy-server",
         image_spec: None,
         version: "5.0.1",
@@ -155,6 +158,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Image,
         id: "system-image",
+        manifest: include_str!("manifests/system-image.tsv"),
         name: "Android 14 · Google Play",
         image_spec: Some(ImageSpec {
             api: 34,
@@ -178,6 +182,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Image,
         id: "system-image-35",
+        manifest: include_str!("manifests/system-image-35.tsv"),
         name: "Android 15 · Google Play",
         image_spec: Some(ImageSpec {
             api: 35,
@@ -200,6 +205,7 @@ pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Image,
         id: "system-image-33",
+        manifest: include_str!("manifests/system-image-33.tsv"),
         name: "Android 13 · Google Play",
         image_spec: Some(ImageSpec {
             api: 33,

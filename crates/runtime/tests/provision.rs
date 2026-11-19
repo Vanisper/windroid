@@ -10,7 +10,7 @@ fn cold_open_exposes_sources_sizes_terms_without_writing() {
     let provision = Provisioner::managed(&root);
     provision.recheck().unwrap();
     let snap = provision.snapshot();
-    assert!(!snap.borrowed);
+    assert!(snap.candidate_target.is_none());
     assert_eq!(snap.components.len(), 4);
     assert_eq!(snap.downloaded_bytes, 0);
     assert!(!snap.components_ready);
@@ -29,39 +29,13 @@ fn cold_open_exposes_sources_sizes_terms_without_writing() {
         assert!(c.license_url.starts_with("https://") && c.license_text.len() > 10_000);
     }
     let paths = provision.paths();
-    assert_eq!(paths.sdk, root.join("runtime/sdk"));
-    assert_eq!(paths.server_jar, root.join("runtime/scrcpy-server.jar"));
-    assert!(
-        paths
-            .image
-            .ends_with("system-images/android-34/google_apis_playstore/arm64-v8a")
+    assert_eq!(paths.runtime_root, root.join("runtime"));
+    assert_eq!(
+        paths.server_jar,
+        root.join("runtime/scrcpy-server/5.0.1/scrcpy-server.jar")
     );
+    assert_eq!(paths.images, root.join("system-images"));
     assert!(!root.exists());
-}
-
-/// 仅显式指定开发 SDK 时执行。自检不启动模拟器或 adb，不写入 SDK 或主目录。
-#[test]
-#[ignore = "set WINDROID_SDK (and optionally WINDROID_SERVER_JAR) to a compatible read-only SDK"]
-fn explicitly_borrowed_sdk_passes_the_same_layout_and_jar_checks() {
-    let sdk = PathBuf::from(std::env::var_os("WINDROID_SDK").expect("set WINDROID_SDK"));
-    let home = std::env::temp_dir().join(format!(
-        "windroid-borrowed-provision-{}",
-        std::process::id()
-    ));
-    assert!(!home.exists());
-    let provision = Provisioner::new(&home);
-    assert_eq!(provision.paths().sdk, sdk);
-    assert!(provision.snapshot().borrowed);
-    let issues: Vec<_> = provision
-        .snapshot()
-        .components
-        .into_iter()
-        .filter_map(|c| c.issue)
-        .collect();
-    assert!(issues.is_empty(), "{issues:?}");
-    assert_eq!(provision.snapshot().phase, "ready");
-    provision.start().unwrap();
-    assert!(!home.exists());
 }
 
 /// 使用从清单 URL 单独取得的真实 ZIP。三个镜像都安装在隔离的可配置目录。
@@ -82,13 +56,17 @@ fn verifies_and_imports_each_official_image_into_the_same_library() {
     fs::create_dir(&home).unwrap();
     let locations = windroid_locations::StorageLocations {
         runtime_root: root.join("tools"),
-        image_root: Some(root.join("images")),
+        image_root: std::env::var_os("WINDROID_QA_VOLUME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.clone())
+            .join(format!("images-import-{}", std::process::id())),
     };
     fs::write(
         home.join(windroid_locations::SETTINGS),
         serde_json::to_vec(&locations).unwrap(),
     )
     .unwrap();
+    fs::create_dir(&locations.image_root).unwrap();
     let p = Provisioner::managed(&home);
     for row in p.snapshot().images {
         let archive = archives.join(row.source.rsplit('/').next().unwrap());
@@ -113,9 +91,10 @@ fn verifies_and_imports_each_official_image_into_the_same_library() {
         p.snapshot()
             .images
             .iter()
-            .all(|c| c.ready && c.location.starts_with(root.join("images")))
+            .all(|c| c.ready && c.location.starts_with(&locations.image_root))
     );
     assert!(!p.snapshot().components_ready);
     assert!(!home.join("instances").exists());
+    fs::remove_dir_all(&locations.image_root).unwrap();
     fs::remove_dir_all(root).unwrap();
 }

@@ -2,111 +2,77 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-
 use windroid_locations::StorageLocations;
 
-use super::catalog::{Artifact, BUILD_TOOLS, IMAGE_DIR, Kind};
+use super::catalog::{Artifact, CATALOG, Kind};
 use super::integrity::{check_digest, invalid};
 
-/// 各设备域使用同一组路径。私有模式完全忽略系统 SDK、PATH 和 Homebrew。
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
     pub runtime_root: PathBuf,
-    /// 镜像根目录，其下按 API、标签和 ABI 区分安装。
     pub images: PathBuf,
-    pub sdk: PathBuf,
     pub emulator: PathBuf,
     pub adb: PathBuf,
     pub aapt: PathBuf,
-    pub image: PathBuf,
     pub server_jar: PathBuf,
-    pub borrowed: bool,
-    adb_override: bool,
-    jar_override: bool,
-    config_error: Option<String>,
+    pub(super) config_error: Option<String>,
 }
 
 pub(crate) struct ManagedPackage {
     pub(crate) path: PathBuf,
-    artifact: Artifact,
+    pub(super) artifact: Artifact,
 }
 
 impl ManagedPackage {
-    pub(crate) fn receipt(&self) -> Option<String> {
-        self.artifact.prefix.map(|_| receipt(self.artifact))
+    pub(crate) fn id(&self) -> &'static str {
+        self.artifact.id
     }
-
-    pub(crate) fn owned(&self) -> io::Result<bool> {
-        let result = if let Some(expected) = self.receipt() {
-            small_text(&self.path.join(RECEIPT)).map(|found| found == expected)
-        } else {
-            validate_payload(&self.path, self.artifact).map(|_| true)
-        };
-        match result {
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::NotADirectory
-                        | io::ErrorKind::InvalidData
-                ) =>
-            {
-                Ok(false)
-            }
-            result => result,
-        }
+    pub(crate) fn image(&self) -> Option<contract::Image> {
+        self.artifact.image()
+    }
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "{} {}{}",
+            self.artifact.name,
+            if self.artifact.image_spec.is_some() {
+                "r"
+            } else {
+                ""
+            },
+            self.artifact.version
+        )
+    }
+    pub(crate) fn bytes(&self) -> u64 {
+        self.artifact.unpacked
+    }
+    /// 调用方在整个使用期间持有版本对象的共享租约。
+    pub(crate) fn check(&self, home: &Path) -> io::Result<()> {
+        super::manifest::check(home, &self.path, self.artifact, false, || Ok(())).map(|_| ())
+    }
+    pub(crate) fn content_digest(&self) -> String {
+        super::manifest::content_digest(self.artifact)
+    }
+    pub(crate) fn empty_skeleton(&self, path: &Path) -> io::Result<bool> {
+        super::manifest::empty_skeleton(path, self.artifact)
+    }
+    pub(crate) fn download_space(&self, config: &StorageLocations) -> (u64, Option<u64>, bool) {
+        let paths = RuntimePaths::for_locations(config);
+        let dest = paths.destination(self.artifact);
+        let volume = super::volume_info(dest.parent().expect("version directory")).ok();
+        (
+            super::required_bytes(self.artifact, super::prefix_bytes(&paths, self.artifact)),
+            volume.map(|v| v.0),
+            volume.is_some_and(|v| v.1),
+        )
+    }
+    pub(crate) fn verify_at(&self, path: &Path) -> io::Result<String> {
+        super::manifest::full(path, self.artifact, || Ok(())).map(|(digest, _)| digest)
     }
 }
 
 impl RuntimePaths {
     pub fn discover(home: &Path) -> Self {
-        Self::resolve(home, |key| std::env::var_os(key))
-    }
-
-    pub(super) fn resolve(home: &Path, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
-        let explicit = |key| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let sdk = explicit("WINDROID_SDK");
-        let jar = explicit("WINDROID_SERVER_JAR");
-        let adb = explicit("WINDROID_ADB");
-        let mut paths = match sdk {
-            None => Self::managed(home),
-            Some(sdk) => {
-                let default_jar = || {
-                    ["/opt/homebrew", "/usr/local"]
-                        .into_iter()
-                        .map(|base| {
-                            Path::new(base).join("Cellar/scrcpy/5.0.1/share/scrcpy/scrcpy-server")
-                        })
-                        .find(|path| path.is_file())
-                        .unwrap_or_else(|| Self::managed(home).server_jar)
-                };
-                Self::from_sdk(sdk, jar.clone().unwrap_or_else(default_jar), true)
-            }
-        };
-        if let Some(jar) = jar {
-            paths.server_jar = jar;
-            paths.jar_override = true;
-        }
-        if let Some(adb) = adb {
-            // 显式给出命令名时按 Command::new 的 PATH 搜索顺序检查可执行文件。
-            paths.adb = if adb.parent() == Some(Path::new("")) {
-                env("PATH")
-                    .and_then(|path| {
-                        std::env::split_paths(&path)
-                            .map(|d| d.join(&adb))
-                            .find(|p| {
-                                fs::metadata(p).is_ok_and(|m| {
-                                    m.is_file() && m.permissions().mode() & 0o111 != 0
-                                })
-                            })
-                    })
-                    .unwrap_or(adb)
-            } else {
-                adb
-            };
-            paths.adb_override = true;
-        }
-        paths
+        Self::managed(home)
     }
 
     pub(super) fn managed(home: &Path) -> Self {
@@ -118,31 +84,24 @@ impl RuntimePaths {
         paths
     }
 
-    fn for_locations(config: &StorageLocations) -> Self {
+    pub(crate) fn for_locations(config: &StorageLocations) -> Self {
         let root = &config.runtime_root;
-        let mut paths = Self::from_sdk(root.join("sdk"), root.join("scrcpy-server.jar"), false);
-        paths.images = config.images();
-        paths.image = paths
-            .images
-            .join(Path::new(IMAGE_DIR).strip_prefix("system-images").unwrap());
-        paths
-    }
-
-    /// 迁移可能已由另一进程完成。持有资源锁后再确认一次，避免写回旧目录。
-    pub(super) fn current(&self, home: &Path) -> Self {
-        if self.borrowed {
-            return self.clone();
+        let component = |kind| {
+            let pkg = CATALOG
+                .iter()
+                .find(|p| p.kind == kind)
+                .expect("pinned component");
+            root.join(pkg.id).join(pkg.version)
+        };
+        Self {
+            runtime_root: root.clone(),
+            images: config.images(),
+            emulator: component(Kind::Emulator).join("emulator"),
+            adb: component(Kind::Adb).join("adb"),
+            aapt: component(Kind::Aapt).join("aapt"),
+            server_jar: component(Kind::Server).join("scrcpy-server.jar"),
+            config_error: None,
         }
-        let mut paths = Self::managed(home);
-        if self.adb_override {
-            paths.adb.clone_from(&self.adb);
-            paths.adb_override = true;
-        }
-        if self.jar_override {
-            paths.server_jar.clone_from(&self.server_jar);
-            paths.jar_override = true;
-        }
-        paths
     }
 
     pub(crate) fn check_configuration(
@@ -151,11 +110,8 @@ impl RuntimePaths {
         components: bool,
         images: bool,
     ) -> io::Result<()> {
-        if self.borrowed {
-            return Ok(());
-        }
-        if let Some(message) = &self.config_error {
-            return Err(invalid(message));
+        if let Some(error) = &self.config_error {
+            return Err(invalid(error));
         }
         let current = StorageLocations::load(home)?;
         if components && !crate::storage::same_location(&self.runtime_root, &current.runtime_root)
@@ -163,57 +119,11 @@ impl RuntimePaths {
         {
             return Err(invalid("存储位置已更改，请重新检查运行环境"));
         }
-        crate::storage::check_locations(home, &current, components, images, false)
-    }
-
-    pub(crate) fn claim_locations(
-        &self,
-        home: &Path,
-        components: bool,
-        images: bool,
-    ) -> io::Result<()> {
-        self.check_configuration(home, components, images)?;
-        if !self.borrowed {
-            crate::storage::check_locations(
-                home,
-                &StorageLocations::load(home)?,
-                components,
-                images,
-                true,
-            )?;
-        }
         Ok(())
     }
 
-    pub(super) fn from_sdk(sdk: PathBuf, server_jar: PathBuf, borrowed: bool) -> Self {
-        Self {
-            runtime_root: sdk.parent().unwrap_or(&sdk).to_owned(),
-            images: sdk.join("system-images"),
-            emulator: sdk.join("emulator/emulator"),
-            adb: sdk.join("platform-tools/adb"),
-            aapt: sdk.join(BUILD_TOOLS).join("aapt"),
-            image: sdk.join(IMAGE_DIR),
-            sdk,
-            server_jar,
-            borrowed,
-            adb_override: false,
-            jar_override: false,
-            config_error: None,
-        }
-    }
-
-    pub(super) fn read_only(&self, kind: Kind) -> bool {
-        self.borrowed
-            || (kind == Kind::Adb && self.adb_override)
-            || (kind == Kind::Server && self.jar_override)
-    }
-
-    pub(super) fn explicit_adb(&self, kind: Kind) -> bool {
-        kind == Kind::Adb && self.adb_override
-    }
-
     pub(super) fn installation_root(&self, pkg: Artifact) -> &Path {
-        if pkg.kind == Kind::Image && !self.images.starts_with(&self.runtime_root) {
+        if pkg.image_spec.is_some() {
             &self.images
         } else {
             &self.runtime_root
@@ -222,40 +132,23 @@ impl RuntimePaths {
 
     pub(crate) fn managed_packages(config: &StorageLocations) -> Vec<ManagedPackage> {
         let paths = Self::for_locations(config);
-        super::catalog::CATALOG
+        CATALOG
             .iter()
-            .map(|pkg| ManagedPackage {
-                path: paths.destination(*pkg),
-                artifact: *pkg,
+            .map(|&artifact| ManagedPackage {
+                path: paths.destination(artifact),
+                artifact,
             })
             .collect()
     }
 
     pub(super) fn destination(&self, pkg: Artifact) -> PathBuf {
-        match pkg.kind {
-            Kind::Emulator => self.sdk.join("emulator"),
-            Kind::Adb if self.adb_override => self.adb.clone(),
-            Kind::Adb => self.sdk.join("platform-tools"),
-            Kind::Aapt => self.sdk.join(BUILD_TOOLS),
-            Kind::Image => {
-                let image = pkg.image().expect("catalog image identity");
-                self.images
-                    .join(crate::instances::image_subdir(&image).expect("catalog ABI"))
-            }
-            Kind::Server => self.server_jar.clone(),
+        if let Some(image) = pkg.image() {
+            self.images
+                .join(crate::instances::image_subdir(&image).expect("catalog image"))
+        } else {
+            self.runtime_root.join(pkg.id).join(pkg.version)
         }
     }
-}
-
-pub(super) const RECEIPT: &str = ".windroid-component";
-
-pub(super) fn receipt(pkg: Artifact) -> String {
-    format!(
-        "windroid-v1 {} {} {}\n",
-        pkg.id,
-        pkg.version,
-        pkg.digest.hex()
-    )
 }
 
 /// 每个目录逐层检查，拒绝私有 SDK 或 staging 内跳转到用户其他目录的链接。
@@ -270,7 +163,7 @@ pub(super) fn directory(home: &Path, path: &Path, create: bool) -> io::Result<()
     if create {
         fs::create_dir_all(home)?;
     }
-    if !fs::symlink_metadata(home)?.is_dir() {
+    if !fs::metadata(home)?.is_dir() {
         return Err(invalid(format!("根目录必须为普通目录：{}", home.display())));
     }
     let mut dir = home.to_path_buf();
@@ -313,41 +206,11 @@ pub(super) fn small_text(path: &Path) -> io::Result<String> {
     Ok(s)
 }
 
-pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io::Result<()> {
-    paths.check_configuration(home, pkg.kind != Kind::Image, pkg.kind == Kind::Image)?;
-    let dest = paths.destination(pkg);
-    if paths.read_only(pkg.kind) {
-        // 只读检查显式选中的链接目标。单独指定 adb 时可以使用开发者自己的可执行文件。
-        let selected = dest.canonicalize()?;
-        if paths.explicit_adb(pkg.kind) {
-            let meta = regular(&selected)?;
-            if meta.len() == 0 || meta.permissions().mode() & 0o111 == 0 {
-                return Err(invalid(format!(
-                    "指定的 adb 为空或不可执行：{}",
-                    dest.display()
-                )));
-            }
-            return Ok(());
-        }
-        return validate_payload(&selected, pkg);
-    }
-    let parent = if pkg.prefix.is_some() {
-        dest.as_path()
-    } else {
-        dest.parent().unwrap()
-    };
-    directory(paths.installation_root(pkg), parent, false)?;
-    if pkg.prefix.is_some() && small_text(&dest.join(RECEIPT))? != receipt(pkg) {
-        return Err(invalid("组件安装记录与发布版本不符"));
-    }
-    validate_payload(&dest, pkg)
-}
-
 /// 受信任包在发布前以及后续每次重扫都要满足同一份布局/版本契约。
 /// 启动自检只读取小元数据与 734 KB 的协议绑定 JAR，不扫描多 GB 的镜像内容。
 pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
     if pkg.kind == Kind::Server {
-        return check_digest(dest, pkg, || Ok(()));
+        return check_digest(&dest.join("scrcpy-server.jar"), pkg, || Ok(()));
     }
     let props = small_text(&dest.join("source.properties"))?;
     super::metadata::verify(&props, pkg)?;
@@ -357,6 +220,17 @@ pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
         directory(dest, path.parent().expect("relative component file"), false)?;
         let meta = regular(&path)
             .map_err(|e| io::Error::new(e.kind(), format!("{}：{e}", path.display())))?;
+        if executable
+            && CATALOG
+                .iter()
+                .any(|official| official.digest.hex() == pkg.digest.hex())
+            && !has_arm64(&path)?
+        {
+            return Err(invalid(format!(
+                "宿主可执行文件缺少 arm64 架构：{}",
+                path.display()
+            )));
+        }
         if meta.len() != bytes || (executable && meta.permissions().mode() & 0o111 == 0) {
             return Err(invalid(format!(
                 "文件长度不符或不可执行：{}",
@@ -365,4 +239,30 @@ pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 此目录上游包只发布 Mach-O arm64 或同时含 arm64 的 universal 可执行文件。
+fn has_arm64(path: &Path) -> io::Result<bool> {
+    let mut f = File::open(path)?;
+    let mut head = [0; 8];
+    f.read_exact(&mut head)?;
+    const ARM64: u32 = 0x0100000c;
+    match u32::from_be_bytes(head[..4].try_into().unwrap()) {
+        0xcffaedfe => Ok(u32::from_le_bytes(head[4..].try_into().unwrap()) == ARM64),
+        magic @ (0xcafebabe | 0xcafebabf) => {
+            let count = u32::from_be_bytes(head[4..].try_into().unwrap());
+            if count > 32 {
+                return Ok(false);
+            }
+            let mut row = [0; 32];
+            for _ in 0..count {
+                f.read_exact(&mut row[..if magic == 0xcafebabe { 20 } else { 32 }])?;
+                if u32::from_be_bytes(row[..4].try_into().unwrap()) == ARM64 {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }

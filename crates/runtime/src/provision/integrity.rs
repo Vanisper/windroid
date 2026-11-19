@@ -43,8 +43,10 @@ pub(super) fn check_file(
     Ok(())
 }
 
-fn hash<H: Hasher>(mut input: impl Read, check: impl Fn() -> io::Result<()>) -> io::Result<String> {
-    use std::fmt::Write;
+pub(super) fn hash<H: Hasher>(
+    mut input: impl Read,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<String> {
     let mut h = H::new();
     let mut buffer = vec![0; 256 * 1024];
     loop {
@@ -55,9 +57,5 @@ fn hash<H: Hasher>(mut input: impl Read, check: impl Fn() -> io::Result<()>) -> 
         }
         h.update(&buffer[..count]);
     }
-    let mut result = String::new();
-    for byte in h.finalize() {
-        write!(result, "{byte:02x}").unwrap();
-    }
-    Ok(result)
+    Ok(base16ct::lower::encode_string(&h.finalize()))
 }
