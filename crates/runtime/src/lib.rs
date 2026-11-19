@@ -13,6 +13,7 @@ pub mod labels;
 pub mod provision;
 pub mod running;
 pub mod storage;
+pub mod workspace;
 
 use std::io;
 use std::path::PathBuf;

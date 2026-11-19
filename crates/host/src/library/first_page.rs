@@ -1,4 +1,4 @@
-//! 初次入口属于工作区。宿主先认出旧版留下的目录，再允许实例注册表创建空目录。
+//! 已通过格式检查的工作区，在首个页面实际布局后记录展示状态。
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,22 +19,9 @@ impl FirstPage {
         } else if pending.try_exists()? {
             true
         } else {
-            let legacy = [
-                "instances",
-                "preferences",
-                "runtime",
-                "staging",
-                "groups.json",
-                "cache",
-                "logs",
-            ]
-            .into_iter()
-            .map(|name| home.join(name).try_exists())
-            .try_fold(false, |found, item| item.map(|exists| found || exists))?;
             fs::create_dir_all(&prefs)?;
-            // 提前保留首次资格。界面未载入就退出时，新建的实例注册表不会被误认成旧工作区。
-            File::create(if legacy { &shown } else { &pending })?;
-            !legacy
+            File::create(&pending)?;
+            true
         };
         Ok(Self {
             pending,
@@ -62,7 +49,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_survives_an_unshown_page_and_recognizes_legacy_workspaces() {
+    fn entry_survives_an_unshown_page() {
         let dir = std::env::temp_dir().join(format!("windroid-first-page-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         for (name, enabled) in [("direct", false), ("welcome", true)] {
@@ -76,9 +63,6 @@ mod tests {
             fs::remove_dir(home.join("instances")).unwrap();
             assert!(!FirstPage::open(&home, true).unwrap().welcome());
         }
-        let legacy = dir.join("legacy");
-        fs::create_dir_all(legacy.join("instances")).unwrap();
-        assert!(!FirstPage::open(&legacy, true).unwrap().welcome());
         fs::remove_dir_all(dir).unwrap();
     }
 }

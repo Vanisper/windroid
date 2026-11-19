@@ -319,13 +319,35 @@ fn lock_file(path: &Path) -> io::Result<File> {
 fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
     let mut records = Vec::new();
     let mut used = BTreeSet::new();
+pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.as_encoded_bytes().starts_with(b".") {
+            let kind = entry.file_type()?;
+            let name = name.to_str().ok_or_else(|| invalid("注册表文件名无效"))?;
+            let known = match name {
+                ".registry.lock" | ".selected" => kind.is_file(),
+                _ if name.starts_with(".new-") || name.starts_with(".deleted-") => kind.is_dir(),
+                _ if name.starts_with(".selection-") => kind.is_file(),
+                _ => false,
+            };
+            if !known {
+                return Err(invalid(format!("注册表内存在未知文件或类型：{name}")));
+            }
+        } else if !entry.file_type()?.is_dir() || !entry.path().join(MANIFEST).try_exists()? {
+            return Err(invalid(format!(
+                "实例目录缺少有效记录：{}",
+                entry.path().display()
+            )));
+        }
+    }
+    records_in(root).map(|_| ())
+}
+
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() || entry.file_name().as_encoded_bytes().starts_with(b".") {
-            continue;
-        }
-        // 早期版本的空目录没有发行记录，保留用户数据，同时把它排除在可操作列表外。
-        if !entry.path().join(MANIFEST).try_exists()? {
             continue;
         }
         let id = InstanceId::new(
@@ -352,7 +374,7 @@ fn read_record(root: &Path, id: &InstanceId) -> io::Result<InstanceRecord> {
     }
     let manifest = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join(MANIFEST))?;
     if !manifest.metadata()?.is_file() || manifest.metadata()?.len() > 8192 {
         return Err(invalid("实例记录类型或长度无效"));

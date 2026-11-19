@@ -137,6 +137,7 @@ impl Library {
             None
         } else {
             let enabled =
+            runtime::workspace::open(&layout.root).map_err(|e| e.to_string())?;
                 std::env::var("WINDROID_SHOW_GUIDE_ON_FIRST_LAUNCH").as_deref() == Ok("1");
             Some(first_page::FirstPage::open(&layout.root, enabled).map_err(|e| e.to_string())?)
         };

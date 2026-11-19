@@ -436,4 +436,20 @@ fn begin_picker(panel: &NSOpenPanel, chosen: impl FnOnce(Option<PathBuf>) + 'sta
         }
     });
     panel.beginWithCompletionHandler(&reply);
+
+/// 工作区拒绝与预放资源确认先于应用库及文件日志。提示只使用 AppKit。
+pub fn workspace_prompt(mtm: MainThreadMarker, title: &str, detail: &str, confirm: bool) -> bool {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(detail));
+    alert.addButtonWithTitle(&NSString::from_str(if confirm {
+        "在此新建工作区"
+    } else {
+        "退出"
+    }));
+    if confirm {
+        alert.addButtonWithTitle(&NSString::from_str("取消"));
+    }
+    alert.runModal() == NSAlertFirstButtonReturn
+}
 }

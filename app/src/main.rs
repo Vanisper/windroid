@@ -9,11 +9,15 @@ mod streaming;
 mod windows;
 
 fn main() -> Result<(), String> {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .try_init();
     let mtm = MainThreadMarker::new().expect("必须在主线程启动");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    let layout = runtime::Layout::default_root();
+    if !open_workspace(mtm, &layout.root) {
+        return Ok(());
+    }
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
     let app_on_close = app.clone();
     let library_window = Window::new(
         mtm,
@@ -25,7 +29,6 @@ fn main() -> Result<(), String> {
         }),
     );
 
-    let layout = runtime::Layout::default_root();
     let home = layout.root.clone();
     let (commands, rx) = mpsc::channel();
     let (events, windows_rx) = mpsc::channel();
@@ -57,5 +60,39 @@ fn load_ui(window: &Window) -> Result<(), String> {
             "载入界面 {} 失败：{e}。开发构建请运行 nsh build app -o app/.nsh/out",
             path.display()
         )
+    })
+}
+
+fn open_workspace(mtm: MainThreadMarker, home: &std::path::Path) -> bool {
+    use runtime::workspace::{self, Workspace};
+    let result = workspace::inspect(home).and_then(|state| {
+        if let Workspace::Resources(names) = &state {
+            let detail = format!(
+                "{}\n\n已核验下列预放资源：\n{}\n\n确认后将在此目录建立新的实例库。",
+                home.display(),
+                names.join("\n")
+            );
+            if !host::surface::workspace_prompt(mtm, "使用此目录新建工作区？", &detail, true)
+            {
+                return Ok(false);
+            }
+        }
+        if state != Workspace::Current {
+            workspace::initialize(home, &state)?;
+        }
+        Ok(true)
+    });
+    result.unwrap_or_else(|e| {
+        host::surface::workspace_prompt(
+            mtm,
+            "无法打开此工作区",
+            &format!(
+                "{}\n\n{}\n\n请将 WINDROID_HOME 设为新的空目录并重新启动 Windroid。",
+                home.display(),
+                e
+            ),
+            false,
+        );
+        false
     })
 }
