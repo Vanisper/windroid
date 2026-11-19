@@ -890,7 +890,8 @@ fn candidate_download_preserves_the_bound_root_until_the_next_preview_is_confirm
         let missing = first.swap(false, std::sync::atomic::Ordering::Relaxed);
         let mut plan = storage_plan(call.data(), if missing { 1 } else { 2 });
         plan["versions"] = json!([{"id":"r34", "name":"Android 14 · r14", "source":"/original/r14", "target":"/target/r14",
-            "status":if missing {"missing"} else {"reuse"}, "bytes":1048576, "downloadable":missing, "cleanup":false, "detail":""}]);
+            "status":if missing {"missing"} else {"reuse"}, "bytes":1048576, "downloadable":missing,
+            "downloadRequiredBytes":3145728,"downloadAvailableBytes":1073741824,"downloadWritable":true, "cleanup":false, "detail":""}]);
         plan["blockers"] = if missing {json!(["目标缺少 r14"])} else {json!([])};
         call.resolve(plan);
     });
@@ -899,19 +900,22 @@ fn candidate_download_preserves_the_bound_root_until_the_next_preview_is_confirm
     press(&mut ui.app, "settings-storage");
     press(&mut ui.app, "choose-image-directory");
     wait(&mut ui.app, "id:download-candidate-r34");
+    wait(&mut ui.app, "text:/下载及安装需额外空间 · 3.0 MiB/");
     assert!(ui.commands.lock().unwrap().is_empty());
     press(&mut ui.app, "download-candidate-r34");
     wait(&mut ui.app, "text:512 KiB / 1.0 MiB");
     ui.update(|v| {
         let p = &mut v["preparation"];
         p["phase"] = json!("ready");
-        p["candidateTarget"] = Value::Null;
-        p["currentComponent"] = Value::Null;
+        p["candidateDownloadedBytes"] = json!(1048576);
     });
+    wait(&mut ui.app, "text:目标镜像已准备，请重新预览。");
+    gone(&mut ui.app, "id:download-candidate-r34");
     gone(&mut ui.app, "id:pause-candidate");
     assert!(!ui.app.screen().enabled("id:storage-apply").unwrap());
     press(&mut ui.app, "storage-recheck");
     wait(&mut ui.app, "text:可原地复用");
+    gone(&mut ui.app, "id:download-candidate-r34");
     assert!(ui.app.screen().enabled("id:storage-apply").unwrap());
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
     assert_eq!(

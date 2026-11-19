@@ -10,6 +10,7 @@ interface Version {
   id: string; name: string; source: string; target: string; bytes: number;
   status: "reuse" | "copy" | "missing" | "conflict" | "unused";
   detail: string; cleanup: boolean; downloadable: boolean;
+  downloadRequiredBytes: number | null; downloadAvailableBytes: number | null; downloadWritable: boolean;
 }
 interface Plan extends Roots {
   previewId: number; mode: Mode; cleanup: boolean; blockers: string[]; versions: Version[];
@@ -30,6 +31,17 @@ function VersionRow(props: { item: Version; previewId: number; locked: boolean }
   const item = computed(() => images().find(i => i.id === props.item.id));
   const job = computed(() => preparation()?.candidateTarget === props.item.target && preparation()?.currentComponent === props.item.id);
   const inProgress = computed(() => job() && activeTransfer());
+  const accepted = signal<number | null>(null);
+  const completed = computed(() => job() && preparation()?.phase === "ready" && accepted() === props.previewId);
+  const cannotDownload = computed(() => !props.item.downloadWritable ? "目标目录不可写" :
+    props.item.downloadRequiredBytes !== null && props.item.downloadAvailableBytes !== null &&
+    props.item.downloadRequiredBytes > props.item.downloadAvailableBytes ? "目标卷空间不足" : "");
+  async function start() {
+    const id = props.previewId;
+    accepted.set(id);
+    if (!await send({ kind: "prepareCandidateImage", previewId: id,
+      resourceId: props.item.id, acceptedLicenses: true }, "准备目标版本")) accepted.set(null);
+  }
   return <View testID={"storage-version-" + props.item.id}
     style={{ borderTopWidth: 1, borderColor: colors().line, paddingTop: 10, gap: 5 }}>
     <View style={row}><Heading text={props.item.name} /><Detail text={status[props.item.status]} /></View>
@@ -37,8 +49,11 @@ function VersionRow(props: { item: Version; previewId: number; locked: boolean }
     {props.item.status === "copy" ? <Detail text={"复制大小 · " + size(props.item.bytes)} /> : null}
     {props.item.detail ? <Location path={props.item.detail} /> : null}
     {props.item.cleanup ? <Detail text="切换成功后，复核并清理此源版本。" /> : null}
-    {(props.item.downloadable || job()) && item() ? <View style={{ gap: 6 }}>
+    {(props.item.downloadable || inProgress()) && item() ? <View style={{ gap: 6 }}>
       <Detail text={"官方镜像 ZIP · " + size(item()!.sizeBytes)} />
+      {props.item.downloadRequiredBytes != null ? <Detail text={"下载及安装需额外空间 · " + size(props.item.downloadRequiredBytes) +
+        (props.item.downloadAvailableBytes === null ? "    可用空间未知" : "    可用 · " + size(props.item.downloadAvailableBytes))} /> : null}
+      {props.item.downloadable && cannotDownload() ? <Detail text={cannotDownload()} /> : null}
       {job() ? <View style={{ gap: 5 }}>
         {preparation()?.phase === "failed" ? <Detail text={preparation()?.error ?? "下载失败"} /> : null}
         <Progress id={"candidate-progress-" + props.item.id} downloaded={preparation()?.candidateDownloadedBytes ?? 0} total={item()!.sizeBytes} />
@@ -48,9 +63,8 @@ function VersionRow(props: { item: Version; previewId: number; locked: boolean }
         {inProgress() ? preparation()?.phase === "downloading" ?
           <Button id="pause-candidate" label="暂停下载" disabled={props.locked}
             press={() => send({ kind: "pausePreparation" }, "暂停目标镜像下载")} /> : <Detail text="正在校验并安装目标镜像…" /> :
-          <Button id={"download-candidate-" + props.item.id} label={job() && preparation()?.phase === "paused" ? "同意并继续下载到目标" : "同意并下载到目标"}
-            disabled={props.locked || activeTransfer()} press={() => send({ kind: "prepareCandidateImage", previewId: props.previewId,
-              resourceId: props.item.id, acceptedLicenses: true }, "准备目标版本")} />}
+          completed() ? <Detail text="目标镜像已准备，请重新预览。" /> : <Button id={"download-candidate-" + props.item.id} label={job() && preparation()?.phase === "paused" ? "同意并继续下载到目标" : "同意并下载到目标"}
+            disabled={props.locked || activeTransfer() || !!cannotDownload()} press={start} />}
       </View>
       <Detail text="下载完成后重新预览，再确认目录切换。" />
     </View> : null}
@@ -182,6 +196,11 @@ export function Storage() {
       </View> : null}
     </View>}</If>
     {!plan() ? <View style={card()}>
+      {preparation()?.candidateTarget && activeTransfer() ? <View style={{ gap: 5 }}>
+        <Heading text="正在准备目标镜像" /><Location path={preparation()!.candidateTarget!} />
+        {preparation()?.phase === "downloading" ? <Button id="pause-storage-download" label="暂停下载" disabled={locked()}
+          press={() => send({ kind: "pausePreparation" }, "暂停目标镜像下载")} /> : null}
+      </View> : null}
       <Heading text="工作区" /><Location path={current()?.home ?? "未知"} />
       <Detail text="实例的私有数据、设置和日志保存在这里。" />
       <Heading text="运行组件目录" /><Location path={current()?.runtimeRoot ?? "未知"} />
