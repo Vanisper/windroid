@@ -64,6 +64,8 @@ fn isolated(name: &str, apis: &[u32]) -> bool {
         .env("HOME", root.join("user"))
         .env("ANDROID_USER_HOME", root.join("android-user"))
         .env("TMPDIR", root.join("tmp"))
+        // 每个测试服务只接收 Emulator 的显式登记，避免它探测其他工作区的模拟器端口。
+        .env("ADB_LOCAL_TRANSPORT_MAX_PORT", "5553")
         .env("ANDROID_ADB_SERVER_PORT", &port)
         .env("ADB_SERVER_SOCKET", format!("tcp:localhost:{port}"))
         .env(
