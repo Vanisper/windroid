@@ -11,11 +11,19 @@ fn cold_open_exposes_sources_sizes_terms_without_writing() {
     provision.recheck().unwrap();
     let snap = provision.snapshot();
     assert!(!snap.borrowed);
-    assert_eq!(snap.components.len(), 5);
+    assert_eq!(snap.components.len(), 4);
     assert_eq!(snap.downloaded_bytes, 0);
-    assert_eq!(snap.total_bytes, 2_058_422_264);
-    for c in snap.components {
-        assert!(!c.ready && c.issue.is_some());
+    assert!(!snap.components_ready);
+    assert_eq!(
+        snap.images
+            .iter()
+            .map(|c| c.image.as_ref().unwrap().api)
+            .collect::<Vec<_>>(),
+        [34, 35, 33]
+    );
+    assert_eq!(snap.total_bytes, 509_516_883);
+    for c in snap.components.into_iter().chain(snap.images) {
+        assert!(!c.ready && c.issue.is_none());
         assert!(c.source.starts_with("https://"));
         assert!(c.size_bytes > 0 && c.unpacked_bytes >= c.size_bytes);
         assert!(c.license_url.starts_with("https://") && c.license_text.len() > 10_000);

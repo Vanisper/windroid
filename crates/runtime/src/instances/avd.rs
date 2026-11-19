@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{InstanceRecord, invalid, private_dir};
-use contract::Spec;
+use contract::{Image, Spec};
 
 pub(super) fn validate(spec: &Spec) -> io::Result<()> {
     dimensions(&spec.template)?;
@@ -25,7 +25,7 @@ pub(super) fn validate(spec: &Spec) -> io::Result<()> {
     {
         return Err(invalid("Android 镜像标识无效"));
     }
-    abi(spec)?;
+    abi(&spec.image)?;
     Ok(())
 }
 
@@ -41,20 +41,18 @@ fn dimensions(template: &str) -> io::Result<(u32, u32, u32)> {
 }
 
 // SDK 镜像目录用 ABI，模拟器的 hw.cpu.arch 使用内核架构名。
-fn abi(spec: &Spec) -> io::Result<(&'static str, &'static str)> {
-    match spec.image.abi.as_str() {
+fn abi(image: &Image) -> io::Result<(&'static str, &'static str)> {
+    match image.abi.as_str() {
         "arm64" | "arm64-v8a" => Ok(("arm64-v8a", "arm64")),
         "x86_64" => Ok(("x86_64", "x86_64")),
-        _ => Err(invalid(format!("不支持的 Android ABI {}", spec.image.abi))),
+        _ => Err(invalid(format!("不支持的 Android ABI {}", image.abi))),
     }
 }
 
-pub(crate) fn image_relative(spec: &Spec) -> io::Result<PathBuf> {
-    validate(spec)?;
-    Ok(Path::new("system-images")
-        .join(format!("android-{}", spec.image.api))
-        .join(&spec.image.tag)
-        .join(abi(spec)?.0))
+pub(crate) fn image_subdir(image: &Image) -> io::Result<PathBuf> {
+    Ok(PathBuf::from(format!("android-{}", image.api))
+        .join(&image.tag)
+        .join(abi(image)?.0))
 }
 
 pub(crate) fn data_dir(dir: &Path, record: &InstanceRecord) -> PathBuf {
@@ -64,8 +62,8 @@ pub(crate) fn data_dir(dir: &Path, record: &InstanceRecord) -> PathBuf {
 pub(super) fn generate(stage: &Path, final_dir: &Path, record: &InstanceRecord) -> io::Result<()> {
     let spec = &record.spec;
     let (width, height, density) = dimensions(&spec.template)?;
-    let (abi, arch) = abi(spec)?;
-    let image = image_relative(spec)?;
+    let (abi, arch) = abi(&spec.image)?;
+    let image = Path::new("system-images").join(image_subdir(&spec.image)?);
     let name = record.avd_name();
     let avd = data_dir(stage, record);
     private_dir(&stage.join("avd"))?;

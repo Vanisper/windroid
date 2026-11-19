@@ -16,7 +16,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::{Layout, serial_for};
-pub(crate) use avd::{data_dir, image_relative};
+pub(crate) use avd::{data_dir, image_subdir};
 use contract::{InstanceId, Spec};
 pub use hardware::InstanceConfig;
 use serde::{Deserialize, Serialize};

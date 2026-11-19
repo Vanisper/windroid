@@ -2,7 +2,7 @@
 use std::path::Path;
 use std::{fs, io};
 
-use super::{InstanceRecord, InstanceStore, data_dir, image_relative, invalid};
+use super::{InstanceRecord, InstanceStore, data_dir, image_subdir, invalid};
 use crate::provision::RuntimePaths;
 use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
@@ -62,13 +62,12 @@ impl OwnedEmulator {
                 format!("Android SDK {}：{e}", paths.sdk.display()),
             )
         })?;
-        let image = sdk.join(image_relative(&record.spec)?);
+        let image = paths.images.join(image_subdir(&record.spec.image)?);
         for part in [
             "system.img",
             "vendor.img",
             "ramdisk.img",
             "kernel-ranchu",
-            "userdata.img",
         ] {
             if !image.join(part).is_file() {
                 return Err(io::Error::new(

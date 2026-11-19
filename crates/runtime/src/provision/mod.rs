@@ -6,6 +6,7 @@ mod archive;
 mod catalog;
 mod download;
 mod integrity;
+mod metadata;
 mod paths;
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,9 @@ pub struct Component {
     pub id: &'static str,
     pub name: &'static str,
     pub version: &'static str,
+    pub location: PathBuf,
+    pub image: Option<contract::Image>,
+    pub min_emulator: Option<&'static str>,
     pub source: &'static str,
     pub license: &'static str,
     pub license_url: &'static str,
@@ -48,11 +52,19 @@ pub struct Preparation {
     /// missing / downloading / verifying / installing / paused / failed / ready。
     pub phase: &'static str,
     pub components: Vec<Component>,
+    pub components_ready: bool,
+    pub images: Vec<Component>,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub current_component: Option<&'static str>,
     pub error: Option<String>,
     pub borrowed: bool,
+}
+
+impl Preparation {
+    fn rows_mut(&mut self) -> impl Iterator<Item = &mut Component> {
+        self.components.iter_mut().chain(&mut self.images)
+    }
 }
 
 struct State {
@@ -141,42 +153,74 @@ impl Provisioner {
 
     /// 仅在用户已同意所列许可并主动点击时调用。重复点击不会启动两个 worker。
     pub fn start(&self) -> Result<(), String> {
+        let packages = self
+            .owner
+            .worker
+            .catalog
+            .iter()
+            .copied()
+            .filter(|p| p.image_spec.is_none())
+            .collect();
+        self.launch(packages)
+    }
+
+    pub fn start_image(&self, id: &str) -> Result<(), String> {
+        self.launch(vec![self.image_package(id)?])
+    }
+
+    fn image_package(&self, id: &str) -> Result<Artifact, String> {
+        self.owner
+            .worker
+            .catalog
+            .iter()
+            .copied()
+            .find(|p| p.id == id && p.image_spec.is_some())
+            .ok_or_else(|| "镜像不在当前官方清单中".into())
+    }
+
+    fn launch(&self, packages: Vec<Artifact>) -> Result<(), String> {
         let shared = &self.owner.worker;
         let mut state = shared.state.lock().unwrap();
         if state.active {
             return if shared.cancel.load(Ordering::Acquire) {
                 Err("正在暂停准备，请稍后继续".into())
-            } else {
+            } else if packages
+                .iter()
+                .any(|p| Some(p.id) == state.snapshot.current_component)
+            {
                 Ok(())
+            } else {
+                Err("另一项资源正在准备，请稍后再试".into())
             };
         }
         if !shared.supported {
             return Err(UNSUPPORTED.into());
         }
-        if shared
-            .catalog
+        state.snapshot = shared.scan();
+        let rows = state
+            .snapshot
+            .components
             .iter()
-            .any(|pkg| shared.paths.read_only(pkg.kind))
-        {
-            state.snapshot = shared.scan();
-            if let Some(component) = state
-                .snapshot
-                .components
-                .iter()
-                .find(|c| c.borrowed && !c.ready)
-            {
+            .chain(&state.snapshot.images)
+            .filter(|row| packages.iter().any(|p| p.id == row.id));
+        let mut first_missing = None;
+        for row in rows.filter(|r| !r.ready) {
+            first_missing.get_or_insert(row.id);
+            if row.borrowed {
                 let msg = format!(
                     "开发者指定的组件为只读，请修正后重新检查。{}",
-                    component.issue.as_deref().unwrap_or(component.name)
+                    row.issue.as_deref().unwrap_or(row.name)
                 );
+                state.snapshot.current_component = Some(row.id);
                 state.snapshot.phase = "failed";
                 state.snapshot.error = Some(msg.clone());
                 return Err(msg);
             }
         }
-        if state.snapshot.phase == "ready" {
+        if first_missing.is_none() {
             return Ok(());
         }
+        state.snapshot.current_component = first_missing;
         shared.cancel.store(false, Ordering::Release);
         state.snapshot.error = None;
         state.snapshot.phase = "downloading";
@@ -184,7 +228,7 @@ impl Provisioner {
         let worker = Arc::clone(shared);
         if let Err(e) = std::thread::Builder::new()
             .name("windroid-provision".into())
-            .spawn(move || worker.run())
+            .spawn(move || worker.run(&packages))
         {
             state.active = false;
             state.snapshot.phase = "failed";
@@ -226,28 +270,32 @@ fn scan(
     supported: bool,
 ) -> Preparation {
     let can_resume = !paths.borrowed && directory(home, stage, false).is_ok();
-    let mut resumable = false;
-    let components: Vec<_> = catalog
+    let (images, components): (Vec<_>, Vec<_>) = catalog
         .iter()
         .map(|&pkg| {
-            let issue = installed(home, paths, pkg).err().map(|e| match e.kind() {
-                ErrorKind::NotFound => format!(
-                    "缺少{}，预期位置 {}",
-                    pkg.name,
-                    paths.destination(pkg.kind).display()
-                ),
-                _ => e.to_string(),
+            let location = paths.destination(pkg);
+            let borrowed = paths.read_only(pkg.kind);
+            let checked = installed(home, paths, pkg);
+            let ready = checked.is_ok();
+            let issue = checked.err().and_then(|e| {
+                if e.kind() != ErrorKind::NotFound {
+                    return Some(e.to_string());
+                }
+                if borrowed {
+                    return Some(format!("开发者指定的位置缺少{}或其必要文件", pkg.name));
+                }
+                if fs::symlink_metadata(&location).is_err_and(|e| e.kind() == ErrorKind::NotFound) {
+                    return None;
+                }
+                Some(format!("{} 安装不完整：{e}", pkg.name))
             });
-            let ready = issue.is_none();
             let downloaded_bytes = if ready {
                 pkg.bytes
-            } else if can_resume && !paths.read_only(pkg.kind) {
-                let size = download::part_len(&partial(stage, pkg))
+            } else if can_resume && !borrowed {
+                download::part_len(&partial(stage, pkg))
                     .ok()
                     .filter(|&s| s <= pkg.bytes)
-                    .unwrap_or(0);
-                resumable |= size > 0;
-                size
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -260,6 +308,9 @@ fn scan(
                 } else {
                     pkg.version
                 },
+                location,
+                image: pkg.image(),
+                min_emulator: pkg.image_spec.map(|spec| spec.min_emulator),
                 source: pkg.url,
                 license,
                 license_url,
@@ -268,16 +319,20 @@ fn scan(
                 unpacked_bytes: pkg.unpacked,
                 downloaded_bytes,
                 ready,
-                borrowed: paths.read_only(pkg.kind),
+                borrowed,
                 issue,
             }
         })
-        .collect();
+        .partition(|row| row.image.is_some());
+    let components_ready = supported && components.iter().all(|c| c.ready);
     let phase = if !supported {
         "failed"
-    } else if components.iter().all(|c| c.ready) {
+    } else if components_ready {
         "ready"
-    } else if resumable {
+    } else if components
+        .iter()
+        .any(|c| !c.ready && c.downloaded_bytes > 0)
+    {
         "paused"
     } else {
         "missing"
@@ -287,6 +342,8 @@ fn scan(
         downloaded_bytes: components.iter().map(|c| c.downloaded_bytes).sum(),
         total_bytes: components.iter().map(|c| c.size_bytes).sum(),
         components,
+        images,
+        components_ready,
         current_component: None,
         error: (!supported).then(|| UNSUPPORTED.into()),
         borrowed: paths.borrowed,
@@ -322,10 +379,14 @@ impl Shared {
     fn progress(&self, pkg: Artifact, bytes: u64) {
         let mut state = self.state.lock().unwrap();
         let snapshot = &mut state.snapshot;
-        if let Some(c) = snapshot.components.iter_mut().find(|c| c.id == pkg.id) {
-            snapshot.downloaded_bytes = snapshot.downloaded_bytes - c.downloaded_bytes + bytes;
+        if let Some(c) = snapshot.rows_mut().find(|c| c.id == pkg.id) {
             c.downloaded_bytes = bytes;
         }
+        snapshot.downloaded_bytes = snapshot
+            .components
+            .iter()
+            .map(|row| row.downloaded_bytes)
+            .sum();
     }
 
     fn phase(&self, pkg: Artifact, phase: &'static str) {
@@ -334,22 +395,25 @@ impl Shared {
         state.snapshot.current_component = Some(pkg.id);
     }
 
-    fn run(&self) {
-        let result = self.prepare();
+    fn run(&self, packages: &[Artifact]) {
+        let result = self.prepare(packages);
         let mut state = self.state.lock().unwrap();
         let current = state.snapshot.current_component;
         let mut snap = self.scan();
         if let Err(e) = result {
             snap.current_component = current;
             if e.kind() == ErrorKind::Interrupted && self.cancel.load(Ordering::Acquire) {
-                if snap.phase != "ready" {
-                    snap.phase = "paused";
-                }
+                snap.phase = "paused";
             } else {
                 snap.phase = "failed";
                 snap.error = Some(e.to_string());
             }
-        } else if snap.phase != "ready" {
+        } else if snap
+            .components
+            .iter()
+            .chain(&snap.images)
+            .any(|c| !c.ready && packages.iter().any(|p| p.id == c.id))
+        {
             snap.phase = "failed";
             snap.error = Some("安装完成后的自检未通过，请查看组件状态".into());
         }
@@ -357,7 +421,7 @@ impl Shared {
         state.snapshot = snap;
     }
 
-    fn prepare(&self) -> io::Result<()> {
+    fn prepare(&self, packages: &[Artifact]) -> io::Result<()> {
         self.check_pause()?;
         directory(&self.home, &self.stage, true)?;
         let lock_path = self.stage.join("prepare.lock");
@@ -371,7 +435,7 @@ impl Shared {
         lock.try_lock().map_err(|e| {
             io::Error::other(format!("无法独占准备目录（可能有其他进程正在准备）：{e}"))
         })?;
-        for &pkg in self.catalog {
+        for &pkg in packages {
             self.check_pause()?;
             if let Err(e) = installed(&self.home, &self.paths, pkg) {
                 if self.paths.read_only(pkg.kind) {
@@ -393,7 +457,7 @@ impl Shared {
                     &self.home,
                     &self.stage,
                     &part,
-                    &self.paths.destination(pkg.kind),
+                    &self.paths.destination(pkg),
                     pkg,
                     || self.check_pause(),
                 ) {
@@ -414,8 +478,7 @@ impl Shared {
                 .lock()
                 .unwrap()
                 .snapshot
-                .components
-                .iter_mut()
+                .rows_mut()
                 .find(|c| c.id == pkg.id)
             {
                 c.ready = true;

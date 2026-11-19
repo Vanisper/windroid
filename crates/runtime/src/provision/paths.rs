@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use windroid_locations::StorageLocations;
 
-use super::catalog::{Artifact, BUILD_TOOLS, EMULATOR_VERSION, IMAGE_DIR, Kind};
+use super::catalog::{Artifact, BUILD_TOOLS, IMAGE_DIR, Kind};
 use super::integrity::{check_digest, invalid};
 
 /// 各设备域使用同一组路径。私有模式完全忽略系统 SDK、PATH 和 Homebrew。
@@ -81,13 +81,18 @@ impl RuntimePaths {
         let config = StorageLocations::load(home);
         let issue = config.as_ref().err().map(ToString::to_string);
         let config = config.unwrap_or_else(|_| StorageLocations::defaults(home));
+        let mut paths = Self::for_locations(&config);
+        paths.config_error = issue;
+        paths
+    }
+
+    fn for_locations(config: &StorageLocations) -> Self {
         let root = &config.runtime_root;
         let mut paths = Self::from_sdk(root.join("sdk"), root.join("scrcpy-server.jar"), false);
         paths.images = config.images();
         paths.image = paths
             .images
             .join(Path::new(IMAGE_DIR).strip_prefix("system-images").unwrap());
-        paths.config_error = issue;
         paths
     }
 
@@ -141,13 +146,17 @@ impl RuntimePaths {
         }
     }
 
-    pub(super) fn destination(&self, kind: Kind) -> PathBuf {
-        match kind {
+    pub(super) fn destination(&self, pkg: Artifact) -> PathBuf {
+        match pkg.kind {
             Kind::Emulator => self.sdk.join("emulator"),
             Kind::Adb if self.adb_override => self.adb.clone(),
             Kind::Adb => self.sdk.join("platform-tools"),
             Kind::Aapt => self.sdk.join(BUILD_TOOLS),
-            Kind::Image => self.image.clone(),
+            Kind::Image => {
+                let image = pkg.image().expect("catalog image identity");
+                self.images
+                    .join(crate::instances::image_subdir(&image).expect("catalog ABI"))
+            }
             Kind::Server => self.server_jar.clone(),
         }
     }
@@ -221,7 +230,7 @@ fn small_text(path: &Path) -> io::Result<String> {
 
 pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io::Result<()> {
     paths.check_configuration(home)?;
-    let dest = paths.destination(pkg.kind);
+    let dest = paths.destination(pkg);
     if paths.read_only(pkg.kind) {
         // 只读检查显式选中的链接目标。单独指定 adb 时可以使用开发者自己的可执行文件。
         let selected = dest.canonicalize()?;
@@ -249,17 +258,6 @@ pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io:
     validate_payload(&dest, pkg)
 }
 
-fn revision(value: &str) -> Option<[u32; 3]> {
-    let mut parts = value.split('.');
-    let mut result = [0; 3];
-    for field in &mut result {
-        if let Some(part) = parts.next() {
-            *field = part.parse().ok()?;
-        }
-    }
-    parts.next().is_none().then_some(result)
-}
-
 /// 受信任包在发布前以及后续每次重扫都要满足同一份布局/版本契约。
 /// 启动自检只读取小元数据与 734 KB 的协议绑定 JAR，不扫描多 GB 的镜像内容。
 pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
@@ -267,39 +265,7 @@ pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
         return check_digest(dest, pkg, || Ok(()));
     }
     let props = small_text(&dest.join("source.properties"))?;
-    let property = |key: &str| {
-        props
-            .lines()
-            .filter_map(|s| s.trim().split_once('='))
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.trim())
-    };
-    if property("Pkg.Revision") != Some(pkg.version) {
-        return Err(invalid(format!(
-            "{} 需要版本 {}，实际为 {}",
-            pkg.name,
-            pkg.version,
-            property("Pkg.Revision").unwrap_or("未知")
-        )));
-    }
-    if pkg.kind == Kind::Image
-        && (property("AndroidVersion.ApiLevel") != Some("34")
-            || property("SystemImage.TagId") != Some("google_apis_playstore")
-            || property("SystemImage.Abi") != Some("arm64-v8a"))
-    {
-        return Err(invalid("系统镜像的 API、标签或 ABI 不匹配"));
-    }
-    if pkg.kind == Kind::Image {
-        // 当前镜像只声明一项最低依赖，例如 emulator#34.2.16。比较数字而非词典序。
-        let required = property("Pkg.Dependencies")
-            .and_then(|v| v.strip_prefix("emulator#"))
-            .and_then(revision);
-        if !required
-            .is_some_and(|v| v <= revision(EMULATOR_VERSION).expect("pinned emulator revision"))
-        {
-            return Err(invalid("镜像声明的最低模拟器版本不兼容"));
-        }
-    }
+    super::metadata::verify(&props, pkg)?;
     let executable = pkg.kind != Kind::Image;
     for &(name, bytes) in pkg.essentials {
         let path = dest.join(name);

@@ -34,6 +34,7 @@ fn fixture(bytes: &[u8], url: String) -> Artifact {
         kind: Kind::Server,
         id: "server",
         name: "fixture",
+        image_spec: None,
         version: "1",
         url: Box::leak(url.into_boxed_str()),
         bytes: bytes.len() as u64,
@@ -358,7 +359,7 @@ fn image_selfcheck_rejects_a_newer_or_unknown_emulator_dependency() {
         ("unknown", false),
     ] {
         let properties = format!(
-            "Pkg.Revision=14\nAndroidVersion.ApiLevel=34\nSystemImage.TagId=google_apis_playstore\nSystemImage.Abi=arm64-v8a\nPkg.Dependencies={dep}\n"
+            "Pkg.Revision=14\nAndroidVersion.ApiLevel=34\nSystemImage.TagId=google_apis_playstore\nSystemImage.Abi=arm64-v8a\nAddon.VendorId=google\nPkg.Dependencies={dep}\n"
         );
         fs::write(t.0.join("source.properties"), properties).unwrap();
         assert_eq!(paths::validate_payload(&t.0, image).is_ok(), good);
@@ -395,7 +396,13 @@ fn staged_sdk_payload_is_checked_before_publish_and_on_each_scan() {
     fs::set_permissions(&p.paths().adb, fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_file(p.paths().sdk.join("platform-tools").join(paths::RECEIPT)).unwrap();
     p.recheck().unwrap();
-    assert!(!p.snapshot().components[0].ready);
+    assert!(
+        p.snapshot().components[0]
+            .issue
+            .as_ref()
+            .unwrap()
+            .contains("安装不完整")
+    );
 }
 
 #[test]
@@ -480,4 +487,25 @@ fn staging_links_and_borrowed_mode_cannot_write_external_files() {
     assert!(p.start().is_err());
     assert!(!home.exists());
     assert_eq!(fs::read(file).unwrap(), b"keep");
+}
+
+#[test]
+fn preparing_components_leaves_image_consent_and_partial_untouched() {
+    let temp = Temp::new();
+    let core = fixture(b"core", "https://example.invalid".into());
+    let image = *CATALOG.iter().find(|p| p.image_spec.is_some()).unwrap();
+    let p = Provisioner::configured(
+        temp.0.clone(),
+        RuntimePaths::managed(&temp.0),
+        Box::leak(Box::new([core, image])),
+        true,
+    );
+    stage(&temp.0, core, b"core");
+    let image_part = stage(&temp.0, image, b"paused");
+    p.start().unwrap();
+    let snap = settled(&p);
+    assert!(snap.components_ready && !snap.images[0].ready);
+    assert_eq!(snap.images[0].downloaded_bytes, 6);
+    assert_eq!(fs::read(image_part).unwrap(), b"paused");
+    assert!(p.start_image("unlisted").is_err());
 }
