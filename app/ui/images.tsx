@@ -1,7 +1,7 @@
 import { cleanup, computed, effect, host, signal, Text, View } from "nsh";
 import { Button, card, colors, Detail, Heading, row } from "./controls";
-import { activeTransfer, busy, describeImage, environmentReady, images, pickResource, preparation, send, startCreation, type Component } from "./model";
-import { LicenseLink, Location, Progress, size } from "./resources";
+import { activeTransfer, busy, describeImage, environmentReady, images, openStorage, pickResource, preparation, send, startCreation, type Component } from "./model";
+import { LicenseLink, Location, Progress, ResourceHealth, size, writeIssue } from "./resources";
 
 export function imageDescription(item: Component) {
   const image = item.image;
@@ -9,7 +9,7 @@ export function imageDescription(item: Component) {
 }
 
 function ImageRow(props: { item: Component; select?: (id: string) => void; download: (item: Component) => void }) {
-  const phase = computed(() => preparation()?.currentComponent === props.item.id ? preparation()?.phase : null);
+  const phase = computed(() => !preparation()?.candidateTarget && preparation()?.currentComponent === props.item.id ? preparation()?.phase : null);
   const active = computed(() => !!phase() && activeTransfer());
   const error = computed(() => phase() === "failed" ? preparation()?.error : null);
   const downloadLabel = computed(() => {
@@ -23,25 +23,23 @@ function ImageRow(props: { item: Component; select?: (id: string) => void; downl
     </View>
     <Detail text={imageDescription(props.item)} />
     {props.item.minEmulator ? <Detail text={"需要 Android Emulator " + props.item.minEmulator + " 或更高版本"} /> : null}
-    <Location path={props.item.location} />
-    {props.item.issue ? <Detail text={props.item.issue} /> : null}
+    <ResourceHealth item={props.item} />
     {active() || (!props.item.ready && props.item.downloadedBytes > 0) ? <View style={{ gap: 5 }}>
       <Detail text={phase() === "installing" ? "正在安装镜像" : phase() === "verifying" ? "正在校验镜像" :
         active() ? "正在准备镜像" : "已保留下载进度"} />
-      <Progress id={"image-progress-" + props.item.id} downloaded={props.item.downloadedBytes} total={props.item.sizeBytes} />
+      {phase() === "downloading" || (!active() && props.item.downloadedBytes > 0) ?
+        <Progress id={"image-progress-" + props.item.id} downloaded={props.item.downloadedBytes} total={props.item.sizeBytes} /> : null}
     </View> : null}
     {error() ? <Text role="alert" style={{ color: colors().bad }}>{error()}</Text> : null}
     <View style={row}>
-      <LicenseLink item={props.item} />
       {props.item.ready ? <Button id={"use-" + props.item.id} primary disabled={!environmentReady() || busy()}
         label={props.select ? "使用此镜像" : "用于新实例"} accessibilityLabel={"使用 " + props.item.name + " 创建实例"}
         press={() => (props.select ?? startCreation)(props.item.id)} /> :
-        props.item.borrowed ? <Detail text="请在指定的 SDK 中准备此镜像，然后重新检查。" /> :
         active() ? (phase() === "downloading" ? <Button id={"pause-" + props.item.id} label="暂停下载" disabled={busy()}
           press={() => send({ kind: "pausePreparation" }, "暂停镜像下载")} /> : null) :
-        <Button id={"download-" + props.item.id} label={downloadLabel()} primary disabled={activeTransfer() || busy()}
+        props.item.integrity === "missing" && !writeIssue(props.item) ? <Button id={"download-" + props.item.id} label={downloadLabel()} primary disabled={activeTransfer() || busy()}
           accessibilityLabel={downloadLabel() + " " + props.item.name}
-          press={() => props.download(props.item)} />}
+          press={() => props.download(props.item)} /> : null}
     </View>
   </View>;
 }
@@ -49,8 +47,8 @@ function ImageRow(props: { item: Component; select?: (id: string) => void; downl
 export function ImageList(props: { select?: (id: string) => void }) {
   const versions = computed(() => [...images()].sort((a, b) => (b.image?.api ?? 0) - (a.image?.api ?? 0) || (b.image?.revision ?? 0) - (a.image?.revision ?? 0)));
   const local = computed(() => versions().filter(c => c.ready));
-  const remote = computed(() => versions().filter(c => !c.ready && !c.borrowed));
-  const external = computed(() => versions().filter(c => !c.ready && c.borrowed));
+  const remote = computed(() => versions().filter(c => c.integrity === "missing" && !writeIssue(c)));
+  const unavailable = computed(() => versions().filter(c => !c.ready && (c.integrity !== "missing" || !!writeIssue(c))));
   const inspected = signal<{ path: string; id: string } | null>(null);
   const candidate = computed(() => images().find(i => i.id === inspected()?.id));
   const awaiting = signal<string | null>(null);
@@ -90,7 +88,7 @@ export function ImageList(props: { select?: (id: string) => void }) {
     if (!result || !candidate()) return;
     if (candidate()!.ready) {
       inspected.set(null); props.select?.(result.id);
-    } else {
+    } else if (candidate()!.integrity === "missing" && !writeIssue(candidate()!)) {
       if (props.select) awaiting.set(result.id);
       const ok = await send({ kind: "importImage", imageId: result.id, path: result.path, acceptedLicenses: true }, "导入系统镜像");
       if (visible) {
@@ -104,8 +102,11 @@ export function ImageList(props: { select?: (id: string) => void }) {
       <Heading text={props.select ? "选择系统镜像" : "系统镜像"} />
       <Button id="pick-image-zip" label="导入本地镜像…" disabled={!!status() || activeTransfer() || busy()} press={inspect} />
     </View>
-    <Detail text={preparation()?.borrowed ? "正在使用开发者指定的 SDK。此处可选用该 SDK 中已就绪的镜像。" :
-      "可下载或导入清单中的官方完整 ZIP。多个实例可使用同一镜像，各自保存应用和文件。"} />
+    <Detail text="可下载或导入清单中的官方完整 ZIP。多个实例可使用同一镜像，各自保存应用和文件。" />
+    {preparation()?.candidateTarget ? <View style={{ gap: 5 }}>
+      <Detail text="存储设置中另有一个目标镜像任务。" /><Location path={preparation()!.candidateTarget!} />
+      <Button id="images-view-storage-task" label="查看目标目录" press={openStorage} />
+    </View> : null}
     {status() ? <Detail id="image-checking" text={status()} /> : null}
     {error() ? <Text testID="import-error" role="alert" style={{ userSelect: "text", color: colors().bad }}>{error()}</Text> : null}
     <If when={candidate()}>{item => <View testID="image-import-preview" style={card()}>
@@ -114,10 +115,12 @@ export function ImageList(props: { select?: (id: string) => void }) {
       <Detail text={item().name + " · " + imageDescription(item())} />
       <Detail text={"存储位置 · " + item().location} />
       {item().minEmulator ? <Detail text={"需要 Android Emulator " + item().minEmulator + " 或更高版本"} /> : null}
-      {!item().ready && item().borrowed ? <Detail text="请在指定的 SDK 中安装此版本，然后重新检查。" /> : null}
+      {item().integrity === "damaged" ? <Detail text="本机的这个版本已损坏。可在下方版本条目确认重新安装。" /> : null}
+      {item().integrity === "conflict" ? <Detail text={item().issue ?? "请先处理目标目录的版本冲突。"} /> : null}
+      {!item().ready && writeIssue(item()) ? <Detail text={writeIssue(item())} /> : null}
       <View style={row}>
         <LicenseLink item={item()} id="import-license" />
-        <Button id="confirm-import" primary disabled={busy() || activeTransfer() || (!item().ready && item().borrowed)}
+        <Button id="confirm-import" primary disabled={busy() || activeTransfer() || (!item().ready && (item().integrity !== "missing" || !!writeIssue(item())))}
           label={item().ready ? props.select ? "使用此镜像" : "完成" : props.select ? "同意导入并选用" : "同意并导入"} press={confirm} />
         <Button id="cancel-import" label="取消" press={() => inspected.set(null)} />
       </View>
@@ -127,7 +130,7 @@ export function ImageList(props: { select?: (id: string) => void }) {
     <Each of={local()} key={item => item.id}>{item => <ImageRow item={item()} select={props.select} download={download} />}</Each>
     {remote().length ? <Heading text="可下载" /> : null}
     <Each of={remote()} key={item => item.id}>{item => <ImageRow item={item()} select={props.select} download={download} />}</Each>
-    {external().length ? <Heading text="需在指定的 SDK 中准备" /> : null}
-    <Each of={external()} key={item => item.id}>{item => <ImageRow item={item()} select={props.select} download={download} />}</Each>
+    {unavailable().length ? <Heading text="需要处理" /> : null}
+    <Each of={unavailable()} key={item => item.id}>{item => <ImageRow item={item()} select={props.select} download={download} />}</Each>
   </View>;
 }

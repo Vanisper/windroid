@@ -30,7 +30,8 @@ function NextAction() {
     else openEnvironment("components");
   };
   return <View style={{ gap: 12, alignItems: "flex-start" }}>
-    <Detail text={imageTransfer() ? "系统镜像正在准备，完成后可供实例使用。" : activeTransfer() ? "正在准备这台 Mac 共用的运行组件。" :
+    <Detail text={imageTransfer() && preparation()?.candidateTarget ? "正在为候选目录准备镜像，完成后可回到存储设置确认切换。" :
+      imageTransfer() ? "系统镜像正在准备，完成后可供实例使用。" : activeTransfer() ? "正在准备这台 Mac 共用的运行组件。" :
       environmentReady() ? "运行组件已就绪。选择系统镜像后即可创建实例。" : "先准备这台 Mac 共用的 Android 运行组件，再创建实例。"} />
     <View style={row}>
       <Button id="workspace-next" primary label={label()} press={next} />

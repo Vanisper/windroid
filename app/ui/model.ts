@@ -30,17 +30,19 @@ export interface Action {
 export interface AppItem { package: string; label: string; system: boolean; launchable: boolean; actions: Action[] }
 interface AppSection { id: "installed" | "system"; name: string; count: number; apps: AppItem[] }
 export interface RunningApp { instanceId: string; package: string; label: string; windowOpen: boolean }
+export type Integrity = "missing" | "quick" | "verified" | "damaged" | "conflict";
 export interface Component {
   id: string; name: string; version: string; source: string; sizeBytes: number; ready: boolean;
   license: string; licenseUrl: string; licenseText?: string;
-  location: string; downloadedBytes: number; borrowed: boolean; issue: string | null;
+  location: string; downloadedBytes: number; integrity: Integrity; issue: string | null;
+  writable: boolean; requiredBytes: number; availableBytes: number | null;
   image: InstanceConfig["image"] | null; minEmulator: string | null;
 }
 export interface Preparation {
   phase: "missing" | "downloading" | "verifying" | "installing" | "paused" | "failed" | "ready";
   candidateTarget: string | null; candidateDownloadedBytes: number | null;
   componentsReady: boolean; components: Component[]; images: Component[]; downloadedBytes: number; totalBytes: number;
-  currentComponent: string | null; error: string | null; borrowed: boolean;
+  currentComponent: string | null; error: string | null;
 }
 interface InstallError { code: string; detail: string }
 export interface Message { instanceId: string | null; message: string; failed: boolean; seq?: number; installError?: InstallError }
@@ -84,6 +86,8 @@ type Command =
   | { kind: "prepareCandidateImage"; previewId: number; resourceId: string; acceptedLicenses: true }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
   | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
+  | { kind: "repairResource"; resourceId: string; location: string; acceptedLicenses: true; confirmed: true }
+  | { kind: "verifyResource"; resourceId: string }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
   | { kind: "pausePreparation" | "recheckRuntime" }
   | { kind: DeviceCommand; instanceId: string }

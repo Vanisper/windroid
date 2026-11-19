@@ -383,7 +383,8 @@ impl Scripted {
 fn image(id: &str, api: u32, ready: bool) -> Value {
     json!({"id":id, "name":format!("Android API {api}"), "version":"14", "source":"https://example.org/image.zip",
         "license":"镜像许可", "licenseUrl":"https://example.org/terms", "licenseText":"镜像许可条款", "sizeBytes":1048576,
-        "ready":ready, "location":"/tmp/images", "borrowed":false, "downloadedBytes":0, "issue":null,
+        "ready":ready, "location":"/tmp/images", "integrity":if ready {"quick"} else {"missing"},
+        "writable":true,"requiredBytes":if ready {0} else {3145728},"availableBytes":1073741824, "downloadedBytes":0, "issue":null,
         "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a","revision":14},"minEmulator":"34.0.0"})
 }
 
@@ -391,7 +392,7 @@ fn ready_view() -> Value {
     json!({"id":"a","instances":[{"id":"a","name":"工作机","state":"ready"}],"selectedId":"a",
         "state":"ready","summary":"已就绪","capabilities":{"install":true,"launchApp":true,"deviceView":true,"stop":true,"refreshApps":true},
         "facts":{"services":{"activity":true,"package":true,"window":true},"adbVisible":true},"groups":[],"catalogStatus":{"kind":"ready"},"running":[],"desktop":null,"tasksLoaded":true,
-        "preparation":{"phase":"ready","componentsReady":true,"images":[image("r34",34,true)],"components":[],"currentComponent":null,"totalBytes":0,"downloadedBytes":0,"borrowed":false,"error":null}})
+        "preparation":{"phase":"ready","componentsReady":true,"images":[image("r34",34,true)],"components":[],"currentComponent":null,"totalBytes":0,"downloadedBytes":0,"candidateTarget":null,"candidateDownloadedBytes":null,"error":null}})
 }
 
 #[test]
@@ -400,8 +401,9 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
     view["instances"] = json!([]);
     view["selectedId"] = Value::Null;
     view["preparation"] = json!({"phase":"missing","components":[{"id":"image","name":"系统镜像","version":"34","source":"https://example.org/image.zip",
-        "license":"镜像许可","licenseUrl":"https://example.org/terms","licenseText":"镜像完整许可正文","sizeBytes":1048576,"ready":false}],
-        "currentComponent":null,"downloadedBytes":0,"totalBytes":1048576,"borrowed":false,"error":null});
+        "license":"镜像许可","licenseUrl":"https://example.org/terms","licenseText":"镜像完整许可正文","sizeBytes":1048576,"ready":false,
+        "location":"/tmp/runtime","integrity":"missing","writable":true,"requiredBytes":3145728,"availableBytes":1073741824}],
+        "currentComponent":null,"downloadedBytes":0,"totalBytes":1048576,"candidateTarget":null,"candidateDownloadedBytes":null,"error":null});
     let mut ui = Scripted::new(view, |cmd, view| {
         let p = &mut view["preparation"];
         match cmd["kind"].as_str().unwrap() {
@@ -471,6 +473,84 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
 }
 
 #[test]
+fn full_verification_then_repair_requires_consent_for_the_reviewed_version_and_location() {
+    let mut view = ready_view();
+    let mut tool = image("tool", 34, true);
+    tool["image"] = Value::Null;
+    tool["name"] = json!("Android SDK Build-Tools");
+    tool["version"] = json!("34.0.0");
+    tool["location"] = json!("/Volumes/Windroid/build-tools/34.0.0");
+    view["preparation"]["components"] = json!([tool]);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        let preparation = &mut view["preparation"];
+        match cmd["kind"].as_str().unwrap() {
+            "verifyResource" => {
+                assert_eq!(cmd["resourceId"], "tool");
+                preparation["componentsReady"] = json!(false);
+                preparation["phase"] = json!("failed");
+                let target = &mut preparation["components"][0];
+                target["integrity"] = json!("damaged");
+                target["issue"] = json!("aapt 文件内容 SHA-256 不符");
+                target["ready"] = json!(false);
+            }
+            "repairResource" => {
+                assert_eq!(
+                    cmd,
+                    &json!({"kind":"repairResource","resourceId":"tool",
+                    "location":"/Volumes/Windroid/build-tools/34.0.0","confirmed":true,"acceptedLicenses":true})
+                );
+                preparation["components"][0]["integrity"] = json!("verified");
+                preparation["components"][0]["ready"] = json!(true);
+                preparation["components"][0]["issue"] = Value::Null;
+                preparation["componentsReady"] = json!(true);
+                preparation["phase"] = json!("ready");
+            }
+            _ => panic!("意外的版本操作 {cmd}"),
+        }
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-environment");
+    wait(&mut ui.app, "text:快速自检通过");
+    press(&mut ui.app, "verify-tool");
+    wait(&mut ui.app, "text:/aapt 文件内容/");
+    gone(&mut ui.app, "id:prepare-runtime");
+    press(&mut ui.app, "repair-tool");
+    wait(&mut ui.app, "id:repair-review-tool >> text:/Volumes/");
+    press(&mut ui.app, "cancel-repair-tool");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    press(&mut ui.app, "repair-tool");
+    press(&mut ui.app, "confirm-repair-tool");
+    wait(&mut ui.app, "text:已通过完整核验");
+    assert_eq!(ui.commands.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn image_writes_report_space_permissions_and_unknown_files_without_offering_overwrite() {
+    let mut view = ready_view();
+    let mut full = image("full", 34, false);
+    full["availableBytes"] = json!(1024);
+    let mut readonly = image("ro", 35, false);
+    readonly["writable"] = json!(false);
+    let mut unknown = image("unknown", 36, false);
+    unknown["integrity"] = json!("conflict");
+    unknown["issue"] = json!("包含未知文件 extra.img");
+    view["preparation"]["images"] = json!([full, readonly, unknown]);
+    let mut ui = Scripted::new(view, |_, _| unreachable!());
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-environment");
+    press(&mut ui.app, "environment-images");
+    wait(&mut ui.app, "id:image-full >> text:目标卷空间不足");
+    wait(&mut ui.app, "id:image-ro >> text:目标目录不可写");
+    wait(&mut ui.app, "id:image-unknown >> text:/extra.img/");
+    for id in ["full", "ro", "unknown"] {
+        gone(&mut ui.app, &format!("id:download-{id}"));
+        gone(&mut ui.app, &format!("id:repair-{id}"));
+    }
+    assert!(ui.commands.lock().unwrap().is_empty());
+}
+
+#[test]
 fn images_require_separate_consent_selection_and_instance_creation() {
     let mut view = ready_view();
     view["instances"] = json!([]);
@@ -506,6 +586,7 @@ fn images_require_separate_consent_selection_and_instance_creation() {
         v["preparation"]["phase"] = json!("ready");
         v["preparation"]["currentComponent"] = Value::Null;
         v["preparation"]["images"][1]["ready"] = json!(true);
+        v["preparation"]["images"][1]["integrity"] = json!("verified");
     });
     wait(&mut ui.app, "id:workspace-next >> text:创建实例");
     gone(&mut ui.app, "id:pending");
@@ -572,6 +653,7 @@ fn selected_download_advances_only_the_current_creation_flow() {
         v["preparation"]["phase"] = json!("ready");
         v["preparation"]["currentComponent"] = Value::Null;
         v["preparation"]["images"][0]["ready"] = json!(true);
+        v["preparation"]["images"][0]["integrity"] = json!("verified");
     });
     wait(&mut ui.app, "id:create-form >> text:/Android API 35/");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
@@ -587,6 +669,7 @@ fn local_image_zip_is_reviewed_before_import_and_unknown_files_explain_why() {
             &json!({"kind":"importImage","imageId":"r34","path":"/tmp/archive.zip","acceptedLicenses":true})
         );
         view["preparation"]["images"][0]["ready"] = json!(true);
+        view["preparation"]["images"][0]["integrity"] = json!("verified");
         json!({"status":"accepted"})
     });
     ui.channel.handle("windroid.pickResource", |call| {
@@ -627,7 +710,7 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     view["preparation"]["componentsReady"] = json!(false);
     view["preparation"]["phase"] = json!("missing");
     view["preparation"]["components"] = json!([{"id":"emulator","name":"Android Emulator","version":"37",
-        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"borrowed":false}]);
+        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"integrity":"missing","requiredBytes":3072,"writable":true,"availableBytes":65536}]);
     let mut ui = Scripted::new(view, |cmd, v| {
         assert_eq!(
             cmd,
@@ -1420,9 +1503,10 @@ fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
         image("r33", 33, false),
         image("r35", 35, false),
         image("r34", 34, true),
-        image("external", 30, false)
+        image("conflicting", 30, false)
     ]);
-    view["preparation"]["images"][3]["borrowed"] = json!(true);
+    view["preparation"]["images"][3]["integrity"] = json!("conflict");
+    view["preparation"]["images"][3]["issue"] = json!("包含未知文件 extra.img");
     view["preparation"]["images"][1]["location"] = json!(long_path);
     view["storage"] = storage(&root, &long_path);
     let mut ui = Scripted::new(view, |_, _| unreachable!());
@@ -1442,8 +1526,8 @@ fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
     press(&mut ui.app, "show-environment");
     press(&mut ui.app, "environment-images");
     wait(&mut ui.app, "id:download-r35");
-    wait(&mut ui.app, "text:需在指定的 SDK 中准备");
-    gone(&mut ui.app, "id:download-external");
+    wait(&mut ui.app, "text:需要处理");
+    gone(&mut ui.app, "id:download-conflicting");
     assert!(bounds(&ui.app, "image-r34").top() < bounds(&ui.app, "image-r35").top());
     assert!(bounds(&ui.app, "image-r35").top() < bounds(&ui.app, "image-r33").top());
     let long_location = ui
