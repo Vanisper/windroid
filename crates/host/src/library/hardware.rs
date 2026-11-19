@@ -120,23 +120,41 @@ impl Library {
         let config = match &self.store {
             Some(store) => store
                 .update_hardware(id, hardware)
-                .map_err(error)?
-                .config(&self.layout),
+                .map(|record| record.config(&self.layout))
+                .map_err(error),
             None => {
                 let saved = instance
                     .config
                     .as_ref()
                     .ok_or_else(|| error("实例缺少配置"))?;
-                demo_config(saved.spec.clone(), hardware)?
+                demo_config(saved.spec.clone(), hardware)
             }
         };
-        self.state
-            .lock()
-            .unwrap()
+        let frozen = self.state.lock().unwrap().frozen.contains(id.as_str());
+        // 实际工作区以退出回执为准。保存中途失败时，旧快照也可能已经失效。
+        let invalidated = frozen
+            && match &self.store {
+                Some(store) => !matches!(store.quick_boot_saved(id), Ok(true)),
+                None => {
+                    config.is_ok()
+                        && instance.config.as_ref().is_some_and(|saved| {
+                            saved.cpu_cores != Some(hardware.cpu_cores)
+                                || saved.ram_mib != Some(hardware.ram_mib)
+                                || saved.graphics != Some(hardware.graphics)
+                        })
+                }
+            };
+        let mut state = self.state.lock().unwrap();
+        if invalidated {
+            state.frozen.remove(id.as_str());
+        }
+        let config = config?;
+        state
             .instances
             .get_mut(id.as_str())
             .ok_or_else(|| error("目标实例已不存在"))?
             .config = Some(config);
+        drop(state);
         self.note(Some(id.as_str()), false, "硬件规格已保存，下次启动生效");
         Ok(self.revision())
     }

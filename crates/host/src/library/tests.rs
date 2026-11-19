@@ -376,6 +376,41 @@ fn idle_freeze_requires_a_receipt_from_the_stop_just_completed() {
 }
 
 #[test]
+fn editing_hardware_preserves_a_frozen_session_only_while_its_snapshot_is_valid() {
+    let (lib, _windows) = library();
+    let id = create(&lib, "后台实例");
+    let instance = ready(&lib, &id);
+    create(&lib, "当前实例");
+    age_interaction(&lib, &id);
+    lib.freeze_idle(&instance, || Ok(true)).unwrap();
+    lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
+        .unwrap();
+
+    let edit = |cores| {
+        lib.perform(&json!({"kind":"updateHardware","instanceId":id,
+        "cpuCores":cores,"ramMiB":2560,"gpuMode":"host"}))
+    };
+    assert!(edit(0).is_err());
+    edit(2).unwrap();
+    let check = |frozen, cores| {
+        let snapshot = lib.snapshot();
+        let row = snapshot["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap();
+        assert_eq!(snapshot["frozen"], json!(frozen));
+        assert_eq!(row["frozen"], json!(frozen));
+        assert_eq!(row["state"], "stopped");
+        assert_eq!(row["config"]["cpuCores"], json!(cores));
+    };
+    check(true, 2);
+    edit(3).unwrap();
+    check(false, 3);
+}
+
+#[test]
 fn freeze_rechecks_selection_and_pending_windows_before_stopping() {
     let (lib, _windows) = library();
     let id = create(&lib, "有窗口");
