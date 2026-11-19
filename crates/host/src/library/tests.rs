@@ -200,53 +200,82 @@ fn running_list_waits_for_launcher_classification_and_keeps_cached_rows_on_error
 }
 
 #[test]
-fn deleting_a_group_restores_source_without_affecting_another_instance() {
-    let (lib, _) = library();
-    let id = create(&lib, "主机");
-    lib.perform(&json!({"kind":"createGroup","instanceId":id,"name":"书架"}))
-        .unwrap();
-    let group = lib.snapshot()["groups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|g| g["name"] == "书架")
-        .unwrap()["id"]
-        .clone();
-    lib.perform(
-        &json!({"kind":"moveApp","instanceId":id,"package":"com.example.reader","groupId":group}),
-    )
+fn old_group_files_do_not_change_sources_or_block_reopening() {
+    use std::fs;
+    let layout = temporary_workspace();
+    let path = layout.root.join("groups.json");
+    let store = InstanceStore::new(layout.clone());
+    let record = store.create("已有实例", stored_spec()).unwrap();
+    let id = record.id.as_str();
+    let old = serde_json::to_vec_pretty(&json!({(id): {
+        "names": {"group-1": "书架"},
+        "membership": {"com.example.reader": "group-1", "com.example.launcher": "group-1"},
+        "serial": 1
+    }}))
     .unwrap();
-    assert_eq!(
-        lib.snapshot()["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["id"] == group)
-            .unwrap()["count"],
-        1
-    );
-    let other = create(&lib, "副机");
-    assert!(
-        !lib.snapshot()["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|g| g["id"] == group)
-    );
-    lib.perform(&json!({"kind":"deleteGroup","instanceId":id,"groupId":group}))
-        .unwrap();
-    assert_eq!(lib.snapshot()["selectedId"], other);
-    lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
-        .unwrap();
-    assert_eq!(
-        lib.snapshot()["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["id"] == "installed")
-            .unwrap()["count"],
-        1
-    );
+    for previous in [None, Some(old.as_slice()), Some(b"{damaged".as_slice())] {
+        if let Some(bytes) = previous {
+            fs::write(&path, bytes).unwrap();
+        }
+        let (tx, windows) = mpsc::channel();
+        let (_events, rx) = mpsc::channel();
+        let lib = Library::attach(HostChannel::new(), layout.clone(), false, tx, rx).unwrap();
+        assert_eq!(lib.snapshot()["selectedId"], id);
+
+        // 保留真实工作区的挂载和命令路由，用已知 LAUNCHER 清单代替启动模拟器。
+        let (handle, events) = device::spawn(
+            record.id.clone(),
+            record.serial(),
+            device::FakeBackend::new(),
+            Default::default(),
+        );
+        assert!(matches!(
+            handle.send(Command::Create { spec: fake_spec() }),
+            Ack::Accepted { .. }
+        ));
+        assert!(matches!(handle.send(Command::Start), Ack::Accepted { .. }));
+        until(|| handle.snapshot().state == State::Ready);
+        lib.add(record.name.clone(), handle, events, None);
+        let snap = lib.snapshot();
+        let sections = snap["groups"].as_array().unwrap();
+        assert_eq!(sections.len(), 2);
+        for (group, package) in [
+            ("installed", "com.example.reader"),
+            ("system", "com.example.launcher"),
+        ] {
+            let section = sections
+                .iter()
+                .find(|section| section["id"] == group)
+                .unwrap();
+            assert_eq!(section["count"], 1);
+            assert_eq!(section["apps"][0]["package"], package);
+            lib.perform(&json!({"kind": "launch", "instanceId": id, "package": package}))
+                .unwrap();
+            let command = windows.recv_timeout(Duration::from_secs(1)).unwrap();
+            let WindowCommand::Open { key, serial, .. } = command else {
+                panic!("应收到打开应用窗口的命令：{command:?}")
+            };
+            assert_eq!(key.instance_id, id);
+            assert_eq!(key.package.as_deref(), Some(package));
+            assert_eq!(serial, record.serial());
+            lib.window_event(WindowEvent::Opened { key: key.clone() });
+            lib.window_event(WindowEvent::FirstFrame { key });
+        }
+        assert_eq!(lib.snapshot()["facts"]["sessionCount"], 2);
+        for kind in ["createGroup", "moveApp", "deleteGroup"] {
+            let request = json!({"kind": kind, "instanceId": id, "groupId": "group-1",
+                "name": "新分组", "package": "com.example.reader"});
+            assert!(
+                matches!(lib.perform(&request), Err(Rejection::Error { detail, .. }) if detail.contains("无法识别的操作"))
+            );
+        }
+        lib.shutdown();
+        match previous {
+            Some(bytes) => assert_eq!(fs::read(&path).unwrap(), bytes),
+            None => assert!(!path.try_exists().unwrap()),
+        }
+    }
+    fs::remove_dir_all(layout.root).unwrap();
 }
 
 fn ready(lib: &Arc<Library>, id: &str) -> Instance {
@@ -458,7 +487,7 @@ fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
     let layout = Layout {
         root: PathBuf::default(),
     };
-    let mut lib = Library::new(HostChannel::new(), layout.clone(), true, tx, false).unwrap();
+    let mut lib = Library::new(HostChannel::new(), layout.clone(), true, tx, false);
     // 只切换原生窗口消息路径。设备使用内存后端，测试端逐条送回窗口事件。
     Arc::get_mut(&mut lib).unwrap().store = Some(InstanceStore::new(layout));
     let (handle, events) = device::spawn(
@@ -546,8 +575,7 @@ fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
     assert_eq!(handle.snapshot().facts.session_count, 1);
 }
 
-#[test]
-fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
+fn temporary_workspace() -> Layout {
     use std::{fs, time::SystemTime};
     let token = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -556,9 +584,11 @@ fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
     let root =
         std::env::temp_dir().join(format!("windroid-workspace-{}-{token}", std::process::id()));
     fs::create_dir(&root).unwrap();
-    let layout = Layout { root: root.clone() };
-    let store = InstanceStore::new(layout.clone());
-    let spec = contract::Spec {
+    Layout { root }
+}
+
+fn stored_spec() -> contract::Spec {
+    contract::Spec {
         template: "compact-720".into(),
         image: contract::Image {
             api: 34,
@@ -566,7 +596,15 @@ fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
             abi: "arm64-v8a".into(),
         },
         disk_bytes: 6 << 30,
-    };
+    }
+}
+
+#[test]
+fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
+    let layout = temporary_workspace();
+    let root = layout.root.clone();
+    let store = InstanceStore::new(layout.clone());
+    let spec = stored_spec();
     let a = store.create("副屏", spec.clone()).unwrap();
     let b = store
         .create(
@@ -598,7 +636,7 @@ fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
     assert_eq!(snap["storage"]["sdk"], json!(sdk));
     assert_eq!(snap["storage"]["images"], json!(sdk.join("system-images")));
     lib.shutdown();
-    fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -612,8 +650,7 @@ fn missing_runtime_blocks_create_and_start_but_keeps_selection_available() {
         true,
         tx,
         false,
-    )
-    .unwrap();
+    );
     Arc::get_mut(&mut lib).unwrap().runtime = Some(Provisioner::managed(&root));
     assert_ne!(lib.snapshot()["preparation"]["phase"], "ready");
     assert_eq!(lib.snapshot()["capabilities"]["create"], false);

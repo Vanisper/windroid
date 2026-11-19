@@ -75,22 +75,6 @@ impl Library {
                 self.device(&instance, Command::Delete)?;
                 self.remove(id)?;
             }
-            "createGroup" | "moveApp" | "deleteGroup" => {
-                if kind == "moveApp" {
-                    app(&snap, package)?;
-                }
-                let _writer = self.group_writer.lock().unwrap();
-                let mut groups = self.groups.lock().unwrap().clone();
-                groups
-                    .change(
-                        self.store.as_ref().map(|_| self.layout.root.as_path()),
-                        id,
-                        kind,
-                        data,
-                    )
-                    .map_err(error)?;
-                *self.groups.lock().unwrap() = groups;
-            }
             "openDevice" | "launch" | "focusApp" => {
                 if !caps.launch_app {
                     return Err(Rejection::NotReady { state: snap.state });

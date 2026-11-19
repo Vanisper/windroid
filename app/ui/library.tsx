@@ -1,6 +1,6 @@
 import { computed, effect, Scroll, signal, Text, View, windowSize } from "nsh";
-import { Input, Tab, Tabs } from "nsh/base";
-import { Menu, type MenuItem } from "nsh/desktop";
+import { Tab, Tabs } from "nsh/base";
+import { Menu } from "nsh/desktop";
 import { Button, card, colors, confirmation, Detail, Heading, Indicator, row, Title } from "./controls";
 import { busy, can, currentId, dropApk, report, running, selected, send, snapshot, switching, type Action, type AppItem, type RunningApp } from "./model";
 
@@ -8,7 +8,7 @@ const points: Record<string, string> = { process: "模拟器进程", adb: "设�
 
 function DesktopPicker() {
   const desktop = computed(() => snapshot()?.desktop);
-  const label = (pkg: string) => desktop()?.candidateLabels?.[pkg] ?? groups().flatMap(g => g.apps).find(a => a.package === pkg)?.label ?? pkg;
+  const label = (pkg: string) => desktop()?.candidateLabels?.[pkg] ?? sections().flatMap(s => s.apps).find(a => a.package === pkg)?.label ?? pkg;
   const choose = () => {
     const id = currentId();
     if (!id || !can("launchApp")) return;
@@ -119,21 +119,10 @@ function AppTile(props: { app: AppItem; instanceId: string }) {
   function menu(at?: { x: number; y: number }) {
     // 原生菜单可在一次快照刷新后才完成选择。保留打开时的实例与包名。
     const app = props.app, id = props.instanceId;
-    const items: MenuItem[] = app.actions.map(action => ({
+    const items = app.actions.map(action => ({
       label: action.enabled || !action.reason ? action.label : action.label + " · " + action.reason,
       disabled: !action.enabled || busy(), onSelect: () => runAction(id, app, action),
     }));
-    const custom = groups().filter(g => g.id.startsWith("group-"));
-    if (custom.length) {
-      const membership = custom.find(g => g.apps.some(a => a.package === app.package))?.id ?? "";
-      const move = (groupId: string) => {
-        if (currentId() === id) void send({ kind: "moveApp", instanceId: id, package: app.package, groupId }, "移动应用");
-      };
-      items.push({ type: "separator" });
-      for (const g of [{ id: "", name: "原始分组" }, ...custom]) {
-        items.push({ label: "移至" + g.name, checked: membership === g.id, disabled: membership === g.id || busy(), onSelect: () => move(g.id) });
-      }
-    }
     void Menu.popup(items, at).catch(e => report("无法打开应用菜单 · " + String(e), true, id));
   }
   const palette = ["#336C60", "#58669C", "#836534", "#586B3B", "#905D72", "#3C7085"];
@@ -160,81 +149,25 @@ function AppTile(props: { app: AppItem; instanceId: string }) {
   </View>;
 }
 
-const groups = computed(() => snapshot()?.groups ?? []);
-
-const customGroups = computed(() => groups().filter(g => g.id.startsWith("group-")));
-
-function GroupEditor(props: { selected: string; select: (id: string) => void }) {
-  const owner = signal<string | null>(null);
-  const name = signal("");
-  const invalid = computed(() => {
-    const value = name().trim();
-    return !value || Array.from(value).length > 40 || /[\u0000-\u001f\u007f-\u009f]/.test(value);
+const sections = computed(() => {
+  const sources = snapshot()?.groups ?? [];
+  return [{ id: "installed", name: "已安装" }, { id: "system", name: "系统应用" }].map(section => {
+    const source = sources.find(s => s.id === section.id);
+    const apps = [...(source?.apps ?? [])].sort((a, b) => a.label.localeCompare(b.label));
+    return { ...section, apps };
   });
-  const custom = computed(() => groups().find(g => g.id === props.selected && g.id.startsWith("group-")));
-  async function save() {
-    const id = owner(), value = name().trim();
-    if (!id || id !== currentId() || invalid() || busy()) return;
-    if (await send({ kind: "createGroup", instanceId: id, name: value }, "创建分组")) {
-      owner.set(null);
-      if (currentId() === id) props.select(groups().find(g => g.name === value)?.id ?? "");
-    }
-  }
-  function remove() {
-    const id = currentId(), g = custom();
-    if (!id || !g) return;
-    confirmation.set({ id, title: "删除「" + g.name + "」分组？", detail: "删除后仍可在「已安装」或「系统应用」打开组内应用。", label: "删除分组",
-      action: async () => { if (await send({ kind: "deleteGroup", instanceId: id, groupId: g.id }, "删除分组") && id === currentId()) props.select(""); } });
-  }
-  return <View style={row}>
-    {owner() !== null && currentId() === owner() ? <>
-      <Input testID="group-name" accessibilityLabel="分组名称" placeholder="分组名称" value={name()} autoFocus onChange={e => name.set(e.value)} onSubmit={save}
-        style={{ width: 160, paddingHorizontal: 8, minHeight: 32, borderRadius: 7, borderWidth: 1, borderColor: colors().line, color: colors().ink }} />
-      <Button id="save-group" label="保存分组" primary disabled={busy() || invalid()} press={save} />
-      <Button id="cancel-group" label="取消" press={() => owner.set(null)} />
-    </> : <>
-      <Button id="new-group" label="新建分组…" disabled={busy()} press={() => { name.set(""); owner.set(currentId()); }} />
-      {custom() ? <Button id="delete-group" label="删除分组…" danger disabled={busy()} press={remove} /> : null}
-    </>}
-  </View>;
-}
+});
 
-function Catalog(props: { showGroups: boolean }) {
-  const groupId = signal("");
-  const filter = computed(() => props.showGroups ? customGroups().find(g => g.id === groupId()) : undefined);
-  let groupOwner = currentId();
-  effect(() => {
-    if (currentId() !== groupOwner) {
-      groupOwner = currentId();
-      groupId.set("");
-    }
-  });
-  // 自建分组可能含有不同来源的包；所有视图均以包自身的 system 标志归类。
-  const catalogApps = computed(() => (filter()?.apps ?? groups().flatMap(g => g.apps)).filter(app => app.launchable)
-    .sort((a, b) => a.label.localeCompare(b.label)));
-  const sections = computed(() => [
-    { id: "installed", title: "已安装", apps: catalogApps().filter(app => !app.system) },
-    { id: "system", title: "系统应用", apps: catalogApps().filter(app => app.system) },
-  ]);
+function Catalog() {
   const status = computed(() => snapshot()?.catalogStatus?.kind ?? "pending");
   return <View style={{ gap: 16 }}>
-    {props.showGroups ? <View style={{ gap: 8 }}>
-      <View style={row}>
-        <Button id="group-all" label="全部分组" primary={!filter()} press={() => groupId.set("")} />
-        <Each of={customGroups()} key={g => g.id}>{g =>
-          <Button id={"group-" + g().id} label={g().name} primary={g().id === groupId()} press={() => groupId.set(g().id)} />
-        }</Each>
-      </View>
-      <GroupEditor selected={groupId()} select={id => groupId.set(id)} />
-    </View> : null}
     {status() === "failed" ? <Text testID="catalog-error" role="alert" style={{ fontSize: 13, color: colors().bad }}>
       {"应用列表读取失败 · " + (snapshot()?.catalogStatus?.message || "请刷新列表重试")}</Text> : null}
     {status() === "pending" ? <Detail id="catalog-pending" text={can("refreshApps") ? "正在读取应用…" : "实例就绪后将读取应用列表。"} /> : null}
-    {filter() && !catalogApps().length && status() === "ready" ? <Detail text="这个分组还没有应用" /> : null}
     <Each of={sections()} key={section => section.id}>{section =>
-      <If when={section().apps.length > 0 || (!filter() && status() === "ready")}>
+      <If when={section().apps.length > 0 || status() === "ready"}>
         <View testID={"section-" + section().id} style={{ gap: 8 }}>
-          <Heading text={section().title} />
+          <Heading text={section().name} />
           {section().apps.length ? <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
             <Each of={section().apps} key={app => app.package}>{app => <AppTile app={app()} instanceId={currentId()!} />}</Each>
           </View> : section().id === "installed" ? <View testID="empty-library" style={{ gap: 4 }}>
@@ -248,13 +181,11 @@ function Catalog(props: { showGroups: boolean }) {
 
 export function Library(props: { onManage: () => void }) {
   const tab = signal<"apps" | "tasks">("apps");
-  const showGroups = signal(false);
   let owner = currentId();
   effect(() => {
     if (currentId() !== owner) {
       owner = currentId();
       tab.set("apps");
-      showGroups.set(false);
     }
   });
   const taskLabel = computed(() => tasksKnown() ? "运行中 · " + running().length : "运行中");
@@ -286,7 +217,6 @@ export function Library(props: { onManage: () => void }) {
           </Tab>
         </Tabs>
         <View style={{ ...row, visibility: tab() === "apps" ? "visible" : "hidden" }}>
-          <Button id="show-groups" label={showGroups() ? "收起分组" : "分组"} press={() => showGroups.set(!showGroups())} />
           <Button id="refresh-apps" label="刷新列表" disabled={!can("refreshApps") || busy()} press={() => act("refreshApps", "刷新应用")} />
           <Button id="add-apk" label="安装 APK…" primary disabled={!can("install") || busy()} press={() => act("addApk", "安装 APK")} />
         </View>
@@ -294,7 +224,7 @@ export function Library(props: { onManage: () => void }) {
       <Scroll testID={tab() === "apps" ? "apk-drop" : "task-scroll"}
         onFileDrop={tab() === "apps" ? e => dropApk(e.uris) : undefined} accessibilityLabel={tab() === "apps" ? "应用列表" : "运行中的应用"}
         style={{ height: Math.max(220, windowSize().height - 260), minWidth: 0, borderTopWidth: 1, borderColor: colors().line, paddingTop: 12 }}>
-        {tab() === "apps" ? <Catalog showGroups={showGroups()} /> : <RunningList />}
+        {tab() === "apps" ? <Catalog /> : <RunningList />}
       </Scroll>
     </View>
   </View>;
