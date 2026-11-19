@@ -335,6 +335,7 @@ struct Scripted {
     state: Arc<Mutex<Value>>,
     commands: Arc<Mutex<Vec<Value>>>,
     channel: HostChannel,
+    first_pages: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Scripted {
@@ -347,6 +348,12 @@ impl Scripted {
         let state = Arc::new(Mutex::new(state));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let view = state.clone();
+        let first_pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let receipts = first_pages.clone();
+        channel.handle("windroid.firstPageShown", move |call| {
+            receipts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            call.resolve(Value::Null);
+        });
         channel.handle("windroid.snapshot", move |call| {
             call.resolve(view.lock().unwrap().clone())
         });
@@ -362,6 +369,7 @@ impl Scripted {
             state,
             commands: requests,
             channel,
+            first_pages,
         }
     }
 
@@ -583,6 +591,88 @@ fn local_image_zip_is_reviewed_before_import_and_unknown_files_explain_why() {
     press(&mut ui.app, "confirm-import");
     wait(&mut ui.app, "id:use-r34");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
+    let mut view = ready_view();
+    view["showWelcome"] = json!(true);
+    view["instances"] = json!([]);
+    view["selectedId"] = Value::Null;
+    view["preparation"]["componentsReady"] = json!(false);
+    view["preparation"]["phase"] = json!("missing");
+    view["preparation"]["components"] = json!([{"id":"emulator","name":"Android Emulator","version":"37",
+        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"borrowed":false}]);
+    let mut ui = Scripted::new(view, |cmd, v| {
+        assert_eq!(
+            cmd,
+            &json!({"kind":"prepareRuntime","acceptedLicenses":true})
+        );
+        v["preparation"]["phase"] = json!("downloading");
+        v["preparation"]["currentComponent"] = json!("emulator");
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "text:欢迎使用 Windroid");
+    press(&mut ui.app, "guide-back");
+    wait(&mut ui.app, "id:inventory");
+    press(&mut ui.app, "guide-from-inventory");
+    press(&mut ui.app, "guide-begin");
+    wait(&mut ui.app, "id:components");
+    press(&mut ui.app, "prepare-runtime");
+    wait(&mut ui.app, "id:component-progress");
+    press(&mut ui.app, "guide-skip-components");
+    wait(&mut ui.app, "id:workspace-next >> text:查看准备进度");
+    ui.update(|v| {
+        v["preparation"]["phase"] = json!("ready");
+        v["preparation"]["componentsReady"] = json!(true);
+        v["preparation"]["currentComponent"] = Value::Null;
+    });
+    wait(&mut ui.app, "id:workspace-next >> text:创建实例");
+    press(&mut ui.app, "show-settings");
+    press(&mut ui.app, "settings-logs");
+    press(&mut ui.app, "show-guide");
+    press(&mut ui.app, "guide-begin");
+    wait(&mut ui.app, "id:image-list");
+    press(&mut ui.app, "cancel-image-selection");
+    wait(&mut ui.app, "text:/Windroid 当前将运行记录/");
+    press(&mut ui.app, "show-guide");
+    press(&mut ui.app, "guide-begin");
+    press(&mut ui.app, "use-r34");
+    wait(&mut ui.app, "id:create-form");
+    press(&mut ui.app, "cancel-create");
+    wait(&mut ui.app, "text:/Windroid 当前将运行记录/");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    assert_eq!(ui.first_pages.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn creation_reply_does_not_redirect_a_new_guide_session() {
+    let mut ui = Scripted::new(ready_view(), |_, _| unreachable!());
+    let (submitted, waiting) = mpsc::channel();
+    ui.channel.handle("windroid.command", move |call| {
+        assert_eq!(call.data()["kind"], "createInstance");
+        submitted.send(call.into_reply().unwrap()).unwrap();
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-settings");
+    press(&mut ui.app, "show-guide");
+    press(&mut ui.app, "guide-begin");
+    press(&mut ui.app, "use-r34");
+    press(&mut ui.app, "create");
+    let request = waiting.recv_timeout(WAIT).unwrap();
+    press(&mut ui.app, "show-settings");
+    press(&mut ui.app, "show-guide");
+    wait(&mut ui.app, "id:guide-begin");
+    ui.update(|v| {
+        v["selectedId"] = json!("created");
+        v["instances"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"created","name":"Android 2","state":"stopped"}));
+    });
+    request.resolve(json!({"status":"accepted"}));
+    gone(&mut ui.app, "id:pending");
+    wait(&mut ui.app, "id:guide-begin");
 }
 
 #[test]

@@ -63,7 +63,8 @@ export interface Snapshot {
   groups: AppSection[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
   instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string; templateRamMiB?: Record<string, number>;
-  storage?: { home: string; sdk: string; images: string };
+  showWelcome?: boolean;
+  storage?: { home: string; sdk: string; runtimeRoot: string; images: string; imagesInherited: boolean; borrowed: boolean; error?: string | null };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 
@@ -71,6 +72,7 @@ type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "r
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
   | { kind: "createInstance"; name: string; template: string; imageId: string }
+  | { kind: "applyStorage"; plan: { previewId: number } }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
   | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
@@ -107,6 +109,12 @@ type Screen = "instances" | "library" | "manage" | "create" | "environment" | "s
 export const screen = signal<Screen>("instances");
 export const instancePage = computed(() => screen() === "library" || screen() === "manage");
 export const managementBack = signal<"library" | "instances">("instances");
+type GuideOrigin = "first" | "instances" | "settings";
+export const guideOrigin = signal<GuideOrigin>("instances");
+export function openGuide(origin: GuideOrigin) {
+  guideOrigin.set(origin);
+  navigate("guide");
+}
 export const environmentTab = signal<"components" | "images">("components");
 export function openEnvironment(tab: "components" | "images") {
   environmentTab.set(tab);
@@ -175,7 +183,12 @@ async function readChanges() {
       const first = !snapshot();
       snapshot.set(s);
       observeOperation(s.operation);
-      if (first && currentId() && navigation === 0) screen.set("library");
+      if (first) {
+        if (navigation === 0) {
+          if (currentId()) screen.set("library");
+          else if (s.showWelcome) openGuide("first");
+        }
+      }
       if (instancePage() && !currentId()) navigate("instances");
       loadError.set("");
     } while (dirty);
@@ -186,6 +199,17 @@ async function readChanges() {
   }
 }
 
+// 首次取到快照时路由仍在挂载。以首个工作台页面的原生布局回执确认已展示。
+let firstPageSaved = false;
+export function firstPageShown() {
+  if (firstPageSaved || snapshot()?.showWelcome === undefined) return;
+  firstPageSaved = true;
+  void host.call("windroid.firstPageShown").catch(e => {
+    firstPageSaved = false;
+    report("未能保存首次进入记录 · " + String(e), true);
+  });
+}
+
 // 受理和完成分开展示。异步完成、设备拒绝及窗口异常分别由宿主的 operation / Ack / streamNote 给出。
 export async function send(cmd: Command, label: string): Promise<boolean> {
   const instanceId = "instanceId" in cmd ? cmd.instanceId : null;
@@ -194,7 +218,7 @@ export async function send(cmd: Command, label: string): Promise<boolean> {
   requests.update(items => ({ ...items, [key]: label }));
   messages.update(items => items.filter(item => item.instanceId !== null && (cmd.kind === "selectInstance" || item.instanceId !== instanceId)));
   try {
-    const ack = await host.call<Ack>("windroid.command", cmd, { timeout: 300_000 });
+    const ack = await host.call<Ack>("windroid.command", cmd, { timeout: cmd.kind === "applyStorage" ? 3_600_000 : 300_000 });
     if (ack?.status !== "accepted") {
       const r = ack?.reason;
       if (cmd.kind === "install" && r?.kind === "error" && r.code && r.detail !== undefined) {

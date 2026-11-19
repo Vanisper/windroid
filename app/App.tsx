@@ -1,9 +1,10 @@
 import { computed, effect, mount, Scroll, signal, Text, View } from "nsh";
 import { Button, colors, ConfirmDialog, Detail, narrow, Title } from "./ui/controls";
 import { CreateInstance } from "./ui/instances";
-import { Guide, Inventory, ManageInstance } from "./ui/inventory";
+import { Guide } from "./ui/guide";
+import { Inventory, ManageInstance } from "./ui/inventory";
 import { Library } from "./ui/library";
-import { connect, currentId, instancePage, loadError, messageText, notice, openInstance, pendingLabel, refresh, screen, snapshot, type Message } from "./ui/model";
+import { connect, currentId, firstPageShown, instancePage, loadError, messageText, notice, openInstance, pendingLabel, refresh, screen, snapshot, type Message } from "./ui/model";
 import { Environment } from "./ui/preparation";
 import { LicenseDialog } from "./ui/resources";
 import { Settings } from "./ui/settings";
@@ -31,13 +32,19 @@ function Feedback() {
 function Workspace() {
   // 页面只响应导航。下载进度与设备事件通过快照更新当前页面。
   const page = computed(() => snapshot() ? screen() : "loading");
-  return <View style={{ gap: 12, padding: narrow() ? 14 : 24, minWidth: 0 }}>
-    <Feedback />
-    {page() === "loading" ? <Title text={loadError() ? "无法连接应用库" : "正在读取应用库…"} /> :
-      page() === "environment" ? <Environment /> : page() === "create" ? <CreateInstance /> :
-      page() === "settings" ? <Settings /> : page() === "guide" ? <Guide /> :
-      page() === "manage" ? <ManageInstance /> : page() === "library" ?
-        <Library onManage={() => { const id = currentId(); if (id) void openInstance(id, "manage"); }} /> : <Inventory />}
+  return <View style={{ flex: 1, minHeight: 0, minWidth: 0 }}>
+    {page() === "settings" ? <View onLayout={firstPageShown} style={{ flex: 1, minHeight: 0, gap: 12, padding: narrow() ? 14 : 24 }}>
+      <Feedback /><Settings />
+    </View> : <Scroll testID="workspace-scroll" style={{ flex: 1, minWidth: 0, minHeight: 0 }}
+      contentStyle={{ gap: 12, padding: narrow() ? 14 : 24 }}>
+      <Feedback />
+      {page() === "loading" ? <Title text={loadError() ? "无法连接应用库" : "正在读取应用库…"} /> :
+        <View onLayout={firstPageShown} style={{ minWidth: 0 }}>
+          {page() === "environment" ? <Environment /> : page() === "create" ? <CreateInstance /> :
+            page() === "guide" ? <Guide /> : page() === "manage" ? <ManageInstance /> : page() === "library" ?
+              <Library onManage={() => { const id = currentId(); if (id) void openInstance(id, "manage"); }} /> : <Inventory />}
+        </View>}
+    </Scroll>}
   </View>;
 }
 
@@ -46,7 +53,7 @@ function App() {
   return <View style={{ flex: 1, minWidth: 0, backgroundColor: colors().canvas }}>
     <View style={{ flex: 1, flexDirection: "row" }}>
       <Sidebar />
-      <Scroll testID="workspace-scroll" style={{ flex: 1, minWidth: 0, minHeight: 0 }}><Workspace /></Scroll>
+      <Workspace />
     </View>
     <ConfirmDialog />
     <LicenseDialog />

@@ -1,4 +1,4 @@
-import { computed, signal, Text, View } from "nsh";
+import { computed, Text, View } from "nsh";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
 import { ImageList } from "./images";
 import { activeTransfer, busy, environmentReady, environmentTab, navigate, preparation, send, type Component, type Preparation } from "./model";

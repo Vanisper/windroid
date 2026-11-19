@@ -1,7 +1,7 @@
 import { computed, signal, Text, View, windowSize } from "nsh";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
 import { DeviceControls } from "./library";
-import { activeTransfer, environmentReady, images, openEnvironment, instances, instanceState, managementBack, navigate, openInstance, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
+import { activeTransfer, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -33,6 +33,7 @@ function NextAction() {
       environmentReady() ? "运行组件已就绪。选择系统镜像后即可创建实例。" : "先准备这台 Mac 共用的 Android 运行组件，再创建实例。"} />
     <View style={row}>
       <Button id="workspace-next" primary label={label()} press={next} />
+      <Button id="guide-from-inventory" label="使用引导" press={() => openGuide("instances")} />
     </View>
   </View>;
 }
@@ -103,17 +104,5 @@ export function ManageInstance() {
       {logPath() ? <Text style={{ userSelect: "text", fontSize: 13, color: colors().ink }}>{logPath()}</Text> : null}
       <Detail text="启动模拟器时会写入本次输出。按日期和启动记录浏览历史将在后续版本提供。" />
     </View> : null}
-  </View>;
-}
-
-export function Guide() {
-  return <View testID="guide" style={{ gap: 16 }}>
-    <Title text="使用引导" />
-    <View style={card()}>
-      <Heading text={environmentReady() ? "创建实例" : "准备运行环境"} />
-      <Detail text="每台实例独立保存应用和文件。启动后可打开应用窗口，再从「运行中」恢复后台应用。" />
-      <NextAction />
-    </View>
-    <View style={row}><Button id="guide-back" label="返回设置" press={() => navigate("settings")} /></View>
   </View>;
 }

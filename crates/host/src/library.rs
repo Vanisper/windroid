@@ -24,6 +24,7 @@ use crate::{
 };
 
 mod commands;
+mod first_page;
 mod observation;
 mod resources;
 #[cfg(test)]
@@ -109,6 +110,7 @@ impl ViewState {
 pub struct Library {
     layout: Layout,
     recommended_template: &'static str,
+    first_page: Option<first_page::FirstPage>,
     runtime: Option<Provisioner>,
     store: Option<InstanceStore>,
     channel: HostChannel,
@@ -130,7 +132,15 @@ impl Library {
         windows: mpsc::Sender<WindowCommand>,
         events: mpsc::Receiver<WindowEvent>,
     ) -> Result<Arc<Self>, String> {
-        let library = Self::new(channel, layout, fake, windows, false);
+        let first_page = if fake {
+            None
+        } else {
+            let enabled =
+                std::env::var("WINDROID_SHOW_GUIDE_ON_FIRST_LAUNCH").as_deref() == Ok("1");
+            Some(first_page::FirstPage::open(&layout.root, enabled).map_err(|e| e.to_string())?)
+        };
+        let mut library = Self::new(channel, layout, fake, windows, false);
+        Arc::get_mut(&mut library).unwrap().first_page = first_page;
         if let Some(store) = &library.store {
             for record in store.list().map_err(|e| e.to_string())? {
                 library.add_record(record);
@@ -172,6 +182,7 @@ impl Library {
             } else {
                 "phone-1080"
             },
+            first_page: None,
             runtime: (!fake).then(|| Provisioner::new(layout.root.clone())),
             store: (!fake).then(|| InstanceStore::new(layout.clone())),
             layout,
@@ -240,6 +251,14 @@ impl Library {
     }
 
     fn connect(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.channel.handle("windroid.firstPageShown", move |call| {
+            let Some(lib) = weak.upgrade() else {
+                return call.reject("应用库已关闭");
+            };
+            let result = lib.first_page.as_ref().map(|p| p.shown()).transpose();
+            call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
+        });
         self.connect_resources();
         let global = self.lane();
         let weak = Arc::downgrade(self);
@@ -391,6 +410,7 @@ impl Library {
                 })
             })
             .collect();
+        out["showWelcome"] = json!(self.first_page.as_ref().is_some_and(|p| p.welcome()));
         out["selectedId"] = json!(state.selected);
         out["frozen"] = json!(state.frozen.contains(&id));
         out["operation"] = state
