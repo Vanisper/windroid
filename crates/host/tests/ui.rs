@@ -785,7 +785,8 @@ fn creation_reply_does_not_redirect_a_new_guide_session() {
 
 fn storage(runtime: &str, images: &str) -> Value {
     json!({"home":"/home", "runtimeRoot":runtime, "imageRoot":images,
-        "defaultRuntimeRoot":"/home/runtime", "defaultImageRoot":"/home/system-images"})
+        "defaultRuntimeRoot":"/home/runtime", "defaultImageRoot":"/home/system-images", "cleanupNotes":[],
+        "runtimeIsDefault":runtime=="/home/runtime", "imageIsDefault":images=="/home/system-images"})
 }
 
 fn storage_plan(change: &Value, id: usize) -> Value {
@@ -802,7 +803,11 @@ fn storage_reviews_each_version_and_cleanup_choice_then_restores_each_root_indep
         assert_eq!(cmd["kind"], "applyStorage");
         match cmd["plan"]["previewId"].as_u64().unwrap() {
             4 => v["storage"]["imageRoot"] = json!("/images"),
-            7 => v["storage"]["runtimeRoot"] = json!("/home/runtime"),
+            7 => {
+                // 同一实际目录经原生面板返回时可能采用另一种路径拼写。
+                v["storage"]["runtimeRoot"] = json!("/private/home/runtime/");
+                v["storage"]["runtimeIsDefault"] = json!(true);
+            }
             id => panic!("无法识别此次确认的预览 {id}"),
         }
         json!({"status":"accepted"})

@@ -74,7 +74,7 @@ export interface Snapshot {
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
   instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string; templateRamMiB?: Record<string, number>;
   showWelcome?: boolean;
-  storage?: { home: string; runtimeRoot: string; imageRoot: string; defaultRuntimeRoot: string; defaultImageRoot: string; cleanupNotes: string[]; error?: string | null };
+  storage?: { home: string; runtimeRoot: string; imageRoot: string; defaultRuntimeRoot: string; defaultImageRoot: string; runtimeIsDefault: boolean; imageIsDefault: boolean; cleanupNotes: string[]; error?: string | null };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 

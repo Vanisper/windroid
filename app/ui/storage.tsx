@@ -206,13 +206,13 @@ export function Storage() {
       <Heading text="运行组件目录" /><Location path={current()?.runtimeRoot ?? "未知"} />
       <View style={row}>
         <Button id="choose-runtime-directory" label="选择组件文件夹…" disabled={locked() || !current()} press={() => choose("runtimeRoot")} />
-        {current() && current()!.runtimeRoot !== current()!.defaultRuntimeRoot ? <Button id="reset-runtime-directory"
+        {current()?.runtimeIsDefault === false ? <Button id="reset-runtime-directory"
           label="恢复默认组件目录" disabled={locked()} press={() => choose("runtimeRoot", true)} /> : null}
       </View>
       <Heading text="系统镜像目录" /><Location path={current()?.imageRoot ?? "未知"} />
       <View style={row}>
         <Button id="choose-image-directory" label="选择镜像文件夹…" disabled={locked() || !current()} press={() => choose("imageRoot")} />
-        {current() && current()!.imageRoot !== current()!.defaultImageRoot ? <Button id="reset-image-directory"
+        {current()?.imageIsDefault === false ? <Button id="reset-image-directory"
           label="恢复默认镜像目录" disabled={locked()} press={() => choose("imageRoot", true)} /> : null}
       </View>
       {draft() && !pending() ? <Button id="retry-storage-preview" label="重试上次预览" disabled={locked()}
