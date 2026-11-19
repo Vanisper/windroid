@@ -17,7 +17,7 @@ fn library() -> (Arc<Library>, mpsc::Receiver<WindowCommand>) {
 }
 use std::path::PathBuf;
 fn create(lib: &Arc<Library>, name: &str) -> String {
-    lib.perform(&json!({"kind":"createInstance","name":name,"template":"compact-720"}))
+    lib.perform(&json!({"kind":"createInstance","imageId":"system-image","name":name,"template":"compact-720"}))
         .unwrap();
     lib.snapshot()["selectedId"].as_str().unwrap().into()
 }
@@ -27,6 +27,21 @@ fn until(predicate: impl Fn() -> bool) {
         assert!(start.elapsed() < Duration::from_secs(5));
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn creation_requires_an_explicit_available_image() {
+    let (lib, _) = library();
+    for image in [JsonValue::Null, json!("outside-catalog")] {
+        assert!(
+            lib.perform(&json!({"kind":"createInstance","name":"手机","imageId":image}))
+                .is_err()
+        );
+    }
+    assert_eq!(lib.snapshot()["instances"], json!([]));
+    create(&lib, "A");
+    create(&lib, "B");
+    assert_eq!(lib.snapshot()["instances"].as_array().unwrap().len(), 2);
 }
 
 #[test]

@@ -5,6 +5,7 @@ import { Guide, Inventory, ManageInstance } from "./ui/inventory";
 import { Library } from "./ui/library";
 import { connect, currentId, instancePage, loadError, messageText, notice, openInstance, pendingLabel, refresh, screen, snapshot, type Message } from "./ui/model";
 import { Environment } from "./ui/preparation";
+import { LicenseDialog } from "./ui/resources";
 import { Settings } from "./ui/settings";
 import { Sidebar } from "./ui/sidebar";
 
@@ -48,6 +49,7 @@ function App() {
       <Scroll testID="workspace-scroll" style={{ flex: 1, minWidth: 0, minHeight: 0 }}><Workspace /></Scroll>
     </View>
     <ConfirmDialog />
+    <LicenseDialog />
   </View>;
 }
 

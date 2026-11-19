@@ -1,7 +1,7 @@
 import { computed, signal, Text, View, windowSize } from "nsh";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
 import { DeviceControls } from "./library";
-import { environmentReady, instances, instanceState, managementBack, navigate, openInstance, preparation, selected, snapshot, switching, type Instance } from "./model";
+import { activeTransfer, environmentReady, images, openEnvironment, instances, instanceState, managementBack, navigate, openInstance, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -20,12 +20,20 @@ function specs(item?: Instance | null) {
 }
 
 function NextAction() {
-  const active = computed(() => ["downloading", "verifying", "installing"].includes(preparation()?.phase ?? ""));
+  const imageTransfer = computed(() => images().some(i => i.id === preparation()?.currentComponent) && activeTransfer());
+  const label = computed(() => imageTransfer() ? "查看镜像进度" : activeTransfer() ? "查看准备进度" :
+    environmentReady() ? "创建实例" : "查看运行环境");
+  const next = () => {
+    if (imageTransfer()) openEnvironment("images");
+    else if (environmentReady()) startCreation();
+    else openEnvironment("components");
+  };
   return <View style={{ gap: 12, alignItems: "flex-start" }}>
-    <Detail text={environmentReady() ? (instances().length ? "运行环境已就绪，可以创建另一台 Android 实例。" : "运行环境已就绪，可以创建第一台 Android 实例。") :
-      active() ? "正在准备运行环境，可查看下载与安装进度。" : "先准备这台 Mac 共用的 Android 运行环境，再创建实例。"} />
-    <Button id="workspace-next" primary label={environmentReady() ? "创建实例" : active() ? "查看准备进度" : "查看运行环境"}
-      press={() => navigate(environmentReady() ? "create" : "environment")} />
+    <Detail text={imageTransfer() ? "系统镜像正在准备，完成后可供实例使用。" : activeTransfer() ? "正在准备这台 Mac 共用的运行组件。" :
+      environmentReady() ? "运行组件已就绪。选择系统镜像后即可创建实例。" : "先准备这台 Mac 共用的 Android 运行组件，再创建实例。"} />
+    <View style={row}>
+      <Button id="workspace-next" primary label={label()} press={next} />
+    </View>
   </View>;
 }
 

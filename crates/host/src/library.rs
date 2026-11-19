@@ -19,13 +19,13 @@ use runtime::{
 use serde_json::json;
 
 use crate::{
-    SnapshotView,
-    names,
+    SnapshotView, names,
     surface::{WindowCommand, WindowEvent, WindowKey},
 };
 
 mod commands;
 mod observation;
+mod resources;
 #[cfg(test)]
 mod tests;
 
@@ -240,6 +240,7 @@ impl Library {
     }
 
     fn connect(self: &Arc<Self>) {
+        self.connect_resources();
         let global = self.lane();
         let weak = Arc::downgrade(self);
         self.channel.handle(names::COMMAND, move |call| {
@@ -255,6 +256,8 @@ impl Library {
                         | "createInstance"
                         | "deleteInstance"
                         | "prepareRuntime"
+                        | "importImage"
+                        | "prepareImage"
                         | "pausePreparation"
                         | "recheckRuntime"
                 )
@@ -343,10 +346,6 @@ impl Library {
     fn revision(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
-    fn preparation(&self) -> JsonValue {
-        self.runtime.as_ref().map(|p|crate::to_json(&p.snapshot())).unwrap_or_else(||json!({"phase":"ready","borrowed":false,"components":[],"currentComponent":null,"downloadedBytes":0,"totalBytes":0,"error":null}))
-    }
-
     /// 包含所选设备事实和全库导航数据。全部来自内存，查询不会调用 adb 或扫描磁盘。
     pub fn snapshot(&self) -> JsonValue {
         let preparation = self.preparation();
@@ -371,9 +370,12 @@ impl Library {
         let id = snap.id.to_string();
         let mut view = SnapshotView::of(snap.clone()).with_apps(&snap.apps, &snap.desktop);
         // actor 判断设备状态，应用库再叠加同一份准备快照中的主机条件。
-        if preparation["phase"] != "ready" {
+        if preparation["componentsReady"] != true {
             view.capabilities.create = false;
             view.capabilities.start = false;
+        }
+        if let Some(record) = current.and_then(|row| row.record.as_ref()) {
+            view.capabilities.start &= resources::image_available(&preparation, &record.spec.image);
         }
         let mut out = crate::to_json(&view);
         out["instances"] = state
@@ -406,6 +408,22 @@ impl Library {
                 "images": paths.sdk.join("system-images")
             });
         }
+        out["templateRamMiB"] = [
+            "phone-1080",
+            "compact-720",
+            "tablet-1200",
+            "tv-1080",
+            "tv-4k",
+        ]
+        .into_iter()
+        .map(|template| {
+            (
+                template.to_owned(),
+                json!(runtime::instances::ram_mib(template)),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
         out["recommendedTemplate"] = self.recommended_template.into();
         out
     }

@@ -26,10 +26,12 @@ export interface RunningApp { instanceId: string; package: string; label: string
 export interface Component {
   id: string; name: string; version: string; source: string; sizeBytes: number; ready: boolean;
   license: string; licenseUrl: string; licenseText?: string;
+  location: string; downloadedBytes: number; borrowed: boolean; issue: string | null;
+  image: InstanceConfig["image"] | null; minEmulator: string | null;
 }
 export interface Preparation {
   phase: "missing" | "downloading" | "verifying" | "installing" | "paused" | "failed" | "ready";
-  components: Component[]; downloadedBytes: number; totalBytes: number;
+  componentsReady: boolean; components: Component[]; images: Component[]; downloadedBytes: number; totalBytes: number;
   currentComponent: string | null; error: string | null; borrowed: boolean;
 }
 interface InstallError { code: string; detail: string }
@@ -60,7 +62,7 @@ export interface Snapshot {
   catalogStatus?: { kind: "pending" | "ready" | "failed"; message?: string };
   groups: AppSection[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
-  instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string;
+  instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string; templateRamMiB?: Record<string, number>;
   storage?: { home: string; sdk: string; images: string };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
@@ -68,7 +70,9 @@ export interface Snapshot {
 type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "refreshApps" | "openDevice" | "addApk";
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
-  | { kind: "createInstance"; name: string; template: string }
+  | { kind: "createInstance"; name: string; template: string; imageId: string }
+  | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
+  | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
   | { kind: "pausePreparation" | "recheckRuntime" }
   | { kind: DeviceCommand; instanceId: string }
@@ -89,7 +93,13 @@ export const selected = computed(() => {
 export const currentId = computed(() => selected()?.id ?? null);
 export const preparation = computed(() => snapshot()?.preparation);
 export const running = computed(() => (snapshot()?.running ?? []).filter(app => app.instanceId === currentId()));
-export const environmentReady = computed(() => Boolean(snapshot()) && (!preparation() || preparation()?.phase === "ready"));
+export const environmentReady = computed(() => Boolean(snapshot()) && (!preparation() || (preparation()?.componentsReady ?? preparation()?.phase === "ready")));
+export const images = computed(() => preparation()?.images ?? []);
+export const activeTransfer = computed(() => ["downloading", "verifying", "installing"].includes(preparation()?.phase ?? ""));
+
+export function pickResource(kind: "imageZip" | "runtimeDirectory" | "imageDirectory") {
+  return host.call<string | null>("windroid.pickResource", { kind }, { timeout: 3_600_000 });
+}
 export const can = (key: Capability) => currentId() !== null && snapshot()?.capabilities?.[key] === true
   && (key !== "start" || environmentReady());
 
@@ -97,6 +107,16 @@ type Screen = "instances" | "library" | "manage" | "create" | "environment" | "s
 export const screen = signal<Screen>("instances");
 export const instancePage = computed(() => screen() === "library" || screen() === "manage");
 export const managementBack = signal<"library" | "instances">("instances");
+export const environmentTab = signal<"components" | "images">("components");
+export function openEnvironment(tab: "components" | "images") {
+  environmentTab.set(tab);
+  navigate("environment");
+}
+export const creationImage = signal<string | null>(null);
+export function startCreation(imageId?: string) {
+  creationImage.set(imageId ?? null);
+  navigate("create");
+}
 let navigation = 0;
 export function navigate(page: Screen) {
   ++navigation;

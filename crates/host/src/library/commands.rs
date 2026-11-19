@@ -8,21 +8,9 @@ impl Library {
         }
         let kind = data["kind"].as_str().ok_or_else(|| error("缺少操作名称"))?;
         match kind {
-            "prepareRuntime" | "pausePreparation" | "recheckRuntime" => {
-                let p = self
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(|| error("演示环境已就绪"))?;
-                match kind {
-                    "prepareRuntime" if data["acceptedLicenses"] != true => {
-                        return Err(error("请先阅读并接受组件许可"));
-                    }
-                    "prepareRuntime" => p.start(),
-                    "pausePreparation" => p.pause(),
-                    _ => p.recheck(),
-                }
-                .map_err(error)?;
-                return Ok(self.revision());
+            "prepareRuntime" | "prepareImage" | "importImage" | "pausePreparation"
+            | "recheckRuntime" => {
+                return self.prepare(kind, data);
             }
             "createInstance" => return self.create_instance(data),
             _ => {}
@@ -170,6 +158,9 @@ impl Library {
                     }
                     if let Some(r) = &instance.record {
                         self.check_budget(&r.spec.template)?;
+                        if !resources::image_available(&self.preparation(), &r.spec.image) {
+                            return Err(error("请先准备此实例使用的系统镜像"));
+                        }
                     }
                     self.require_ready_runtime()?;
                 }
@@ -233,11 +224,7 @@ impl Library {
         }
         let spec = contract::Spec {
             template: template.into(),
-            image: contract::Image {
-                api: 34,
-                tag: "google_apis_playstore".into(),
-                abi: "arm64-v8a".into(),
-            },
+            image: self.selected_image(data)?,
             disk_bytes: 8 << 30,
         };
         let id = if let Some(store) = &self.store {
@@ -387,7 +374,7 @@ impl Library {
         if self
             .runtime
             .as_ref()
-            .is_some_and(|p| p.snapshot().phase != "ready")
+            .is_some_and(|p| !p.snapshot().components_ready)
         {
             Err(error("请先准备运行环境"))
         } else {

@@ -1,6 +1,6 @@
 import { computed, Scroll, signal, Text, View } from "nsh";
 import { colors, Indicator, narrow } from "./controls";
-import { currentId, environmentReady, instancePage, instances, instanceState, navigate, openInstance, screen, switching } from "./model";
+import { currentId, environmentReady, instancePage, instances, instanceState, navigate, openInstance, screen, startCreation, switching } from "./model";
 
 const folded = signal<boolean | null>(null);
 const compact = computed(() => folded() ?? narrow());
@@ -25,7 +25,7 @@ export function Sidebar() {
     <NavItem id="toggle-sidebar" label={compact() ? "展开侧栏" : "折叠侧栏"} glyph={compact() ? "»" : "«"} press={() => folded.set(!compact())} />
     <NavItem id="all-instances" label="实例" glyph="▦" active={screen() === "instances"} press={() => navigate("instances")} />
     <NavItem id="new-instance" label="新建实例" glyph="＋" active={screen() === "create"}
-      disabled={!environmentReady() || switching()} press={() => navigate("create")} />
+      disabled={!environmentReady() || switching()} press={() => startCreation()} />
     <Scroll testID="instance-navigation" style={{ flex: 1, minHeight: 0 }} contentStyle={{ gap: 2 }}>
       <Each of={instances()} key={item => item.id}>{item =>
         <View testID={"instance-" + item().id} role="button" accessibilityLabel={item().name + " · " + (item().summary ?? instanceState(item()))}
