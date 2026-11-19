@@ -104,20 +104,9 @@ impl OwnedEmulator {
         let mut cmd = Command::new(&paths.emulator);
         // AVD 搜索、快照和数据盘显式指向实例目录。
         // https://developer.android.com/studio/run/emulator-commandline#data-filedir
-        // Emulator 自身也会从 PATH 枚举 adb。为它提供同一版本的工具和宿主基础命令。
-        let adb_dir = paths
-            .adb
-            .parent()
-            .ok_or_else(|| invalid("adb 缺少版本目录"))?;
-        let search = std::env::join_paths([
-            adb_dir,
-            Path::new("/usr/bin"),
-            Path::new("/bin"),
-            Path::new("/usr/sbin"),
-            Path::new("/sbin"),
-        ])
-        .map_err(|e| invalid(e.to_string()))?;
-        cmd.env("PATH", search)
+        // 受管 adb 服务已经启动。不给原生模拟器提供可绕过会话协议检查的 adb 客户端；
+        // 它使用配置的端口注册传输，设备查询和文件操作由 Windroid 绑定的工具执行。
+        cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env_remove("ANDROID_HOME")
             .env_remove("ANDROID_SDK_ROOT")
             .env("ANDROID_EMULATOR_HOME", &dir)
