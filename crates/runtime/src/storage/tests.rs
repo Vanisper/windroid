@@ -228,7 +228,7 @@ fn official_jar_round_trip_reuses_content_and_defers_busy_cleanup() {
     let platform = existing.path.strip_prefix(&original.runtime_root).unwrap();
     for root in [&original.runtime_root, &alternate.runtime_root] {
         fs::create_dir_all(root.join(platform).parent().unwrap()).unwrap();
-        transaction::copy_tree(&tools.join(platform), &root.join(platform)).unwrap();
+        transaction::copy_tree(&tools.join(platform), &root.join(platform), &|| Ok(())).unwrap();
     }
     let jar = Path::new("scrcpy-server/5.0.1");
     fs::create_dir_all(alternate.runtime_root.join(jar)).unwrap();
@@ -363,4 +363,150 @@ fn selected_custom_mount_cannot_fall_back_to_host_volume() {
         ErrorKind::NotConnected
     );
     assert!(!saved.runtime_root.exists());
+}
+
+#[test]
+#[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME to official components"]
+fn deferred_cleanup_requires_both_original_version_objects() {
+    let tools = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap());
+    for swap_source in [true, false] {
+        let tmp = Temp::new();
+        let home = tmp.0.join("workspace");
+        let before = StorageLocations::defaults(&home);
+        let after = StorageLocations {
+            runtime_root: tmp.0.join("target"),
+            ..before.clone()
+        };
+        copy_official_jar(&tools, &before);
+        copy_official_jar(&tools, &after);
+        let jar = Path::new("scrcpy-server/5.0.1");
+        let source = before.runtime_root.join(jar);
+        let hold = version_read_lease(&source).unwrap();
+        let plan = preview_switch(&home, &after, SwitchMode::Migrate, true).unwrap();
+        apply(&home, &plan).unwrap();
+        drop(hold);
+        let config = if swap_source { &before } else { &after };
+        let path = config.runtime_root.join(jar);
+        let saved = path.with_extension("saved");
+        fs::rename(&path, &saved).unwrap();
+        copy_official_jar(&tools, config);
+        recover(&home).unwrap();
+        assert!(source.exists() && path.exists() && saved.exists());
+        assert_eq!(pending_cleanup(&home).unwrap().len(), 1);
+        fs::rename(&path, path.with_extension("unrelated")).unwrap();
+        fs::rename(saved, path).unwrap();
+        recover(&home).unwrap();
+        assert!(!source.exists() && pending_cleanup(&home).unwrap().is_empty());
+    }
+}
+
+/// 两个独立创建的 APFS 卷在同一路径轮换，副本字节完全一致。原盘接回后继续同一个账本。
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME; creates and ejects two private APFS images"]
+fn replacement_volumes_cannot_authorize_migration_or_cleanup() {
+    fn disk(args: &[&std::ffi::OsStr]) {
+        let output = Command::new("/usr/bin/hdiutil")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    struct Mounted<'a>(&'a Path);
+    impl Drop for Mounted<'_> {
+        fn drop(&mut self) {
+            disk(&["detach".as_ref(), self.0.as_os_str()]);
+        }
+    }
+    let tools = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap());
+    let tmp = Temp::new();
+    let slot = tmp.0.join("slot");
+    let images = [
+        tmp.0.join("selected.sparseimage"),
+        tmp.0.join("other.sparseimage"),
+    ];
+    let filesystem = std::env::var_os("WINDROID_TEST_STORAGE_FS").unwrap_or("APFS".into());
+    for img in &images {
+        disk(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "96m".as_ref(),
+            "-fs".as_ref(),
+            filesystem.as_os_str(),
+            "-volname".as_ref(),
+            "Windroid Storage Test".as_ref(),
+            "-type".as_ref(),
+            "SPARSE".as_ref(),
+            img.as_os_str(),
+        ]);
+    }
+    let mount = |i: usize| {
+        fs::create_dir_all(&slot).unwrap();
+        disk(&[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noautoopen".as_ref(),
+            "-mountpoint".as_ref(),
+            slot.as_os_str(),
+            images[i].as_os_str(),
+        ]);
+        Mounted(&slot)
+    };
+    for swap_source in [true, false] {
+        let home = tmp.0.join(format!("workspace-{swap_source}"));
+        let local = StorageLocations::defaults(&home);
+        let removable = StorageLocations {
+            runtime_root: slot.join(format!("resources-{swap_source}")),
+            ..local.clone()
+        };
+        let (source, target) = if swap_source {
+            (&removable, &local)
+        } else {
+            (&local, &removable)
+        };
+        let alt = mount(1);
+        let alternate_uuid = volume_id(&slot).unwrap();
+        copy_official_jar(&tools, &removable);
+        drop(alt);
+        let original = mount(0);
+        let original_uuid = volume_id(&slot).unwrap();
+        assert_ne!(original_uuid, alternate_uuid);
+        if swap_source {
+            future(&home, &removable);
+        }
+        copy_official_jar(&tools, source);
+        let rel = Path::new("scrcpy-server/5.0.1");
+        let src = source.runtime_root.join(rel);
+        let plan = preview_switch(&home, target, SwitchMode::Migrate, true).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        drop(original);
+        let alt = mount(1);
+        assert!(apply(&home, &plan).is_err());
+        assert_eq!(StorageLocations::load(&home).unwrap(), *source);
+        assert!(removable.runtime_root.join(rel).exists());
+        drop(alt);
+        let original = mount(0);
+        assert_eq!(original_uuid, volume_id(&slot).unwrap());
+        let reader = version_read_lease(&src).unwrap();
+        apply(&home, &plan).unwrap();
+        drop(reader);
+        assert_eq!(pending_cleanup(&home).unwrap().len(), 1);
+        drop(original);
+        let alt = mount(1);
+        let other = removable.runtime_root.join(rel);
+        let original_other_object = StableObject::at(&other).unwrap();
+        recover(&home).unwrap();
+        assert!(src.is_dir() && original_other_object.matches(&other).unwrap());
+        assert_eq!(pending_cleanup(&home).unwrap().len(), 1);
+        drop(alt);
+        let original = mount(0);
+        recover(&home).unwrap();
+        assert!(target.runtime_root.join(rel).is_dir());
+        assert!(!src.exists() && pending_cleanup(&home).unwrap().is_empty());
+        drop(original);
+    }
 }

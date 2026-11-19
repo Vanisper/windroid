@@ -9,6 +9,10 @@ use std::os::unix::fs::OpenOptionsExt;
 pub(super) struct Mounts {
     pub runtime: Option<PathBuf>,
     pub images: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_uuid: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images_uuid: Option<[u8; 16]>,
 }
 
 pub(super) fn at(path: &Path) -> io::Result<PathBuf> {
@@ -68,8 +72,39 @@ pub(super) fn load(home: &Path) -> io::Result<Mounts> {
     }
 }
 impl Mounts {
+    pub(super) fn capture(&mut self, path: &Path, image: bool) -> io::Result<()> {
+        let (point, uuid) = if image {
+            (&mut self.images, &mut self.images_uuid)
+        } else {
+            (&mut self.runtime, &mut self.runtime_uuid)
+        };
+        *point = Some(at(path)?);
+        *uuid = volume_id(path).ok();
+        Ok(())
+    }
+    pub(super) fn uuid(&self, image: bool) -> Option<[u8; 16]> {
+        if image {
+            self.images_uuid
+        } else {
+            self.runtime_uuid
+        }
+    }
+    pub(super) fn require(&self, path: &Path, image: bool) -> io::Result<()> {
+        if self.uuid(image).is_none() {
+            return Err(invalid("记录缺少稳定的卷身份，已保留原文件"));
+        }
+        self.check(path, image)
+    }
+
     pub(super) fn validate(&self) -> io::Result<()> {
-        for point in [&self.runtime, &self.images].into_iter().flatten() {
+        for (point, uuid) in [
+            (&self.runtime, self.runtime_uuid),
+            (&self.images, self.images_uuid),
+        ] {
+            if uuid == Some([0; 16]) || uuid.is_some() && point.is_none() {
+                return Err(invalid("资源卷标识无效"));
+            }
+            let Some(point) = point else { continue };
             if !point.is_absolute() || point.components().any(|p| p == Component::ParentDir) {
                 return Err(invalid("资源卷挂载路径无效"));
             }
@@ -80,11 +115,14 @@ impl Mounts {
         check_volume(path)?;
         let point = if image { &self.images } else { &self.runtime };
         if let Some(expected) = point
-            && at(path)? != *expected
+            && (at(path)? != *expected
+                || self
+                    .uuid(image)
+                    .is_some_and(|id| volume_id(path).ok() != Some(id)))
         {
             return Err(io::Error::new(
                 ErrorKind::NotConnected,
-                format!("存储卷未挂载在 {}，请重新连接该卷", expected.display()),
+                format!("所选存储卷未挂载在 {}，请重新连接原卷", expected.display()),
             ));
         }
         Ok(())

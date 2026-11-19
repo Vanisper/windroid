@@ -1,4 +1,6 @@
 //! 两个资源根独立选址。选择和预览只读，确认后仅复制缺失的完整版本。
+mod identity;
+pub(crate) use identity::{StableObject, volume_id};
 mod locks;
 mod mounts;
 pub(crate) use mounts::check_selected_volume;
@@ -54,6 +56,10 @@ pub struct Version {
     pub download_writable: bool,
     #[serde(skip)]
     digest: Option<String>,
+    #[serde(skip)]
+    source_object: Option<StableObject>,
+    #[serde(skip)]
+    target_object: Option<StableObject>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,7 +81,7 @@ pub struct MigrationPlan {
 }
 impl MigrationPlan {
     pub fn check_candidate_image_root(&self) -> io::Result<()> {
-        self.target_mounts.check(&self.after.image_root, true)
+        self.target_mounts.require(&self.after.image_root, true)
     }
 
     pub fn changed_roots(&self) -> (bool, bool) {
@@ -194,9 +200,22 @@ fn copy_space(source: &Path, block: u64) -> io::Result<u64> {
 #[derive(Debug)]
 enum Contents {
     Absent,
-    Complete(String),
+    Skeleton(Option<StableObject>),
+    Complete(String, Option<StableObject>),
     Conflict(String),
     Offline(String),
+}
+
+impl Contents {
+    fn object(&self) -> Option<StableObject> {
+        match self {
+            Self::Complete(_, object) | Self::Skeleton(object) => object.clone(),
+            _ => None,
+        }
+    }
+    fn missing(&self) -> bool {
+        matches!(self, Self::Absent | Self::Skeleton(_))
+    }
 }
 
 fn check_version_path(root: &Path, path: &Path) -> io::Result<()> {
@@ -237,10 +256,15 @@ fn contents(
             return Ok(Contents::Absent);
         };
         if meta.is_dir() && skeleton(path)? {
-            return Ok(Contents::Absent);
+            return Ok(Contents::Skeleton(StableObject::at(path).ok()));
         }
-        let _reader = version_read_lease(path)?;
-        Ok(Contents::Complete(verify(path)?))
+        let reader = version_read_lease(path)?;
+        let id = StableObject::from_file(&reader).ok();
+        let digest = verify(path)?;
+        if let Some(id) = &id {
+            id.require(path)?;
+        }
+        Ok(Contents::Complete(digest, id))
     };
     inspect().unwrap_or_else(|e| Contents::Conflict(format!("{}：{e}", path.display())))
 }
@@ -256,18 +280,18 @@ fn classify(
     match (source, target) {
         (_, Offline(issue) | Conflict(issue)) => (Status::Conflict, issue.clone()),
         (Conflict(issue), _) if mode == SwitchMode::Migrate => (Status::Conflict, issue.clone()),
-        (Complete(a), Complete(b)) if a != b && mode == SwitchMode::Migrate => {
+        (Complete(a, _), Complete(b, _)) if a != b && mode == SwitchMode::Migrate => {
             (Status::Conflict, "同一版本的展开内容不同".into())
         }
-        (_, Complete(_)) => (Status::Reuse, "目标已通过完整校验".into()),
-        (Complete(_), Absent) if mode == SwitchMode::Migrate => {
+        (_, Complete(..)) => (Status::Reuse, "目标已通过完整校验".into()),
+        (Complete(..), Absent | Skeleton(_)) if mode == SwitchMode::Migrate => {
             (Status::Copy, "复制源位置的完整版本".into())
         }
-        (Offline(issue), Absent) if required => {
+        (Offline(issue), Absent | Skeleton(_)) if required => {
             (Status::Missing, format!("{issue}，目标缺少此版本"))
         }
-        (_, Absent) if required => (Status::Missing, "目标缺少所需版本".into()),
-        (_, Absent) => (Status::Unused, "当前无需此版本".into()),
+        (_, Absent | Skeleton(_)) if required => (Status::Missing, "目标缺少所需版本".into()),
+        (_, Absent | Skeleton(_)) => (Status::Unused, "当前无需此版本".into()),
     }
 }
 
@@ -354,11 +378,20 @@ pub fn preview_switch(
         target_mounts: mounts::load(home)?,
     };
     let changed = plan.changed_roots();
-    if changed.0 {
-        plan.target_mounts.runtime = Some(mounts::at(&after.runtime_root)?);
-    }
-    if changed.1 {
-        plan.target_mounts.images = Some(mounts::at(&after.image_root)?);
+    for (moves, image) in [(changed.0, false), (changed.1, true)] {
+        if !moves {
+            continue;
+        }
+        plan.target_mounts
+            .capture(version_root(&after, image), image)?;
+        let source = version_root(&before, image);
+        // 已登记的卷离线或被同名盘替换时保留原绑定。默认根在首次迁移预览时登记。
+        if mode == SwitchMode::Migrate
+            && plan.source_mounts.uuid(image).is_none()
+            && plan.source_mounts.check(source, image).is_ok()
+        {
+            plan.source_mounts.capture(source, image)?;
+        }
     }
     if mode == SwitchMode::Future {
         for (moves, root) in [
@@ -457,9 +490,26 @@ pub fn preview_switch(
             blockers.push(format!("{}：{detail}", dst.label()));
         }
         let digest = match (&source, &target) {
-            (_, Contents::Complete(value)) | (Contents::Complete(value), _) => Some(value.clone()),
+            (_, Contents::Complete(value, _)) | (Contents::Complete(value, _), _) => {
+                Some(value.clone())
+            }
             _ => None,
         };
+        let source_object = source.object();
+        let target_object = target.object();
+        let clean = cleanup
+            && matches!(source, Contents::Complete(..))
+            && matches!(status, VersionStatus::Copy | VersionStatus::Reuse);
+        if (clean || status == VersionStatus::Copy)
+            && (plan.target_mounts.uuid(image.is_some()).is_none()
+                || source_object.is_none()
+                || (!matches!(target, Contents::Absent) && target_object.is_none()))
+        {
+            blockers.push(format!(
+                "{} 无法核实持久卷或版本对象身份，已保留原文件",
+                dst.label()
+            ));
+        }
         let bytes = dst.unpacked_bytes();
         if status == VersionStatus::Copy {
             let (dev, available, read_only, block) = volume(&dst.path)?;
@@ -471,7 +521,7 @@ pub fn preview_switch(
             totals.0 = totals.0.saturating_add(extra);
             plan.required_bytes = plan.required_bytes.saturating_add(extra);
         }
-        let downloadable = image.is_some() && matches!(target, Contents::Absent) && required;
+        let downloadable = image.is_some() && target.missing() && required;
         let download = downloadable.then(|| dst.download_space(&after));
         plan.versions.push(Version {
             id: dst.id().into(),
@@ -481,9 +531,9 @@ pub fn preview_switch(
             status,
             detail,
             bytes,
-            cleanup: cleanup
-                && matches!(source, Contents::Complete(_))
-                && matches!(status, VersionStatus::Copy | VersionStatus::Reuse),
+            cleanup: clean,
+            source_object,
+            target_object,
             downloadable,
             download_required_bytes: download.map(|d| d.0),
             download_available_bytes: download.and_then(|d| d.1),

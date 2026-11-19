@@ -15,10 +15,16 @@ struct Entry {
     digest: String,
     copy: bool,
     cleanup: bool,
-    // 仅用作本次发布对象的归属证据。不同卷的资源一致性由官方展开清单核验。
+    // 早期 v2 记录中的临时设备号仅用于读回原校验和，不能用于授权。
     created: Option<(u64, u64)>,
     #[serde(default)]
     retained: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_object: Option<StableObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_target: Option<StableObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage_object: Option<StableObject>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -216,19 +222,34 @@ fn sibling(target: &Path, nonce: &str, phase: &str) -> PathBuf {
     ))
 }
 
-pub(super) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+pub(super) fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    guard()?;
     let meta = fs::symlink_metadata(src)?;
     if meta.is_dir() {
         fs::create_dir(dst)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dst)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()), guard)?;
         }
-        fs::set_permissions(dst, meta.permissions())?;
+        directory.set_permissions(meta.permissions())?;
     } else if meta.is_file() {
-        if fs::copy(src, dst)? != meta.len() {
-            return Err(invalid("复制期间文件长度变化"));
+        let mut input = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(src)?;
+        let mut output = File::create_new(dst)?;
+        if !input.metadata()?.is_file() || io::copy(&mut input, &mut output)? != meta.len() {
+            return Err(invalid("复制期间文件类型或长度变化"));
         }
+        output.set_permissions(meta.permissions())?;
     } else {
         return Err(invalid(format!(
             "不支持复制链接或特殊文件：{}",
@@ -238,12 +259,17 @@ pub(super) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_scratch(path: &Path) -> io::Result<()> {
-    match metadata(path)? {
-        Some(m) if m.is_dir() => fs::remove_dir_all(path),
-        Some(_) => Err(invalid(format!("迁移暂存目录已变化：{}", path.display()))),
-        None => Ok(()),
+fn confirmed_object(id: &Option<StableObject>) -> io::Result<&StableObject> {
+    id.as_ref()
+        .ok_or_else(|| invalid("记录缺少已确认的对象身份，保留原文件"))
+}
+
+fn remove_scratch(path: &Path, id: &Option<StableObject>) -> io::Result<()> {
+    if metadata(path)?.is_some() {
+        confirmed_object(id)?.require(path)?;
+        fs::remove_dir_all(path)?;
     }
+    Ok(())
 }
 
 // 目标卷暂存都在 settings 提交前准备完毕。先记录文件对象，再逐个发布；
@@ -251,7 +277,8 @@ fn remove_scratch(path: &Path) -> io::Result<()> {
 fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Result<()> {
     let old = RuntimePaths::managed_packages(&journal.before);
     let new = RuntimePaths::managed_packages(&journal.after);
-    for entry in &mut journal.entries {
+    for i in 0..journal.entries.len() {
+        let entry = &journal.entries[i];
         if !entry.copy {
             continue;
         }
@@ -259,17 +286,29 @@ fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Re
         let dst = new.iter().find(|pkg| pkg.id() == entry.id).unwrap();
         journal
             .target_mounts
-            .check(&dst.path, dst.image().is_some())?;
+            .require(&dst.path, dst.image().is_some())?;
+        confirmed_object(&entry.source_object)?.require(&src.path)?;
         let stage = sibling(&dst.path, &journal.nonce, "new");
-        copy_tree(&src.path, &stage)?;
-        leases.push(lock_staged_version(&stage)?);
+        fs::create_dir(&stage)?;
+        let lease = lock_staged_version(&stage)?;
+        journal.entries[i].stage_object = Some(StableObject::from_file(&lease)?);
+        // 建立暂存后先持久化对象身份。随后中断的部分副本可在同卷重挂后安全回收。
+        write_record(&home.join(JOURNAL), journal)?;
+        let stage_id = confirmed_object(&journal.entries[i].stage_object)?;
+        let guard = || stage_id.require(&stage);
+        for child in fs::read_dir(&src.path)? {
+            let child = child?;
+            copy_tree(&child.path(), &stage.join(child.file_name()), &guard)?;
+        }
+        guard()?;
+        lease.set_permissions(fs::metadata(&src.path)?.permissions())?;
+        leases.push(lease);
+        let entry = &journal.entries[i];
+        confirmed_object(&entry.stage_object)?.require(&stage)?;
         if dst.verify_at(&stage)? != entry.digest {
             return Err(invalid("复制后的完整版本摘要不符"));
         }
-        let meta = fs::symlink_metadata(&stage)?;
-        entry.created = Some((meta.dev(), meta.ino()));
     }
-    write_record(&home.join(JOURNAL), journal)?;
     for entry in &journal.entries {
         if !entry.copy {
             continue;
@@ -277,8 +316,11 @@ fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Re
         let dst = new.iter().find(|pkg| pkg.id() == entry.id).unwrap();
         journal
             .target_mounts
-            .check(&dst.path, dst.image().is_some())?;
+            .require(&dst.path, dst.image().is_some())?;
+        let stage = sibling(&dst.path, &journal.nonce, "new");
+        confirmed_object(&entry.stage_object)?.require(&stage)?;
         if metadata(&dst.path)?.is_some() {
+            confirmed_object(&entry.prior_target)?.require(&dst.path)?;
             if !dst.empty_skeleton(&dst.path)? {
                 return Err(invalid(format!(
                     "目标在复制期间已被占用：{}",
@@ -287,7 +329,8 @@ fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Re
             }
             rename_exclusive(&dst.path, &sibling(&dst.path, &journal.nonce, "empty"))?;
         }
-        rename_exclusive(&sibling(&dst.path, &journal.nonce, "new"), &dst.path)?;
+        rename_exclusive(&stage, &dst.path)?;
+        confirmed_object(&entry.stage_object)?.require(&dst.path)?;
         File::open(dst.path.parent().unwrap())?.sync_all()?;
     }
     write_settings(home, &journal.after, &journal.target_mounts)
@@ -323,6 +366,7 @@ fn settle_files(
     let current = StorageLocations::load(home)?;
     let active = RuntimePaths::managed_packages(&current);
     let new = RuntimePaths::managed_packages(&journal.after);
+    let sources = RuntimePaths::managed_packages(&journal.before);
     for entry in journal.entries.iter().filter(|entry| entry.copy) {
         let dst = new.iter().find(|pkg| pkg.id() == entry.id).unwrap();
         check_version_path(
@@ -333,7 +377,7 @@ fn settle_files(
         let backup = sibling(&dst.path, &journal.nonce, "empty");
         journal
             .target_mounts
-            .check(&dst.path, dst.image().is_some())?;
+            .require(&dst.path, dst.image().is_some())?;
         let _lease = if locked {
             vec![]
         } else {
@@ -341,30 +385,51 @@ fn settle_files(
         };
         let adopted = active.iter().any(|pkg| same_location(&pkg.path, &dst.path));
         if !committed && !adopted {
-            if let Some(meta) = metadata(&dst.path)?
-                && Some((meta.dev(), meta.ino())) == entry.created
-            {
-                if dst.verify_at(&dst.path)? != entry.digest {
-                    return Err(invalid(format!(
-                        "已发布副本被更改，保留在 {}",
-                        dst.path.display()
-                    )));
+            // 回滚可能移除完整的已发布副本。确认最初的源版本仍可使用，再回收目标。
+            let src = sources.iter().find(|p| p.id() == entry.id).unwrap();
+            journal
+                .source_mounts
+                .require(&src.path, src.image().is_some())?;
+            let _source = version_read_lease(&src.path)?;
+            let source_id = confirmed_object(&entry.source_object)?;
+            source_id.require(&src.path)?;
+            if src.verify_at(&src.path)? != entry.digest {
+                return Err(invalid("原源版本已变化，保留迁移副本"));
+            }
+            source_id.require(&src.path)?;
+            if metadata(&dst.path)?.is_some() {
+                if entry
+                    .stage_object
+                    .as_ref()
+                    .is_some_and(|id| id.matches(&dst.path).unwrap_or(false))
+                {
+                    if dst.verify_at(&dst.path)? != entry.digest {
+                        return Err(invalid(format!(
+                            "已发布副本被更改，保留在 {}",
+                            dst.path.display()
+                        )));
+                    }
+                    remove_scratch(&dst.path, &entry.stage_object)?;
+                } else {
+                    // 原空目录尚未改名或已还原。其他同名版本不能充当这次事务的目标。
+                    confirmed_object(&entry.prior_target)?.require(&dst.path)?;
                 }
-                fs::remove_dir_all(&dst.path)?;
             }
             if metadata(&backup)?.is_some() {
+                confirmed_object(&entry.prior_target)?.require(&backup)?;
                 rename_exclusive(&backup, &dst.path)?;
             }
         } else if metadata(&backup)?.is_some() {
+            confirmed_object(&entry.stage_object)?.require(&dst.path)?;
             if !dst.empty_skeleton(&backup)? {
                 return Err(invalid(format!(
                     "原空目录已有改动，保留在 {}",
                     backup.display()
                 )));
             }
-            fs::remove_dir_all(backup)?;
+            remove_scratch(&backup, &entry.prior_target)?;
         }
-        remove_scratch(&stage)?;
+        remove_scratch(&stage, &entry.stage_object)?;
     }
     if committed && journal.entries.iter().any(|e| e.cleanup) {
         let cleanup = home
@@ -406,13 +471,24 @@ fn retry_cleanup(home: &Path) -> io::Result<()> {
                 entry.cleanup = false;
                 continue;
             }
+            let (Some(source_id), Some(target_id)) = (
+                &entry.source_object,
+                if entry.copy {
+                    entry.stage_object.as_ref()
+                } else {
+                    entry.prior_target.as_ref()
+                },
+            ) else {
+                entry.retained = Some("原记录缺少稳定卷或版本对象身份".into());
+                continue;
+            };
             if record
                 .source_mounts
-                .check(&src.path, src.image().is_some())
+                .require(&src.path, src.image().is_some())
                 .is_err()
                 || record
                     .target_mounts
-                    .check(&dst.path, dst.image().is_some())
+                    .require(&dst.path, dst.image().is_some())
                     .is_err()
             {
                 continue;
@@ -434,6 +510,9 @@ fn retry_cleanup(home: &Path) -> io::Result<()> {
             let Ok(_target) = version_read_lease(&dst.path) else {
                 continue;
             };
+            if target_id.require(&dst.path).is_err() {
+                continue;
+            }
             if dst.verify_at(&dst.path).as_deref().ok() != Some(entry.digest.as_str()) {
                 entry.retained = Some("目标完整性已变化".into());
                 continue;
@@ -455,13 +534,21 @@ fn retry_cleanup(home: &Path) -> io::Result<()> {
                 continue;
             };
             if !retired.try_exists()? {
+                if source_id.require(&src.path).is_err() {
+                    continue;
+                }
                 if src.verify_at(&src.path).as_deref().ok() != Some(entry.digest.as_str()) {
                     entry.retained = Some("源内容已变化".into());
                     continue;
                 }
+                target_id.require(&dst.path)?;
+                source_id.require(&src.path)?;
                 rename_exclusive(&src.path, &retired)?;
             }
             // 版本内发生任何变化都保留。改名后在原路径新增的对象不参与清理。
+            if source_id.require(&retired).is_err() {
+                continue;
+            }
             if src.verify_at(&retired).as_deref().ok() != Some(entry.digest.as_str()) {
                 if !src.path.try_exists()? {
                     rename_exclusive(&retired, &src.path)?;
@@ -469,6 +556,8 @@ fn retry_cleanup(home: &Path) -> io::Result<()> {
                 entry.retained = Some("清理中断或源副本发生变化".into());
                 continue;
             }
+            target_id.require(&dst.path)?;
+            source_id.require(&retired)?;
             fs::remove_dir_all(retired)?;
             entry.cleanup = false;
         }
@@ -507,7 +596,7 @@ pub fn pending_cleanup(home: &Path) -> io::Result<Vec<String>> {
             let reason = entry
                 .retained
                 .as_deref()
-                .unwrap_or("等待源卷或目标卷可用并释放占用，重新检查时重试");
+                .unwrap_or("等待原源卷、目标卷和已确认的版本对象可用并释放占用，重新检查时重试");
             notes.push(format!("保留 {}（{}）", pkg.path.display(), reason));
         }
     }
@@ -564,6 +653,20 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
             version_root(&confirmed.after, dst.image().is_some()),
             &row.target,
         )?;
+        if row.cleanup || row.status == VersionStatus::Copy {
+            confirmed
+                .source_mounts
+                .require(&row.source, dst.image().is_some())?;
+            confirmed_object(&row.source_object)?.require(&row.source)?;
+        }
+        if row.status == VersionStatus::Copy {
+            confirmed
+                .target_mounts
+                .require(&row.target, dst.image().is_some())?;
+        }
+        if let Some(id) = &row.target_object {
+            id.require(&row.target)?;
+        }
         match row.status {
             VersionStatus::Copy => {
                 leases.push(version_read_lease(&row.source)?);
@@ -576,6 +679,7 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
     let plan = preview_switch(home, &confirmed.after, confirmed.mode, confirmed.cleanup)?;
     if plan.before != confirmed.before
         || plan.target_mounts != confirmed.target_mounts
+        || plan.source_mounts != confirmed.source_mounts
         || plan.versions.len() != confirmed.versions.len()
         || plan.versions.iter().zip(&confirmed.versions).any(|(a, b)| {
             a.id != b.id
@@ -584,6 +688,8 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
                 || a.target != b.target
                 || a.digest != b.digest
                 || a.cleanup != b.cleanup
+                || a.source_object != b.source_object
+                || a.target_object != b.target_object
         })
         || plan.affected_instances != confirmed.affected_instances
         || !plan.blockers.is_empty()
@@ -612,6 +718,9 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
                 cleanup: row.cleanup,
                 created: None,
                 retained: None,
+                source_object: row.source_object,
+                prior_target: row.target_object,
+                stage_object: None,
             })
             .collect(),
     };
@@ -670,6 +779,9 @@ mod tests {
                 cleanup,
                 created: None,
                 retained: None,
+                source_object: None,
+                prior_target: None,
+                stage_object: None,
             }],
         }
     }
@@ -710,6 +822,70 @@ mod tests {
         assert!(validate_journal(&home.0).is_err());
     }
 
+    #[test]
+    #[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME to official components"]
+    fn rollback_waits_for_original_source_and_staged_object_and_preserves_unproven_records() {
+        let official = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap())
+            .join("scrcpy-server/5.0.1/scrcpy-server.jar");
+        for case in ["source", "target", "partial", "unknown"] {
+            let temp = Temp::new();
+            let home = temp.0.join("workspace");
+            fs::create_dir(&home).unwrap();
+            let after = StorageLocations {
+                runtime_root: temp.0.join("target"),
+                ..StorageLocations::defaults(&home)
+            };
+            let mut record = journal(&home, after, false);
+            let rel = Path::new("scrcpy-server/5.0.1");
+            let src = record.before.runtime_root.join(rel);
+            let dst = record.after.runtime_root.join(rel);
+            let stage = sibling(&dst, &record.nonce, "new");
+            fs::create_dir_all(&src).unwrap();
+            fs::copy(&official, src.join("scrcpy-server.jar")).unwrap();
+            fs::create_dir_all(&stage).unwrap();
+            fs::copy(&official, stage.join("scrcpy-server.jar")).unwrap();
+            record.source_mounts.capture(&src, false).unwrap();
+            record.target_mounts.capture(&stage, false).unwrap();
+            record.entries[0].source_object = Some(StableObject::at(&src).unwrap());
+            if case != "unknown" {
+                record.entries[0].stage_object = Some(StableObject::at(&stage).unwrap());
+            }
+            if case == "source" || case == "target" {
+                fs::rename(&stage, &dst).unwrap();
+            }
+            let path = match case {
+                "source" => &src,
+                "target" => &dst,
+                _ => &stage,
+            };
+            let saved = temp.0.join("original");
+            if case != "unknown" {
+                fs::rename(path, &saved).unwrap();
+                fs::create_dir(path).unwrap();
+                fs::copy(&official, path.join("scrcpy-server.jar")).unwrap();
+            }
+            write_record(&home.join(JOURNAL), &record).unwrap();
+            recover(&home).unwrap();
+            assert!(
+                path.join("scrcpy-server.jar").is_file()
+                    && !pending_cleanup(&home).unwrap().is_empty(),
+                "{case}"
+            );
+            if case == "unknown" {
+                continue;
+            }
+            fs::rename(path, temp.0.join("unrelated")).unwrap();
+            fs::rename(&saved, path).unwrap();
+            recover(&home).unwrap();
+            assert!(
+                src.is_dir()
+                    && !stage.exists()
+                    && !dst.exists()
+                    && pending_cleanup(&home).unwrap().is_empty(),
+                "{case}"
+            );
+        }
+    }
     // 通过固定的同卷事务节点模拟程序直接退出，使用完整的真实 JAR 复验。
     #[test]
     #[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME to official components"]
@@ -732,12 +908,15 @@ mod tests {
             fs::create_dir_all(&dst).unwrap();
             let stage = sibling(&dst, &record.nonce, "new");
             fs::create_dir(&stage).unwrap();
+            record.source_mounts.capture(&src, false).unwrap();
+            record.target_mounts.capture(&dst, false).unwrap();
+            record.entries[0].source_object = Some(StableObject::at(&src).unwrap());
+            record.entries[0].prior_target = Some(StableObject::at(&dst).unwrap());
+            record.entries[0].stage_object = Some(StableObject::at(&stage).unwrap());
             if checkpoint == "copying" {
                 fs::write(stage.join("scrcpy-server.jar"), b"partial").unwrap();
             } else {
                 fs::copy(&official, stage.join("scrcpy-server.jar")).unwrap();
-                let meta = fs::metadata(&stage).unwrap();
-                record.entries[0].created = Some((meta.dev(), meta.ino()));
                 rename_exclusive(&dst, &sibling(&dst, &record.nonce, "empty")).unwrap();
                 rename_exclusive(&stage, &dst).unwrap();
             }
