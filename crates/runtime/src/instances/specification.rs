@@ -50,9 +50,14 @@ impl GraphicsMode {
 
     pub fn apply(self, command: &mut Command) {
         command.args(["-gpu", self.gpu()]);
-        // 受管 Emulator 的 lib/advancedFeatures.ini 定义此开关，默认关闭。
+        // 受管 Emulator 的 lib/advancedFeatures.ini 将客户机 Vulkan HAL 和描述符批处理分别控制。
         if self == Self::Batch {
-            command.args(["-feature", "VulkanBatchedDescriptorSetUpdate"]);
+            command.args([
+                "-feature",
+                "Vulkan",
+                "-feature",
+                "VulkanBatchedDescriptorSetUpdate",
+            ]);
         }
     }
 }

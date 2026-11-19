@@ -310,6 +310,8 @@ mod tests {
                     "-gpu",
                     "host",
                     "-feature",
+                    "Vulkan",
+                    "-feature",
                     "VulkanBatchedDescriptorSetUpdate",
                 ],
             ),
