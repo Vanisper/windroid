@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use super::catalog::Artifact;
 use super::integrity::invalid;
 use super::paths::small_text;
+use crate::storage::StableObject;
 
 // 固定包的目录均为 ASCII。逐段检查原始名字，避免解包器静默「修正」路径。
 pub(super) fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
@@ -159,13 +160,14 @@ pub(super) fn workspace(dest: &Path, pkg: Artifact) -> io::Result<(PathBuf, File
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Publish {
-    old: Option<(u64, u64)>,
-    new: (u64, u64),
+    stage: StableObject,
+    old: Option<StableObject>,
+    new: StableObject,
 }
 
-fn object(path: &Path) -> io::Result<Option<(u64, u64)>> {
+pub(super) fn object(path: &Path) -> io::Result<Option<StableObject>> {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => Ok(Some((m.dev(), m.ino()))),
+        Ok(m) if m.is_dir() => StableObject::at(path).map(Some),
         Ok(_) => Err(invalid(format!(
             "发布目录被其他文件占用：{}",
             path.display()
@@ -181,13 +183,19 @@ pub(super) fn recover(
     stage: &Path,
     dest: &Path,
     pkg: Artifact,
+    guard: &impl Fn() -> io::Result<()>,
 ) -> io::Result<Option<File>> {
+    guard()?;
     let journal = stage.join("publish.json");
     let record: Publish = match small_text(&journal) {
-        Ok(s) => serde_json::from_str(&s)?,
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|_| invalid("发布记录缺少可核对的卷及对象身份，已保留暂存和原版本"))?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    if !record.stage.matches(stage)? {
+        return Err(invalid("安装暂存目录或所在卷已更换，无法恢复此发布"));
+    }
     let backup = stage.join("previous");
     let current = object(dest)?;
     let previous = object(&backup)?;
@@ -195,12 +203,12 @@ pub(super) fn recover(
     if previous.is_some() && previous != record.old {
         return Err(invalid(format!("原版本备份发生变化：{}", backup.display())));
     }
-    if current == Some(record.new) {
-        match super::manifest::check(home, dest, pkg, true, || Ok(())) {
+    if current.as_ref() == Some(&record.new) {
+        match super::manifest::check(home, dest, pkg, true, guard) {
             Ok(_) if previous.is_some() => {
                 let _lease = crate::storage::lock_staged_version(&backup)?;
                 super::manifest::repairable(&backup, pkg)?;
-                remove_owned(&backup)?;
+                remove_version(&backup, record.old.as_ref(), guard)?;
             }
             Ok(_) => (),
             Err(e)
@@ -214,7 +222,9 @@ pub(super) fn recover(
                 super::manifest::repairable(dest, pkg)?;
                 if previous.is_some() {
                     restored = Some(crate::storage::lock_staged_version(&backup)?);
+                    require_object(dest, Some(&record.new), guard)?;
                     crate::storage::rename_exclusive(dest, &stage.join("rejected"))?;
+                    require_object(&backup, record.old.as_ref(), guard)?;
                     crate::storage::rename_exclusive(&backup, dest)?;
                 }
                 // 首次发布没有备份时保留现状，本次明确修复会在新副本通过验收后再替换。
@@ -223,6 +233,7 @@ pub(super) fn recover(
         }
     } else if current.is_none() && previous.is_some() {
         restored = Some(crate::storage::lock_staged_version(&backup)?);
+        require_object(&backup, record.old.as_ref(), guard)?;
         crate::storage::rename_exclusive(&backup, dest)?;
     } else if current != record.old {
         return Err(invalid(format!(
@@ -236,10 +247,32 @@ pub(super) fn recover(
             return Err(invalid("撤回版本的对象身份已变化"));
         }
         super::manifest::repairable(&rejected, pkg)?;
-        remove_owned(&rejected)?;
+        remove_version(&rejected, Some(&record.new), guard)?;
     }
+    guard()?;
     fs::remove_file(journal)?;
     Ok(restored)
+}
+
+fn require_object(
+    path: &Path,
+    expected: Option<&StableObject>,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    guard()?;
+    if object(path)?.as_ref() != expected {
+        return Err(invalid(format!("卷或版本目录已更换：{}", path.display())));
+    }
+    Ok(())
+}
+
+fn remove_version(
+    path: &Path,
+    expected: Option<&StableObject>,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    require_object(path, expected, guard)?;
+    remove_owned(path)
 }
 
 /// 调用方已取得版本写锁并恢复发布事务，可以回收该次中断留下的解压空间。
@@ -253,18 +286,20 @@ pub(super) fn install(
     mut input: &File,
     dest: &Path,
     pkg: Artifact,
-    repair: bool,
+    approved: Option<&StableObject>,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
     let scratch = stage.join("unpack");
     let backup = stage.join("previous");
-    let guard = File::open(stage.join("owner"))?.metadata()?;
+    let stage_identity = StableObject::at(stage)?;
+    check()?;
     discard_unpack(stage)?;
     if object(&backup)?.is_some() {
         return Err(invalid("无法确认原版本备份的来源"));
     }
     input.rewind()?;
     fs::create_dir(&scratch)?;
+    let scratch_identity = StableObject::at(&scratch)?;
     let result = (|| {
         if pkg.prefix.is_some() {
             unpack(input, &scratch, pkg, &check)?;
@@ -279,27 +314,32 @@ pub(super) fn install(
         let _next = crate::storage::lock_staged_version(&scratch)?;
         let old = object(dest)?;
         if old.is_some() {
-            if !repair && !super::manifest::empty_skeleton(dest, pkg)? {
+            if old.as_ref() != approved && !super::manifest::empty_skeleton(dest, pkg)? {
                 return Err(invalid("待安装版本已出现，请重新检查后确认操作"));
             }
             super::manifest::repairable(dest, pkg)?;
         }
         let record = Publish {
+            stage: stage_identity.clone(),
             old,
             new: object(&scratch)?.unwrap(),
         };
         let journal = stage.join("publish.json");
         let temp = stage.join("publish.new");
+        check()?;
         remove_owned(&temp)?;
         let mut f = File::create_new(&temp)?;
         serde_json::to_writer(&mut f, &record)?;
         f.sync_all()?;
         crate::storage::rename_exclusive(&temp, &journal)?;
-        if old.is_some() {
+        require_object(dest, record.old.as_ref(), &check)?;
+        if record.old.is_some() {
             crate::storage::rename_exclusive(dest, &backup)?;
         }
+        require_object(&scratch, Some(&record.new), &check)?;
         if let Err(e) = crate::storage::rename_exclusive(&scratch, dest) {
-            if old.is_some() && object(dest)?.is_none() {
+            if record.old.is_some() && object(dest)?.is_none() {
+                require_object(&backup, record.old.as_ref(), &check)?;
                 crate::storage::rename_exclusive(&backup, dest)?;
             }
             return Err(e);
@@ -307,24 +347,30 @@ pub(super) fn install(
         // 当前进程已持有备份（原目标）对象的独占锁，此处无需再次申请。
         if let Err(e) = super::manifest::check(home, dest, pkg, true, &check) {
             super::manifest::repairable(dest, pkg)?;
+            require_object(dest, Some(&record.new), &check)?;
             crate::storage::rename_exclusive(dest, &scratch)?;
-            if old.is_some() {
+            if record.old.is_some() {
+                require_object(&backup, record.old.as_ref(), &check)?;
                 crate::storage::rename_exclusive(&backup, dest)?;
             }
+            check()?;
             fs::remove_file(journal)?;
             return Err(e);
         }
-        if old.is_some() {
+        if record.old.is_some() {
             super::manifest::repairable(&backup, pkg)?;
-            remove_owned(&backup)?;
+            require_object(dest, Some(&record.new), &check)?;
+            remove_version(&backup, record.old.as_ref(), &check)?;
         }
+        check()?;
         fs::remove_file(journal)?;
         // 另一线程可能正在 fork 子进程，显式解锁后才向调用方报告新版本可读。
         File::unlock(&_next)
     })();
     if result.is_err()
-        && fs::symlink_metadata(stage.join("owner"))
-            .is_ok_and(|m| (m.dev(), m.ino()) == (guard.dev(), guard.ino()))
+        && check().is_ok()
+        && stage_identity.matches(stage).unwrap_or(false)
+        && scratch_identity.matches(&scratch).unwrap_or(false)
     {
         remove_owned(&scratch)?;
     }

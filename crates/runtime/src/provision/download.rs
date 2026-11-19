@@ -20,9 +20,16 @@ pub(super) fn part_len(path: &Path) -> io::Result<u64> {
     }
 }
 
-pub(super) fn fetch(shared: &Shared, pkg: Artifact, path: &Path) -> io::Result<()> {
+pub(super) fn fetch(
+    shared: &Shared,
+    pkg: Artifact,
+    path: &Path,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    guard()?;
     let mut offset = part_len(path)?;
     if offset > pkg.bytes {
+        guard()?;
         fs::remove_file(path)?;
         return Err(invalid(format!(
             "{} 的暂存文件超过预期体积，已丢弃",
@@ -30,12 +37,13 @@ pub(super) fn fetch(shared: &Shared, pkg: Artifact, path: &Path) -> io::Result<(
         )));
     }
     loop {
-        shared.check_pause()?;
+        guard()?;
         shared.progress(pkg, offset);
         if offset == pkg.bytes {
             return Ok(());
         }
-        let (status, diagnostic) = transfer(shared, pkg, path, offset)?;
+        let (status, diagnostic) = transfer(shared, pkg, path, offset, guard)?;
+        guard()?;
         if status.success() {
             if part_len(path)? == pkg.bytes {
                 return Ok(());
@@ -65,6 +73,7 @@ fn transfer(
     pkg: Artifact,
     path: &Path,
     offset: u64,
+    guard: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(ExitStatus, String)> {
     let mut part = OpenOptions::new()
         .append(true)
@@ -155,6 +164,7 @@ fn transfer(
     shared.check_pause()?;
     if let Err(e) = result {
         if e.kind() == io::ErrorKind::InvalidData {
+            guard()?;
             fs::remove_file(path)?;
         }
         return Err(e);

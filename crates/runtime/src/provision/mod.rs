@@ -51,6 +51,8 @@ pub struct Component {
     pub available_bytes: Option<u64>,
     pub writable: bool,
     pub issue: Option<String>,
+    /// 确认重装对应的版本对象或中断发布记录。
+    pub repair_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +221,7 @@ impl Provisioner {
     }
 
     pub fn repair(&self, id: &str) -> Result<(), String> {
+        self.recheck()?;
         let snapshot = self.snapshot();
         let row = snapshot
             .components
@@ -230,9 +233,22 @@ impl Provisioner {
     }
 
     pub fn repair_at(&self, id: &str, confirmed: &Path) -> Result<(), String> {
+        let row = self
+            .snapshot()
+            .rows_mut()
+            .find(|row| row.id == id)
+            .cloned()
+            .ok_or_else(|| "版本不在发布清单中".to_owned())?;
+        let token = row
+            .repair_token
+            .ok_or_else(|| "请重新检查需要修复的版本".to_owned())?;
+        self.repair_confirmed(id, confirmed, &token)
+    }
+
+    pub fn repair_confirmed(&self, id: &str, confirmed: &Path, token: &str) -> Result<(), String> {
         self.launch(
             vec![self.package(id)?],
-            Task::Repair(confirmed.into()),
+            Task::Repair(confirmed.into(), token.into()),
             None,
         )
     }
@@ -304,12 +320,15 @@ impl Provisioner {
                     fs::symlink_metadata(paths.destination(pkg))
                         .map_err(|e| format!("无法打开待核验版本：{e}"))?;
                 }
-                Task::Repair(ref confirmed) if *confirmed != paths.destination(pkg) => {
+                Task::Repair(ref confirmed, ref token)
+                    if *confirmed != paths.destination(pkg)
+                        || row.repair_token.as_ref() != Some(token) =>
+                {
                     return Err("资源位置已变化，请重新确认此版本及路径".into());
                 }
-                Task::Repair(_) if row.integrity == "damaged" => (),
-                Task::Repair(_) if row.ready => continue,
-                Task::Repair(_) => {
+                Task::Repair(..) if row.integrity == "damaged" => (),
+                Task::Repair(..) if row.ready => continue,
+                Task::Repair(..) => {
                     return Err(row.issue.unwrap_or_else(|| "此版本不能替换".into()));
                 }
                 _ if row.ready => {
@@ -333,6 +352,15 @@ impl Provisioner {
         }
         let Some(first) = selected.first() else {
             return Ok(());
+        };
+        // 用户确认时绑定目标卷，覆盖后台线程稍后启动及批量下载的后续版本。
+        let volume = if matches!(task, Task::Verify) {
+            None
+        } else {
+            Some(
+                crate::storage::volume_id(paths.installation_root(*first))
+                    .map_err(|e| e.to_string())?,
+            )
         };
         let leases = crate::storage::resource_lease(&shared.home, components, images)
             .map_err(|e| e.to_string())?;
@@ -358,7 +386,7 @@ impl Provisioner {
             .name("windroid-provision".into())
             .spawn(move || {
                 let _leases = Leases(leases);
-                worker.run(&selected, task, &paths, candidate_job);
+                worker.run(&selected, task, &paths, candidate_job, volume);
             })
         {
             state.active = false;
@@ -422,7 +450,7 @@ fn partial(stage: &Path, pkg: Artifact) -> PathBuf {
 
 enum Task {
     Missing,
-    Repair(PathBuf),
+    Repair(PathBuf, String),
     Verify,
     Import(PathBuf),
 }
@@ -438,6 +466,21 @@ fn prefix_bytes(paths: &RuntimePaths, pkg: Artifact) -> u64 {
         .ok()
         .filter(|n| *n <= pkg.bytes)
         .unwrap_or(0)
+}
+
+fn repair_token(dest: &Path, pkg: Artifact) -> io::Result<String> {
+    let stage = archive::stage_path(dest, pkg);
+    let journal = stage.join("publish.json");
+    let interrupted = archive::is_workspace(&stage) && journal.try_exists()?;
+    let identity = crate::storage::StableObject::at(if interrupted { &journal } else { dest })?;
+    Ok(serde_json::to_string(&(interrupted, identity))?)
+}
+
+fn check_repair(dest: &Path, pkg: Artifact, expected: &str) -> io::Result<()> {
+    if repair_token(dest, pkg)? != expected {
+        return Err(invalid("待修复版本或存储卷已更换，请重新检查并确认"));
+    }
+    Ok(())
 }
 
 fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
@@ -508,7 +551,13 @@ fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
     let volume = crate::storage::check_selected_volume(home, paths.installation_root(pkg))
         .and_then(|_| volume_info(location.parent().unwrap()))
         .ok();
+    let repair_token = if integrity == "damaged" {
+        repair_token(&location, pkg).ok()
+    } else {
+        None
+    };
     Component {
+        repair_token,
         id: pkg.id,
         name: pkg.name,
         version: pkg.version,
@@ -660,10 +709,17 @@ impl Shared {
         state.snapshot.current_component = Some(pkg.id);
     }
 
-    fn run(&self, packages: &[Artifact], task: Task, paths: &RuntimePaths, candidate: bool) {
+    fn run(
+        &self,
+        packages: &[Artifact],
+        task: Task,
+        paths: &RuntimePaths,
+        candidate: bool,
+        volume: Option<[u8; 16]>,
+    ) {
         let result = packages
             .iter()
-            .try_for_each(|&pkg| self.prepare(pkg, &task, paths, candidate));
+            .try_for_each(|&pkg| self.prepare(pkg, &task, paths, candidate, volume));
         let mut snap = self.scan();
         let result = result.and_then(|()| {
             let unexpected = if candidate {
@@ -736,6 +792,7 @@ impl Shared {
         task: &Task,
         paths: &RuntimePaths,
         candidate: bool,
+        volume: Option<[u8; 16]>,
     ) -> io::Result<()> {
         self.check_pause()?;
         self.phase(
@@ -768,6 +825,12 @@ impl Shared {
             )?;
         }
         let selected_volume = || {
+            if Some(crate::storage::volume_id(parent)?) != volume {
+                return Err(io::Error::new(
+                    ErrorKind::NotConnected,
+                    "目标卷已更换，请重新选择并确认",
+                ));
+            }
             if candidate {
                 crate::storage::check_volume(&dest)
             } else {
@@ -788,6 +851,10 @@ impl Shared {
         if !recovering {
             check_capacity(parent, pkg, prefix)?;
         }
+        selected_volume()?;
+        if let Task::Repair(_, expected) = task {
+            check_repair(&dest, pkg, expected)?;
+        }
         directory(paths.installation_root(pkg), parent, true)?;
         let mut leases = Leases(crate::storage::version_write_lease(&dest)?);
         let (stage, _lock) = archive::workspace(&dest, pkg)?;
@@ -796,6 +863,12 @@ impl Shared {
         // 持有的文件描述符固定原卷上的对象。强制弹出后即使同名挂载点重现，也不能继续发布。
         let guard = || {
             check()?;
+            if Some(crate::storage::volume_id(&stage)?) != volume {
+                return Err(io::Error::new(
+                    ErrorKind::NotConnected,
+                    "安装暂存所在卷已更换",
+                ));
+            }
             let current = fs::symlink_metadata(stage.join("owner"))?;
             if (owner.dev(), owner.ino()) != (current.dev(), current.ino()) {
                 return Err(io::Error::new(
@@ -807,11 +880,19 @@ impl Shared {
         };
         guard()?;
         selected_volume()?;
-        if let Some(restored) = archive::recover(&self.home, &stage, &dest, pkg)? {
+        if let Task::Repair(_, expected) = task {
+            check_repair(&dest, pkg, expected)?;
+        }
+        if stage.join("publish.json").try_exists()? && !matches!(task, Task::Repair(..)) {
+            return Err(invalid("此版本有中断的发布，请重新检查并确认恢复"));
+        }
+        if let Some(restored) = archive::recover(&self.home, &stage, &dest, pkg, &guard)? {
             leases.0.push(restored);
         }
-        if dest.try_exists()? {
+        let original = archive::object(&dest)?;
+        if original.is_some() {
             if manifest::check(&self.home, &dest, pkg, false, || self.check_pause()).is_ok() {
+                guard()?;
                 let part = partial(&stage, pkg);
                 if download::part_len(&part)? > 0 {
                     fs::remove_file(part)?;
@@ -820,7 +901,7 @@ impl Shared {
                 return Ok(());
             }
             manifest::repairable(&dest, pkg)?;
-            if !matches!(task, Task::Repair(_)) && !manifest::empty_skeleton(&dest, pkg)? {
+            if !matches!(task, Task::Repair(..)) && !manifest::empty_skeleton(&dest, pkg)? {
                 return Err(invalid(format!(
                     "{} 已损坏，请确认重新安装此版本",
                     dest.display()
@@ -828,6 +909,7 @@ impl Shared {
             }
         }
         if recovering {
+            guard()?;
             archive::discard_unpack(&stage)?;
             check_capacity(parent, pkg, prefix)?;
         }
@@ -837,7 +919,7 @@ impl Shared {
             import::capture(self, &stage, source, pkg)?
         } else {
             self.phase(pkg, "downloading");
-            download::fetch(self, pkg, &part)?;
+            download::fetch(self, pkg, &part, &guard)?;
             self.progress(pkg, pkg.bytes);
             fs::File::open(&part)?
         };
@@ -845,6 +927,7 @@ impl Shared {
         guard()?;
         if let Err(e) = check_file(&input, pkg, || self.check_pause()) {
             if !matches!(task, Task::Import(_)) && e.kind() == ErrorKind::InvalidData {
+                guard()?;
                 fs::remove_file(&part)?;
             }
             return Err(e);
@@ -853,13 +936,20 @@ impl Shared {
         // 下载、逐块解压与复制的写错误直接返回；发布前再次检查挂载，防止弹盘后落在系统盘。
         guard()?;
         selected_volume()?;
+        if archive::object(&dest)? != original {
+            return Err(invalid("待发布版本已变化，请重新检查并确认"));
+        }
         archive::install(
             &self.home,
             &stage,
             &input,
             &dest,
             pkg,
-            matches!(task, Task::Repair(_)),
+            if matches!(task, Task::Repair(..)) {
+                original.as_ref()
+            } else {
+                None
+            },
             guard,
         )?;
         guard()?;

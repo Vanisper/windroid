@@ -727,7 +727,6 @@ fn conflicts_are_preserved_and_damaged_jar_needs_explicit_repair() {
 
 #[test]
 fn interrupted_publication_restores_or_commits_only_identified_objects() {
-    use std::os::unix::fs::MetadataExt;
     let pkg = fixture(b"official", "https://example.invalid".into());
     for step in 0..5 {
         let t = Temp::new();
@@ -740,12 +739,10 @@ fn interrupted_publication_restores_or_commits_only_identified_objects() {
         let scratch = work.join("unpack");
         fs::create_dir(&scratch).unwrap();
         fs::write(scratch.join("scrcpy-server.jar"), b"official").unwrap();
-        let identity = |path: &Path| {
-            let m = fs::metadata(path).unwrap();
-            [m.dev(), m.ino()]
-        };
+        let identity = |path: &Path| crate::storage::StableObject::at(path).unwrap();
         let old = (step != 4).then(|| identity(&dest));
-        let record = serde_json::json!({"old":old,"new":identity(&scratch)});
+        let record =
+            serde_json::json!({"stage":identity(&work),"old":old,"new":identity(&scratch)});
         fs::write(
             work.join("publish.json"),
             serde_json::to_vec(&record).unwrap(),
@@ -868,4 +865,54 @@ fn candidate_download_progress_and_prefix_stay_with_the_selected_volume() {
     assert!(!ready.images[0].ready);
     assert_eq!(http.ranges.lock().unwrap().len(), 2);
     assert!(!home.0.join(windroid_locations::SETTINGS).exists());
+}
+
+#[test]
+fn replacing_a_damaged_version_invalidates_its_original_confirmation() {
+    let t = Temp::new();
+    let pkg = fixture(b"official", "https://example.invalid".into());
+    let p = controller(&t.0, pkg);
+    let dest = p.paths().destination(pkg);
+    let jar = dest.join("scrcpy-server.jar");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(&jar, b"Damaged!").unwrap();
+    p.recheck().unwrap();
+    let consent = p.snapshot().components[0].repair_token.clone().unwrap();
+    let saved = t.0.join("first-version");
+    fs::rename(&dest, &saved).unwrap();
+    fs::create_dir(&dest).unwrap();
+    fs::write(&jar, b"Damaged!").unwrap();
+    let part = stage(&t.0, pkg, b"official");
+    assert!(p.repair_confirmed(pkg.id, &dest, &consent).is_err());
+    assert_eq!(fs::read(&part).unwrap(), b"official");
+    assert_eq!(fs::read(&jar).unwrap(), b"Damaged!");
+    assert_eq!(
+        fs::read(saved.join("scrcpy-server.jar")).unwrap(),
+        b"Damaged!"
+    );
+}
+
+#[test]
+fn copied_publication_record_cannot_recover_another_stage() {
+    let t = Temp::new();
+    let pkg = fixture(b"official", "https://example.invalid".into());
+    let p = controller(&t.0, pkg);
+    let dest = p.paths().destination(pkg);
+    stage(&t.0, pkg, b"official");
+    let work = archive::stage_path(&dest, pkg);
+    let first = t.0.join("original-stage");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("scrcpy-server.jar"), b"official").unwrap();
+    let journal = work.join("publish.json");
+    let record = serde_json::json!({"stage":crate::storage::StableObject::at(&first).unwrap(),
+        "old":null,"new":crate::storage::StableObject::at(&dest).unwrap()});
+    let bytes = serde_json::to_vec(&record).unwrap();
+    fs::write(&journal, &bytes).unwrap();
+    assert!(archive::recover(&t.0, &work, &dest, pkg, &|| Ok(())).is_err());
+    assert_eq!(fs::read(journal).unwrap(), bytes);
+    assert_eq!(
+        fs::read(dest.join("scrcpy-server.jar")).unwrap(),
+        b"official"
+    );
 }
