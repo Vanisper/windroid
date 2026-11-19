@@ -14,21 +14,24 @@ pub(super) fn validate(spec: &Spec) -> io::Result<()> {
             "数据分区至少需要 6 GiB，大小必须能用有符号 64 位字节数表示",
         ));
     }
-    if spec.image.revision == 0 {
+    validate_image(&spec.image)
+}
+
+fn validate_image(image: &Image) -> io::Result<()> {
+    if image.revision == 0 {
         return Err(invalid("系统镜像需要正整数修订号"));
     }
-    if spec.image.api == 0
-        || spec.image.tag.is_empty()
-        || spec.image.tag.len() > 80
-        || !spec
-            .image
+    if image.api == 0
+        || image.tag.is_empty()
+        || image.tag.len() > 80
+        || !image
             .tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
     {
         return Err(invalid("Android 镜像标识无效"));
     }
-    abi(&spec.image)?;
+    abi(image)?;
     Ok(())
 }
 
@@ -53,9 +56,10 @@ fn abi(image: &Image) -> io::Result<(&'static str, &'static str)> {
 }
 
 pub(crate) fn image_subdir(image: &Image) -> io::Result<PathBuf> {
+    validate_image(image)?;
     Ok(PathBuf::from(format!("android-{}", image.api))
         .join(&image.tag)
-        .join(abi(image)?.0)
+        .join(&image.abi)
         .join(format!("r{}", image.revision)))
 }
 

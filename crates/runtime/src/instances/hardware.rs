@@ -28,7 +28,7 @@ pub struct InstanceConfig {
 }
 
 impl InstanceRecord {
-    /// 在挂载实例时读取一遍。单项缺失或格式不明保留为 None，旧工作区无需迁移。
+    /// 在挂载实例时读取一遍。单项缺失或格式不明保留为 None，沿用新格式实例原有的私有配置。
     pub fn config(&self, layout: &Layout) -> InstanceConfig {
         let path = data_dir(&layout.instance(&self.id), self).join("config.ini");
         let ini = read_ini(&path, None).unwrap_or_default();
@@ -157,6 +157,11 @@ fn foldable(ini: &str) -> io::Result<bool> {
 }
 
 impl InstanceStore {
+    fn selected_paths(&self) -> io::Result<RuntimePaths> {
+        let locations = crate::storage::StorageLocations::load(self.home())?;
+        Ok(RuntimePaths::for_locations(&locations))
+    }
+
     pub fn disk_limits(&self) -> io::Result<DiskLimits> {
         let path = self.home().join("instances");
         let (_, bytes, readonly) = crate::storage::volume_space(&path)?;
@@ -168,23 +173,19 @@ impl InstanceStore {
 
     // 预览仅需小元数据。实际发布在版本租约中重复检查。
     pub fn spec_limits(&self, template: &str, image: &Image) -> io::Result<SpecLimits> {
-        let paths = RuntimePaths::discover(self.home());
+        let paths = self.selected_paths()?;
         let product = specification::product_name(&paths, image)?;
         SpecLimits::for_template(HostCapacity::read()?, template, image.api, &product)
     }
 
     pub fn edit_limits(&self, record: &InstanceRecord) -> io::Result<SpecLimits> {
-        let paths = RuntimePaths::discover(self.home());
+        let paths = self.selected_paths()?;
         let (limits, _) = self.saved_profile(record, &paths, HostCapacity::read()?)?;
         Ok(limits)
     }
 
     pub fn launch_hardware(&self, record: &InstanceRecord) -> io::Result<Hardware> {
-        self.launch_hardware_at(
-            record,
-            &RuntimePaths::discover(self.home()),
-            HostCapacity::read()?,
-        )
+        self.launch_hardware_at(record, &self.selected_paths()?, HostCapacity::read()?)
     }
 
     pub fn launch_hardware_at(
