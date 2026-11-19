@@ -878,6 +878,59 @@ fn storage_reviews_each_version_and_cleanup_choice_then_restores_each_root_indep
 }
 
 #[test]
+fn restoring_a_default_through_another_spelling_uses_the_real_host_directory_identity() {
+    use runtime::storage::{StorageLocations, SwitchMode, apply, preview_switch};
+    let temp = std::env::temp_dir().join(format!("windroid-ui-root-{}", std::process::id()));
+    std::fs::create_dir(&temp).unwrap();
+    let physical = temp.join("physical");
+    std::fs::create_dir(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, temp.join("alias")).unwrap();
+    let home = temp.join("alias/workspace");
+    runtime::workspace::open(&home).unwrap();
+    let target = StorageLocations {
+        runtime_root: temp.join("custom"),
+        ..StorageLocations::defaults(&home)
+    };
+    apply(
+        &home,
+        &preview_switch(&home, &target, SwitchMode::Future, false).unwrap(),
+    )
+    .unwrap();
+    let config = config();
+    let (windows, _) = mpsc::channel();
+    let (_events, receiver) = mpsc::channel();
+    let library = host::Library::attach(
+        config.host.clone(),
+        runtime::Layout { root: home.clone() },
+        false,
+        windows,
+        receiver,
+    )
+    .unwrap();
+    let mut app = render(config);
+    wait(&mut app, "id:show-settings");
+    press(&mut app, "show-settings");
+    press(&mut app, "settings-storage");
+    press(&mut app, "reset-runtime-directory");
+    wait(&mut app, "id:storage-mode-future");
+    press(&mut app, "storage-mode-future");
+    wait(&mut app, "text:确认下载位置");
+    press(&mut app, "storage-apply");
+    wait(&mut app, "id:choose-runtime-directory");
+    gone(&mut app, "id:reset-runtime-directory");
+    gone(&mut app, "id:reset-image-directory");
+    let saved = StorageLocations::load(&home).unwrap();
+    assert_ne!(saved.runtime_root, home.join("runtime"));
+    assert!(runtime::storage::same_location(
+        &saved.runtime_root,
+        &home.join("runtime")
+    ));
+    assert_eq!(saved.image_root, home.join("system-images"));
+    library.shutdown();
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn candidate_download_preserves_the_bound_root_until_the_next_preview_is_confirmed() {
     let mut view = ready_view();
     view["storage"] = storage("/tools", "/original");
