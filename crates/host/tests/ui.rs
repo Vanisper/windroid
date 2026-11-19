@@ -1396,6 +1396,225 @@ fn recommended_template_can_be_overridden_before_creation() {
     );
 }
 
+#[test]
+fn create_rechecks_the_selected_template_and_accepts_exact_custom_units() {
+    let mut ui = Scripted::new(ready_view(), |cmd, _| {
+        assert_eq!(cmd["kind"], "createInstance");
+        assert_eq!(cmd["cpuCores"], 3);
+        assert_eq!(cmd["ramMiB"], 4097);
+        assert_eq!(cmd["diskGiB"], 11);
+        assert_eq!(cmd["gpuMode"], "batch");
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "new-instance");
+    press(&mut ui.app, "use-r34");
+    wait(&mut ui.app, "id:choose-ram >> text:/2.5 GiB/");
+    press(&mut ui.app, "choose-template");
+    choose(&mut ui.app, "4K 电视 · 3840 × 2160");
+    wait(&mut ui.app, "id:choose-ram >> text:/4 GiB/");
+    for (field, invalid, valid) in [
+        ("cpu", "0", "3"),
+        ("ram", "4095", "4097"),
+        ("disk", "41", "11"),
+    ] {
+        press(&mut ui.app, &format!("choose-{field}"));
+        choose(&mut ui.app, "自定义…");
+        let input = format!("id:custom-{field}");
+        ui.app.clear(&input).unwrap();
+        ui.app.type_text(&input, invalid).unwrap();
+        wait(&mut ui.app, "id:hardware-issue");
+        assert!(!ui.app.screen().enabled("id:create").unwrap());
+        ui.app.clear(&input).unwrap();
+        ui.app.type_text(&input, valid).unwrap();
+        gone(&mut ui.app, "id:hardware-issue");
+    }
+    press(&mut ui.app, "choose-graphics");
+    choose(&mut ui.app, "硬件加速（Vulkan 批处理）");
+    press(&mut ui.app, "create");
+    gone(&mut ui.app, "id:pending");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn late_hardware_limits_cannot_enable_a_creation_on_a_full_volume() {
+    let mut ui = Scripted::new(ready_view(), |_, _| unreachable!());
+    let (requested, replies) = mpsc::channel();
+    ui.channel.handle("windroid.hardwareLimits", move |call| {
+        requested.send(call.into_reply().unwrap()).unwrap();
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "new-instance");
+    press(&mut ui.app, "use-r34");
+    let stale = replies.recv_timeout(WAIT).unwrap();
+    press(&mut ui.app, "choose-template");
+    choose(&mut ui.app, "4K 电视 · 3840 × 2160");
+    let current = replies.recv_timeout(WAIT).unwrap();
+    let mut full = hardware_limits(&json!({"template":"tv-4k"}));
+    full["maxDiskGiB"] = json!(5);
+    full["defaultDiskGiB"] = Value::Null;
+    current.resolve(full);
+    wait(&mut ui.app, "text:/不足 6 GiB/");
+    stale.resolve(hardware_limits(&Value::Null));
+    ui.app.idle(Duration::from_millis(50)).unwrap();
+    assert!(!ui.app.screen().enabled("id:create").unwrap());
+    press(&mut ui.app, "retry-hardware");
+    let mut small = hardware_limits(&json!({"template":"tv-4k"}));
+    small["maxDiskGiB"] = json!(7);
+    small["defaultDiskGiB"] = json!(6);
+    replies.recv_timeout(WAIT).unwrap().resolve(small);
+    wait(&mut ui.app, "id:choose-disk >> text:/6 GiB/");
+    press(&mut ui.app, "choose-disk");
+    let options: Vec<_> = ui
+        .app
+        .menu()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.label)
+        .collect();
+    assert_eq!(options, ["6 GiB", "自定义…"]);
+    assert!(ui.commands.lock().unwrap().is_empty());
+}
+
+#[test]
+fn instance_settings_edit_only_after_process_exit_and_restart_the_selected_session() {
+    let mut view = ready_view();
+    view["instances"][0]["config"] = json!({
+        "template":"compact-720","image":image("r34",34,true)["image"],"cpuCores":2,"ramMiB":1536,
+        "screenWidth":1280,"screenHeight":720,"diskBytes":8589934592_u64,"graphics":"host"
+    });
+    view["instances"][0]["state"] = json!("failed");
+    view["instances"][0]["processAlive"] = json!(true);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd["instanceId"], "a");
+        match cmd["kind"].as_str() {
+            Some("updateHardware") => {
+                assert_eq!(
+                    cmd,
+                    &json!({"kind":"updateHardware","instanceId":"a","cpuCores":4,"ramMiB":1536,"gpuMode":"software"})
+                );
+                view["instances"][0]["config"]["cpuCores"] = cmd["cpuCores"].clone();
+                view["instances"][0]["config"]["graphics"] = cmd["gpuMode"].clone();
+            }
+            Some("coldRestart") => {
+                view["state"] = json!("ready");
+                view["instances"][0]["state"] = json!("ready");
+                view["instances"][0]["processAlive"] = json!(true);
+                view["instances"][0]["observed"] = json!({"cpuCores":4,"ramMiB":2560});
+                view["capabilities"] = json!({"launchApp":true,"stop":true});
+            }
+            Some("restart") => {
+                return json!({"status":"rejected","reason":{"kind":"error","detail":"本机内存压力过高"}});
+            }
+            other => panic!("意外命令 {other:?}"),
+        }
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "all-instances");
+    press(&mut ui.app, "manage-a");
+    gone(&mut ui.app, "id:edit-hardware");
+    ui.update(|v| {
+        v["state"] = json!("stopped");
+        v["instances"][0]["state"] = json!("stopped");
+        v["instances"][0]["processAlive"] = json!(false);
+        v["capabilities"] = json!({"start":true});
+    });
+    wait(&mut ui.app, "id:edit-hardware");
+    press(&mut ui.app, "edit-hardware");
+    wait(&mut ui.app, "id:hardware-editor >> text:/保留原设/");
+    gone(&mut ui.app, "id:choose-disk");
+    press(&mut ui.app, "choose-cpu");
+    choose(&mut ui.app, "4 核");
+    press(&mut ui.app, "choose-graphics");
+    choose(&mut ui.app, "软件渲染");
+    press(&mut ui.app, "save-hardware");
+    gone(&mut ui.app, "id:hardware-editor");
+    wait(&mut ui.app, "text:图形渲染 · 软件渲染");
+    press(&mut ui.app, "manage-more");
+    gone(&mut ui.app, "id:restart-instance");
+    press(&mut ui.app, "cold-restart");
+    press(&mut ui.app, "confirm-action");
+    wait(&mut ui.app, "text:观测到的 CPU · 4 核     内存 · 2560 MiB");
+    gone(&mut ui.app, "id:edit-hardware");
+    press(&mut ui.app, "restart-instance");
+    press(&mut ui.app, "confirm-action");
+    wait(&mut ui.app, "text:/本机内存压力过高/");
+    wait(&mut ui.app, "id:stop");
+    press(&mut ui.app, "manage-back");
+    wait(&mut ui.app, "id:row-a >> text:4 核");
+    wait(&mut ui.app, "id:row-a >> text:1536 MiB");
+    assert_eq!(ui.commands.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn spec_controls_remain_reachable_in_the_scroll_view_at_both_window_sizes() {
+    fn reach(app: &mut Headless, width: f32, height: f32, ids: &[&str]) {
+        for id in ids {
+            let before = bounds(app, id);
+            if before.top().0 < 0.0 || before.bottom().0 > height {
+                let distance = before.top().0 - height / 2.0;
+                app.scroll("id:workspace-scroll", Points(distance)).unwrap();
+            }
+            let control = bounds(app, id);
+            assert!(
+                control.top().0 >= 0.0 && control.bottom().0 <= height,
+                "{id}: {control:?}"
+            );
+            assert!(
+                control.left().0 >= 0.0 && control.right().0 <= width,
+                "{id}: {control:?}"
+            );
+        }
+    }
+    for (width, height) in [(1024.0, 720.0), (480.0, 520.0)] {
+        let mut view = ready_view();
+        view["instances"][0]["state"] = json!("stopped");
+        view["instances"][0]["config"] = json!({"cpuCores":3,"ramMiB":3136,"graphics":"host"});
+        let mut ui = Scripted::new(view, |_, _| unreachable!());
+        wait(&mut ui.app, "id:library");
+        ui.app
+            .set_viewport(Size::new(Points(width), Points(height)))
+            .unwrap();
+        press(&mut ui.app, "new-instance");
+        press(&mut ui.app, "use-r34");
+        wait(&mut ui.app, "id:hardware-fields");
+        reach(
+            &mut ui.app,
+            width,
+            height,
+            &[
+                "instance-name",
+                "choose-template",
+                "change-image",
+                "choose-cpu",
+                "choose-ram",
+                "choose-graphics",
+                "choose-disk",
+                "create",
+                "cancel-create",
+            ],
+        );
+        press(&mut ui.app, "cancel-create");
+        press(&mut ui.app, "manage-a");
+        reach(&mut ui.app, width, height, &["edit-hardware"]);
+        press(&mut ui.app, "edit-hardware");
+        wait(&mut ui.app, "id:hardware-fields");
+        reach(
+            &mut ui.app,
+            width,
+            height,
+            &[
+                "choose-cpu",
+                "choose-ram",
+                "choose-graphics",
+                "save-hardware",
+                "cancel-hardware",
+            ],
+        );
+    }
+}
+
 /// HOME 清单晚于库首帧到达；一次进入应用库即可选择只声明 HOME 的包。
 #[test]
 fn home_picker_tracks_late_candidates_and_instance_changes_in_place() {

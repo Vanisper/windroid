@@ -43,8 +43,11 @@ export function CreateInstance(props: { skip?: () => void }) {
       report("所选镜像缺少修订号，请重新检查发布清单。", true);
       return;
     }
-    if (await send({ kind: "createInstance", name: name().trim(), template: template().id, imageId: selectedImage.id, image: selectedImage.image,
-      ...hardware.values(), diskGiB: hardware.disk.amount() }, "创建实例") && mounted) navigate("library");
+    const created = await send({ kind: "createInstance", name: name().trim(), template: template().id, imageId: selectedImage.id, image: selectedImage.image,
+      ...hardware.values(), diskGiB: hardware.disk.amount() }, "创建实例");
+    if (!mounted) return;
+    if (created) navigate("library");
+    else limits.retry();
   }
   const chooseTemplate = () => Menu.popup(templates.map(t => ({ label: t.name + " · " + t.dimensions, checked: template().id === t.id, onSelect: () => template.set(t) })))
     .catch(e => report("无法显示设备模板 · " + String(e), true));

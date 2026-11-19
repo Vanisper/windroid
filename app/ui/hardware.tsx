@@ -121,7 +121,7 @@ export function HardwareFields(props: { draft: ReturnType<typeof hardwareDraft> 
       </View> : null}
     </View>}</If>
     {draft.issue() ? <Text testID="hardware-issue" role="alert" style={{ fontSize: 13, color: colors().warn }}>{draft.issue()}</Text> : null}
-    {draft.query.error() || (!draft.saved && limits() && limits()!.defaultDiskGiB === null) ?
+    {draft.query.error() || (!draft.saved && limits() && draft.issue()) ?
       <Button id="retry-hardware" label="重新读取规格" press={draft.query.retry} /> : null}
   </View>;
 }

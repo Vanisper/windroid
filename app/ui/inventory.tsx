@@ -1,7 +1,8 @@
-import { computed, signal, Text, View, windowSize } from "nsh";
-import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
+import { computed, effect, signal, Text, View, windowSize } from "nsh";
+import { Button, card, colors, confirmation, Detail, Heading, row, Title } from "./controls";
+import { HardwareFields, hardwareDraft, hardwareLimits, rendererName } from "./hardware";
 import { DeviceControls } from "./library";
-import { activeTransfer, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
+import { activeTransfer, busy, can, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, send, snapshot, startCreation, switching, type Instance, type InstanceConfig } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -14,7 +15,7 @@ function specs(item?: Instance | null) {
   return [
     { label: "CPU", value: cores(c?.cpuCores) },
     { label: "内存", value: memory(c?.ramMiB) },
-    { label: "主屏尺寸", value: c?.screenWidth && c.screenHeight ? c.screenWidth + " × " + c.screenHeight : unknown },
+    { label: "分辨率", value: c?.screenWidth && c.screenHeight ? c.screenWidth + " × " + c.screenHeight : unknown },
     { label: "用户空间", value: c?.diskBytes == null ? unknown : memory(c.diskBytes / 1024 ** 2) },
   ];
 }
@@ -76,9 +77,49 @@ export function Inventory() {
   </View>;
 }
 
+function canEdit(item?: Instance | null) {
+  return !!item && !item.processAlive && (item.state === "stopped" || item.state === "failed");
+}
+
+function EditHardware(props: {
+  id: string; config: InstanceConfig; query: ReturnType<typeof hardwareLimits>; close: () => void;
+}) {
+  const id = props.id;
+  const draft = hardwareDraft(props.query, props.config);
+  async function save() {
+    if (busy() || draft.issue() || id !== selected()?.id || !canEdit(selected())) return;
+    if (await send({ kind: "updateHardware", instanceId: id, ...draft.values() }, "保存硬件规格")) props.close();
+  }
+  return <View testID="hardware-editor" style={{ gap: 12 }}>
+    <HardwareFields draft={draft} />
+    <Detail text="修改将在下次启动时生效。硬件变更后会跳过原快照，保留应用和文件。" />
+    <View style={row}>
+      <Button id="save-hardware" label="保存硬件规格" primary disabled={busy() || !!draft.issue()} press={save} />
+      <Button id="cancel-hardware" label="取消" disabled={busy()} press={props.close} />
+    </View>
+  </View>;
+}
+
 export function ManageInstance() {
   const more = signal(false);
   const config = computed(() => selected()?.config);
+  const editId = signal<string | null>(null);
+  const limits = hardwareLimits(() => selected()?.config ? { instanceId: selected()!.id } : null);
+  const expectedRam = computed(() => {
+    const ram = config()?.ramMiB, floor = limits.limits()?.minRamMiB;
+    return ram && floor ? Math.max(ram, floor) : null;
+  });
+  const editing = computed(() => editId() !== null && editId() === selected()?.id && canEdit(selected()));
+  effect(() => { if (editId() && !editing()) editId.set(null); });
+  const restartable = computed(() => can("launchApp") || selected()?.state === "stalled");
+  function confirmRestart(cold: boolean) {
+    const item = selected();
+    if (!item || (!restartable() && !(cold && can("start")))) return;
+    const label = cold ? "冷启动" : "重新启动";
+    confirmation.set({ id: item.id, title: label + "「" + item.name + "」？", label,
+      detail: cold ? "将跳过快照启动，保留已安装的应用和文件。" : "将结束当前会话，再启动此实例。",
+      action: () => { void send({ kind: cold ? "coldRestart" : "restart", instanceId: item.id }, label); } });
+  }
   const logPath = computed(() => {
     const home = snapshot()?.storage?.home;
     return home && selected() ? home + "/instances/" + selected()!.id + "/emulator.log" : null;
@@ -92,16 +133,24 @@ export function ManageInstance() {
       <Detail text={"设备模板 · " + (config()?.template ?? unknown)} />
       <Detail text={"系统镜像 · " + (config()?.image ? describeImage(config()!.image) : unknown)} />
       <Each of={specs(selected())} key={s => s.label}>{s => <Detail text={s().label + " · " + s().value} />}</Each>
-      <Detail text="自定义硬件配置将在后续版本提供。" />
+      <Detail text={"图形渲染 · " + rendererName(config()?.graphics)} />
+      {editing() && config() ? <EditHardware id={selected()!.id} config={config()!} query={limits} close={() => editId.set(null)} /> :
+        canEdit(selected()) && config() ? <Button id="edit-hardware" label="调整硬件…" disabled={busy()} press={() => editId.set(selected()!.id)} /> :
+        <Detail text={canEdit(selected()) ? "实例配置暂不可读取。" : "停止实例后可调整 CPU、内存和图形渲染。"} />}
     </View>
     <View style={card()}>
       <Heading text="本次运行" />
+      {expectedRam() !== null ? <Detail text={"按当前配置预计分配内存 · " + memory(expectedRam())} /> : null}
       <Detail text={"观测到的 CPU · " + cores(observed()?.cpuCores) + "     内存 · " + memory(observed()?.ramMiB)} />
       {!environmentReady() ? <Button id="manage-environment" label="准备运行环境" press={() => navigate("environment")} /> : null}
     </View>
     <DeviceControls />
     <Button id="manage-more" label={more() ? "收起更多" : "更多"} press={() => more.set(!more())} />
     {more() ? <View style={card()}>
+      <View style={row}>
+        {restartable() ? <Button id="restart-instance" label="重新启动…" disabled={busy() || !environmentReady()} press={() => confirmRestart(false)} /> : null}
+        {restartable() || can("start") ? <Button id="cold-restart" label="冷启动…" disabled={busy() || !environmentReady()} press={() => confirmRestart(true)} /> : null}
+      </View>
       <Heading text="模拟器日志" />
       {logPath() ? <Text style={{ userSelect: "text", fontSize: 13, color: colors().ink }}>{logPath()}</Text> : null}
       <Detail text="启动模拟器时会写入本次输出。按日期和启动记录浏览历史将在后续版本提供。" />
