@@ -1,0 +1,259 @@
+//! 本机同一登录用户的启动预留。申请端口、核数和客户机内存在同一把锁内完成。
+//! 每个活动端口的文件锁由启动者及模拟器继承；异常退出无需清理持久计数器。
+
+mod observation;
+pub use observation::{MemoryObservation, MemoryPressure};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// 交叠的启动往往尚未体现在内核 VM 计数中。在这个短窗口内同时遵守先前观测的余额。
+// XNU host_statistics 会在一秒窗口内复用页计数。每次仍检查当前压力，再额外保留一次
+// 采样窗口覆盖进程进入 QEMU 的时间；两秒不是虚拟机内存实际全部常驻的保证。
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/host.c
+const SAMPLE_LIFETIME_NS: u64 = 2_000_000_000;
+
+#[derive(Clone)]
+pub struct Admission {
+    directory: PathBuf,
+    observe: Arc<dyn Fn() -> io::Result<MemoryObservation> + Send + Sync>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        // WINDROID_HOME、TMPDIR 和工具的 Android 环境都可按实例不同。
+        // uid 与内核端口命名空间用于跨独立打开的工作区共享活动额度。
+        let directory = Path::new("/tmp").join(format!("windroid-admission-v1-{}", unsafe {
+            libc::geteuid()
+        }));
+        Self::new(directory, observation::read)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct Demand {
+    pub cores: u32,
+    pub ram_mib: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Budget {
+    pub logical_cores: u32,
+    pub physical_mib: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Grant {
+    port: u16,
+    since: u64,
+    demand: Demand,
+    sample: MemoryObservation,
+}
+
+pub(crate) struct Reservation {
+    pub file: File,
+    grant: Grant,
+}
+
+impl Admission {
+    /// 隔离测试可提供自己的锁目录及按单调时钟标记的宿主观测。
+    pub fn new(
+        directory: PathBuf,
+        observe: impl Fn() -> io::Result<MemoryObservation> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            directory,
+            observe: Arc::new(observe),
+        }
+    }
+
+    fn lock(&self) -> io::Result<File> {
+        match fs::DirBuilder::new().mode(0o700).create(&self.directory) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+            other => other?,
+        }
+        let meta = fs::symlink_metadata(&self.directory)?;
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("启动资源预留目录需要当前用户的私有目录"));
+        }
+        let guard = lock_file(&self.directory.join("lock"))?;
+        guard.lock()?;
+        Ok(guard)
+    }
+
+    fn grants(&self) -> io::Result<Vec<Grant>> {
+        let mut active = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let Some(port) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u16>().ok())
+            else {
+                continue;
+            };
+            let file = lock_file(&entry.path())?;
+            match file.try_lock() {
+                Ok(()) => continue, // 上次进程已退出，其旧记录不占额度。
+                Err(std::fs::TryLockError::WouldBlock) => (),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+            let grant: Grant = serde_json::from_reader(file.take(4096))
+                .map_err(|e| io::Error::other(format!("无法确认端口 {port} 的活动预留：{e}")))?;
+            if grant.port != port || grant.demand.cores == 0 || grant.demand.ram_mib == 0 {
+                return Err(io::Error::other(format!("端口 {port} 的活动资源记录无效")));
+            }
+            active.push(grant);
+        }
+        Ok(active)
+    }
+
+    fn sample(&self) -> io::Result<MemoryObservation> {
+        let read = || {
+            let sample = (self.observe)()?;
+            if !sample.is_fresh(observation::now()?) {
+                return Err(io::Error::other("观测已过期"));
+            }
+            Ok(sample)
+        };
+        read().or_else(|_| read()).map_err(|e| {
+            io::Error::other(format!("无法确认宿主当前的内存余量或压力，请重试（{e}）"))
+        })
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        port: u16,
+        demand: Demand,
+        budget: Budget,
+    ) -> io::Result<Reservation> {
+        let _guard = self.lock()?;
+        let grants = self.grants()?;
+        if grants.iter().any(|g| g.port == port) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("端口 {port} 已被另一次启动预留"),
+            ));
+        }
+        let sample = self.sample()?;
+        let since = observation::now()?;
+        check(&grants, None, demand, budget, sample, since)?;
+        let grant = Grant {
+            port,
+            since,
+            demand,
+            sample,
+        };
+        let mut file = lock_file(&self.directory.join(port.to_string()))?;
+        file.try_lock().map_err(io::Error::from)?;
+        file.set_len(0)?;
+        serde_json::to_writer(&mut file, &grant)?;
+        file.flush()?;
+        Ok(Reservation { file, grant })
+    }
+
+    pub(crate) fn check_replacement(
+        &self,
+        current: &Reservation,
+        demand: Demand,
+        budget: Budget,
+    ) -> io::Result<()> {
+        let _guard = self.lock()?;
+        let grants = self.grants()?;
+        if !grants
+            .iter()
+            .any(|g| g.port == current.grant.port && g.since == current.grant.since)
+        {
+            return Err(io::Error::other("无法确认本次模拟器的活动预留"));
+        }
+        check(
+            &grants,
+            Some(current.grant),
+            demand,
+            budget,
+            self.sample()?,
+            observation::now()?,
+        )
+    }
+}
+
+fn lock_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::other("无法确认启动资源预留文件"));
+    }
+    Ok(file)
+}
+
+fn check(
+    grants: &[Grant],
+    replaced: Option<Grant>,
+    demand: Demand,
+    budget: Budget,
+    sample: MemoryObservation,
+    now: u64,
+) -> io::Result<()> {
+    if sample.pressure == MemoryPressure::Critical {
+        return Err(io::Error::other("本机内存压力过高，请稍后重新启动实例"));
+    }
+    let others = grants
+        .iter()
+        .filter(|g| Some(g.port) != replaced.map(|r| r.port));
+    let used_cores: u64 = others.clone().map(|g| u64::from(g.demand.cores)).sum();
+    let free_cores = u64::from(budget.logical_cores).saturating_sub(used_cores);
+    if u64::from(demand.cores) > free_cores {
+        return Err(io::Error::other(format!(
+            "启动需要 {} 核，本机当前可分配 {free_cores} 核",
+            demand.cores
+        )));
+    }
+    let used_mib: u64 = others.clone().map(|g| u64::from(g.demand.ram_mib)).sum();
+    let free_mib = (budget.physical_mib / 2).saturating_sub(used_mib);
+    if u64::from(demand.ram_mib) > free_mib {
+        return Err(io::Error::other(format!(
+            "启动需要 {} MiB，客户机内存共享额度剩余 {free_mib} MiB",
+            demand.ram_mib
+        )));
+    }
+    // 逐笔对照采样时刻。已存在的 VM 占用已反映在系统页数中；旧 VM 退出不能抵消
+    // 采样后另一个 VM 的新增申请。重启只可使用自己将释放的容量。
+    let mut available = u64::MAX;
+    for s in
+        std::iter::once(sample).chain(grants.iter().map(|g| g.sample).filter(|s| s.is_fresh(now)))
+    {
+        let new_mib: u64 = others
+            .clone()
+            .filter(|g| g.since >= s.sampled_at)
+            .map(|g| u64::from(g.demand.ram_mib))
+            .sum();
+        let released = replaced
+            .filter(|g| g.since < s.sampled_at)
+            .map_or(0, |g| u64::from(g.demand.ram_mib));
+        available = available.min(
+            s.additional_mib
+                .saturating_add(released)
+                .saturating_sub(new_mib),
+        );
+    }
+    if u64::from(demand.ram_mib) > available {
+        return Err(io::Error::other(format!(
+            "启动需要 {} MiB，宿主当前预计可分配 {available} MiB",
+            demand.ram_mib
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

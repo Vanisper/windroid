@@ -6,6 +6,7 @@
 //! 分工：本 crate 认识 emulator 与 adb 的调用方式；[adb] 只负责发命令与取输出。
 //! 状态推导不在这里——那是设备域的事。
 
+pub mod admission;
 pub mod catalog;
 pub mod install;
 pub mod instances;
