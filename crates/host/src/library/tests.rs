@@ -631,15 +631,20 @@ fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
 }
 
 fn temporary_workspace() -> Layout {
-    use std::{fs, time::SystemTime};
-    let token = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root =
-        std::env::temp_dir().join(format!("windroid-workspace-{}-{token}", std::process::id()));
-    fs::create_dir(&root).unwrap();
-    Layout { root }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "windroid-workspace-{}-{serial}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&root) {
+            Ok(()) => return Layout { root },
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("无法创建测试工作区 {}：{e}", root.display()),
+        }
+    }
 }
 
 fn stored_spec() -> contract::Spec {
