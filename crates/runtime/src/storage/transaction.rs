@@ -2,6 +2,7 @@ use super::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(test)]
 use windroid_locations::SETTINGS;
 
 const JOURNAL: &str = ".storage-migration-v2.json";
@@ -27,6 +28,8 @@ struct Journal {
     nonce: String,
     before: StorageLocations,
     after: StorageLocations,
+    source_mounts: mounts::Mounts,
+    target_mounts: mounts::Mounts,
     entries: Vec<Entry>,
 }
 
@@ -91,6 +94,25 @@ fn write_record(path: &Path, journal: &Journal) -> io::Result<()> {
         },
     )
 }
+fn write_settings(
+    home: &Path,
+    settings: &StorageLocations,
+    mounts: &mounts::Mounts,
+) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct Selection<'a> {
+        #[serde(flatten)]
+        roots: &'a StorageLocations,
+        mounts: &'a mounts::Mounts,
+    }
+    write_json(
+        &home.join(windroid_locations::SETTINGS),
+        &Selection {
+            roots: settings,
+            mounts,
+        },
+    )
+}
 fn ledger_paths(home: &Path) -> io::Result<Vec<PathBuf>> {
     let root = home.join(CLEANUP);
     let Some(meta) = metadata(&root)? else {
@@ -126,7 +148,10 @@ fn check_record(home: &Path, journal: &Journal) -> io::Result<()> {
     {
         return Err(invalid("无法确认存储事务的格式或所属工作区"));
     }
+    journal.source_mounts.validate()?;
+    journal.target_mounts.validate()?;
     let ids = RuntimePaths::managed_packages(&journal.after);
+    let sources = RuntimePaths::managed_packages(&journal.before);
     let mut seen = std::collections::BTreeSet::new();
     for root in [
         &journal.after.runtime_root,
@@ -137,10 +162,11 @@ fn check_record(home: &Path, journal: &Journal) -> io::Result<()> {
         safe_root(&journal.workspace, root)?;
     }
     for entry in &journal.entries {
+        let valid_version = ids.iter().zip(&sources).any(|(dst, src)| {
+            dst.id() == entry.id && src.path != dst.path && dst.content_digest() == entry.digest
+        });
         if !seen.insert(&entry.id)
-            || !ids
-                .iter()
-                .any(|pkg| pkg.id() == entry.id && pkg.content_digest() == entry.digest)
+            || !valid_version
             || entry.digest.len() != 64
             || !entry.digest.bytes().all(|b| b.is_ascii_hexdigit())
             || !entry.copy && entry.created.is_some()
@@ -153,6 +179,7 @@ fn check_record(home: &Path, journal: &Journal) -> io::Result<()> {
 
 /// 工作区格式门禁可调用此函数。只读事务小文件，不访问外部卷、版本内容或用户盘。
 pub fn validate_journal(home: &Path) -> io::Result<()> {
+    mounts::load(home)?;
     let mut records = ledger_paths(home)?;
     let primary = home.join(JOURNAL);
     if metadata(&primary)?.is_some() {
@@ -189,7 +216,7 @@ fn sibling(target: &Path, nonce: &str, phase: &str) -> PathBuf {
     ))
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+pub(super) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     if meta.is_dir() {
         fs::create_dir(dst)?;
@@ -230,6 +257,9 @@ fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Re
         }
         let src = old.iter().find(|pkg| pkg.id() == entry.id).unwrap();
         let dst = new.iter().find(|pkg| pkg.id() == entry.id).unwrap();
+        journal
+            .target_mounts
+            .check(&dst.path, dst.image().is_some())?;
         let stage = sibling(&dst.path, &journal.nonce, "new");
         copy_tree(&src.path, &stage)?;
         leases.push(lock_staged_version(&stage)?);
@@ -245,6 +275,9 @@ fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Re
             continue;
         }
         let dst = new.iter().find(|pkg| pkg.id() == entry.id).unwrap();
+        journal
+            .target_mounts
+            .check(&dst.path, dst.image().is_some())?;
         if metadata(&dst.path)?.is_some() {
             if !dst.empty_skeleton(&dst.path)? {
                 return Err(invalid(format!(
@@ -257,7 +290,7 @@ fn publish(home: &Path, journal: &mut Journal, leases: &mut Vec<File>) -> io::Re
         rename_exclusive(&sibling(&dst.path, &journal.nonce, "new"), &dst.path)?;
         File::open(dst.path.parent().unwrap())?.sync_all()?;
     }
-    write_json(&home.join(SETTINGS), &journal.after)
+    write_settings(home, &journal.after, &journal.target_mounts)
 }
 
 fn settle(home: &Path, journal: &Journal, locked: bool) -> io::Result<()> {
@@ -292,9 +325,15 @@ fn settle_files(
     let new = RuntimePaths::managed_packages(&journal.after);
     for entry in journal.entries.iter().filter(|entry| entry.copy) {
         let dst = new.iter().find(|pkg| pkg.id() == entry.id).unwrap();
+        check_version_path(
+            version_root(&journal.after, dst.image().is_some()),
+            &dst.path,
+        )?;
         let stage = sibling(&dst.path, &journal.nonce, "new");
         let backup = sibling(&dst.path, &journal.nonce, "empty");
-        check_volume(&dst.path)?;
+        journal
+            .target_mounts
+            .check(&dst.path, dst.image().is_some())?;
         let _lease = if locked {
             vec![]
         } else {
@@ -367,7 +406,29 @@ fn retry_cleanup(home: &Path) -> io::Result<()> {
                 entry.cleanup = false;
                 continue;
             }
-            if check_volume(&src.path).is_err() || check_volume(&dst.path).is_err() {
+            if record
+                .source_mounts
+                .check(&src.path, src.image().is_some())
+                .is_err()
+                || record
+                    .target_mounts
+                    .check(&dst.path, dst.image().is_some())
+                    .is_err()
+            {
+                continue;
+            }
+            if check_version_path(
+                version_root(&record.before, src.image().is_some()),
+                &src.path,
+            )
+            .is_err()
+                || check_version_path(
+                    version_root(&record.after, dst.image().is_some()),
+                    &dst.path,
+                )
+                .is_err()
+            {
+                entry.retained = Some("版本目录所在路径已变化".into());
                 continue;
             }
             let Ok(_target) = version_read_lease(&dst.path) else {
@@ -481,8 +542,28 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
         return Err(invalid(confirmed.blockers.join("；")));
     }
     let _work = locks::workspace_locks(home, confirmed.changed_roots(), true)?;
+    let changed = confirmed.changed_roots();
+    if changed.0 {
+        confirmed
+            .target_mounts
+            .check(&confirmed.after.runtime_root, false)?;
+    }
+    if changed.1 {
+        confirmed
+            .target_mounts
+            .check(&confirmed.after.image_root, true)?;
+    }
     let mut leases = Vec::new();
+    let destinations = RuntimePaths::managed_packages(&confirmed.after);
     for row in &confirmed.versions {
+        let dst = destinations
+            .iter()
+            .find(|p| p.id() == row.id)
+            .ok_or_else(|| invalid("版本已不在清单中，请重新预览"))?;
+        check_version_path(
+            version_root(&confirmed.after, dst.image().is_some()),
+            &row.target,
+        )?;
         match row.status {
             VersionStatus::Copy => {
                 leases.push(version_read_lease(&row.source)?);
@@ -494,6 +575,7 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
     }
     let plan = preview_switch(home, &confirmed.after, confirmed.mode, confirmed.cleanup)?;
     if plan.before != confirmed.before
+        || plan.target_mounts != confirmed.target_mounts
         || plan.versions.len() != confirmed.versions.len()
         || plan.versions.iter().zip(&confirmed.versions).any(|(a, b)| {
             a.id != b.id
@@ -517,6 +599,8 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
         nonce: crate::instances::nonce()?,
         before: plan.before,
         after: plan.after,
+        source_mounts: plan.source_mounts,
+        target_mounts: plan.target_mounts,
         entries: plan
             .versions
             .into_iter()
@@ -532,11 +616,15 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
             .collect(),
     };
     if journal.entries.is_empty() {
-        return write_json(&home.join(SETTINGS), &journal.after);
+        return write_settings(home, &journal.after, &journal.target_mounts);
     }
     write_record(&home.join(JOURNAL), &journal)?;
     let result = publish(home, &mut journal, &mut leases);
     settle(home, &journal, true)?;
+    // 其他线程 fork 后可能暂时继承这些 CLOEXEC 描述符。显式释放后再尝试源清理。
+    for lease in &leases {
+        lease.unlock()?;
+    }
     drop(leases);
     retry_cleanup(home)?;
     result
@@ -573,6 +661,8 @@ mod tests {
             workspace: home.into(),
             before: StorageLocations::defaults(home),
             after,
+            source_mounts: mounts::Mounts::default(),
+            target_mounts: mounts::Mounts::default(),
             entries: vec![Entry {
                 id: src.id().into(),
                 digest: src.content_digest(),
@@ -591,6 +681,12 @@ mod tests {
             runtime_root: home.0.join("target"),
             ..StorageLocations::defaults(&home.0)
         };
+        let settings = home.0.join(SETTINGS);
+        let mut damaged = serde_json::to_value(&target).unwrap();
+        damaged["mounts"] = serde_json::json!({"runtime":"../invalid"});
+        write_json(&settings, &damaged).unwrap();
+        assert!(validate_journal(&home.0).is_err());
+        fs::remove_file(settings).unwrap();
         let original = journal(&home.0, target.clone(), true);
         let primary = home.0.join(JOURNAL);
         write_record(&primary, &original).unwrap();

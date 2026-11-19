@@ -221,6 +221,15 @@ fn official_jar_round_trip_reuses_content_and_defers_busy_cleanup() {
         runtime_root: target.0.join("arbitrary-name"),
         ..original.clone()
     };
+    let existing = RuntimePaths::managed_packages(&original)
+        .into_iter()
+        .find(|p| p.id() == "platform-tools")
+        .unwrap();
+    let platform = existing.path.strip_prefix(&original.runtime_root).unwrap();
+    for root in [&original.runtime_root, &alternate.runtime_root] {
+        fs::create_dir_all(root.join(platform).parent().unwrap()).unwrap();
+        transaction::copy_tree(&tools.join(platform), &root.join(platform)).unwrap();
+    }
     let jar = Path::new("scrcpy-server/5.0.1");
     fs::create_dir_all(alternate.runtime_root.join(jar)).unwrap();
     let p = preview(&home, &alternate).unwrap();
@@ -232,8 +241,40 @@ fn official_jar_round_trip_reuses_content_and_defers_busy_cleanup() {
         1
     );
     assert!(p.available_bytes.is_some_and(|n| n >= p.required_bytes));
+    assert!(
+        p.versions
+            .iter()
+            .any(|v| v.id == "platform-tools" && v.status == VersionStatus::Reuse)
+    );
     apply(&home, &p).unwrap();
     assert!(original.runtime_root.join(jar).is_dir() && alternate.runtime_root.join(jar).is_dir());
+    let published = alternate.runtime_root.join(jar).join("scrcpy-server.jar");
+    assert!(p.required_bytes >= fs::metadata(&published).unwrap().blocks() * 512);
+    eprintln!(
+        "跨卷复制预估 {} 字节，已发布 JAR 分配 {} 字节",
+        p.required_bytes,
+        fs::metadata(&published).unwrap().blocks() * 512
+    );
+    let restored = original.runtime_root.join(jar).join("scrcpy-server.jar");
+    let mut bytes = fs::read(&restored).unwrap();
+    let modified = fs::metadata(&restored).unwrap().modified().unwrap();
+    bytes[0] ^= 1;
+    fs::write(&restored, &bytes).unwrap();
+    fs::File::open(&restored)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let conflict = preview_switch(&home, &original, SwitchMode::Migrate, true).unwrap();
+    assert!(
+        conflict
+            .versions
+            .iter()
+            .any(|v| v.id == "scrcpy-server" && v.status == VersionStatus::Conflict)
+    );
+    assert!(apply(&home, &conflict).is_err());
+    assert_eq!(fs::read(&restored).unwrap(), bytes);
+    assert_eq!(StorageLocations::load(&home).unwrap(), alternate);
+    fs::copy(&published, &restored).unwrap();
     let reader = version_read_lease(&alternate.runtime_root.join(jar)).unwrap();
     let back = preview_switch(&home, &original, SwitchMode::Migrate, true).unwrap();
     assert_eq!(back.required_bytes, 0);
@@ -279,4 +320,47 @@ fn attaches_complete_read_only_components_with_offline_source() {
     assert_eq!(plan.required_bytes, 0);
     apply(&home.0, &plan).unwrap();
     assert_eq!(StorageLocations::load(&home.0).unwrap(), after);
+    let testhome = Temp::new();
+    let readonly = preview_switch(
+        &testhome.0,
+        &StorageLocations {
+            runtime_root: after.runtime_root,
+            ..StorageLocations::defaults(&testhome.0)
+        },
+        SwitchMode::Future,
+        false,
+    )
+    .unwrap();
+    assert!(readonly.blockers.iter().any(|issue| issue.contains("只读")));
+}
+
+/// 分两次执行，期间使用 hdiutil 卸载实际卷，在相同路径留下宿主卷上的空目录。
+#[test]
+#[ignore = "set WINDROID_TEST_LIFETIME_HOME and WINDROID_TEST_MOUNT_ROOT; run with mounted, then detached volume"]
+fn selected_custom_mount_cannot_fall_back_to_host_volume() {
+    let home = PathBuf::from(std::env::var_os("WINDROID_TEST_LIFETIME_HOME").unwrap());
+    let root = PathBuf::from(std::env::var_os("WINDROID_TEST_MOUNT_ROOT").unwrap());
+    if !home.join(windroid_locations::SETTINGS).exists() {
+        let new = StorageLocations {
+            runtime_root: root.join("empty-future-tools"),
+            ..StorageLocations::defaults(&home)
+        };
+        future(&home, &new);
+        assert_eq!(
+            mounts::load(&home).unwrap().runtime.as_deref(),
+            Some(root.as_path())
+        );
+        check_selected_volume(&home, &new.runtime_root).unwrap();
+        return;
+    }
+    let saved = StorageLocations::load(&home).unwrap();
+    assert!(root.is_dir());
+    assert_ne!(mounts::at(&root).unwrap(), root);
+    assert_eq!(
+        check_selected_volume(&home, &saved.runtime_root)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotConnected
+    );
+    assert!(!saved.runtime_root.exists());
 }

@@ -1,5 +1,7 @@
 //! 两个资源根独立选址。选择和预览只读，确认后仅复制缺失的完整版本。
 mod locks;
+mod mounts;
+pub(crate) use mounts::check_selected_volume;
 mod transaction;
 
 pub(crate) use locks::{
@@ -66,8 +68,16 @@ pub struct MigrationPlan {
     pub blockers: Vec<String>,
     pub required_bytes: u64,
     pub available_bytes: Option<u64>,
+    #[serde(skip)]
+    source_mounts: mounts::Mounts,
+    #[serde(skip)]
+    target_mounts: mounts::Mounts,
 }
 impl MigrationPlan {
+    pub fn check_candidate_image_root(&self) -> io::Result<()> {
+        self.target_mounts.check(&self.after.image_root, true)
+    }
+
     pub fn changed_roots(&self) -> (bool, bool) {
         (
             !same_location(&self.before.runtime_root, &self.after.runtime_root),
@@ -108,18 +118,20 @@ fn absolute(path: &Path) -> io::Result<PathBuf> {
     }
     Err(invalid("无法定位资源目录所在卷"))
 }
-pub(crate) fn same_location(a: &Path, b: &Path) -> bool {
+pub fn same_location(a: &Path, b: &Path) -> bool {
     a == b || matches!((absolute(a),absolute(b)),(Ok(a),Ok(b)) if a==b)
 }
 pub(crate) fn check_volume(path: &Path) -> io::Result<()> {
     if let Ok(suffix) = path.strip_prefix("/Volumes")
         && let Some(Component::Normal(name)) = suffix.components().next()
-        && !Path::new("/Volumes").join(name).is_dir()
     {
-        return Err(io::Error::new(
-            ErrorKind::NotConnected,
-            format!("请先挂载存储卷 {}", name.to_string_lossy()),
-        ));
+        let point = Path::new("/Volumes").join(name);
+        if !point.is_dir() || point.canonicalize()? != mounts::at(&point)? {
+            return Err(io::Error::new(
+                ErrorKind::NotConnected,
+                format!("请先挂载存储卷 {}", name.to_string_lossy()),
+            ));
+        }
     }
     Ok(())
 }
@@ -135,6 +147,11 @@ fn existing_ancestor(path: &Path) -> io::Result<&Path> {
 
 /// 返回目标卷的设备号、可用字节和只读标志，不创建探测文件。
 pub(crate) fn volume_space(path: &Path) -> io::Result<(u64, u64, bool)> {
+    let (device, available, readonly, _) = volume(path)?;
+    Ok((device, available, readonly))
+}
+
+fn volume(path: &Path) -> io::Result<(u64, u64, bool, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     check_volume(path)?;
@@ -153,7 +170,25 @@ pub(crate) fn volume_space(path: &Path) -> io::Result<(u64, u64, bool)> {
         dev,
         bytes,
         stat.f_flag & libc::ST_RDONLY as libc::c_ulong != 0,
+        (stat.f_frsize as u64).max(1),
     ))
+}
+
+/// 按目标卷的分配单元向上取整，并为每个目录计入一个块。
+/// 同卷克隆、稀疏文件、压缩和文件系统内部元数据会影响实际增量。
+fn copy_space(source: &Path, block: u64) -> io::Result<u64> {
+    let meta = fs::symlink_metadata(source)?;
+    if meta.is_dir() {
+        let mut total = block;
+        for child in fs::read_dir(source)? {
+            total = total.saturating_add(copy_space(&child?.path(), block)?);
+        }
+        Ok(total)
+    } else if meta.is_file() {
+        Ok(meta.len().div_ceil(block).saturating_mul(block))
+    } else {
+        Err(invalid("版本在预览期间出现特殊文件，请重新预览"))
+    }
 }
 
 #[derive(Debug)]
@@ -162,6 +197,29 @@ enum Contents {
     Complete(String),
     Conflict(String),
     Offline(String),
+}
+
+fn check_version_path(root: &Path, path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| invalid("版本缺少父目录"))?;
+    // 用户选择的根可以是路径别名；版本内部的链接不能把发布或清理引向其他目录。
+    if absolute(parent)?
+        != absolute(root)?.join(
+            parent
+                .strip_prefix(root)
+                .map_err(|_| invalid("资源路径超出所选根"))?,
+        )
+    {
+        return Err(invalid(format!("版本层级含外部链接：{}", parent.display())));
+    }
+    Ok(())
+}
+
+fn version_root(settings: &StorageLocations, image: bool) -> &Path {
+    if image {
+        &settings.image_root
+    } else {
+        &settings.runtime_root
+    }
 }
 
 fn contents(
@@ -174,17 +232,7 @@ fn contents(
         return Contents::Offline(e.to_string());
     }
     let inspect = || -> io::Result<Contents> {
-        let parent = path.parent().ok_or_else(|| invalid("版本缺少父目录"))?;
-        // 用户选择的根可以是路径别名；版本内部的链接不能把发布或清理引向其他目录。
-        if absolute(parent)?
-            != absolute(root)?.join(
-                parent
-                    .strip_prefix(root)
-                    .map_err(|_| invalid("资源路径超出所选根"))?,
-            )
-        {
-            return Err(invalid(format!("版本层级含外部链接：{}", parent.display())));
-        }
+        check_version_path(root, path)?;
         let Some(meta) = metadata(path)? else {
             return Ok(Contents::Absent);
         };
@@ -302,8 +350,29 @@ pub fn preview_switch(
         blockers: vec![],
         required_bytes: 0,
         available_bytes: None,
+        source_mounts: mounts::load(home)?,
+        target_mounts: mounts::load(home)?,
     };
     let changed = plan.changed_roots();
+    if changed.0 {
+        plan.target_mounts.runtime = Some(mounts::at(&after.runtime_root)?);
+    }
+    if changed.1 {
+        plan.target_mounts.images = Some(mounts::at(&after.image_root)?);
+    }
+    if mode == SwitchMode::Future {
+        for (moves, root) in [
+            (changed.0, &after.runtime_root),
+            (changed.1, &after.image_root),
+        ] {
+            if moves && volume_space(root)?.2 {
+                blockers.push(format!(
+                    "{} 所在卷只读，可选择使用已备齐的目录",
+                    root.display()
+                ));
+            }
+        }
+    }
     let instances = InstanceStore::new(Layout { root: home.into() }).list_readonly()?;
     if changed != (false, false) {
         for record in &instances {
@@ -361,12 +430,16 @@ pub fn preview_switch(
             .collect();
         let required = !dependents.is_empty() || mode == SwitchMode::Use && image.is_none();
         let source = if mode == SwitchMode::Migrate {
-            contents(
-                old_root,
-                &src.path,
-                |path| src.verify_at(path),
-                |path| src.empty_skeleton(path),
-            )
+            if let Err(e) = plan.source_mounts.check(old_root, image.is_some()) {
+                Contents::Offline(e.to_string())
+            } else {
+                contents(
+                    old_root,
+                    &src.path,
+                    |path| src.verify_at(path),
+                    |path| src.empty_skeleton(path),
+                )
+            }
         } else {
             Contents::Absent
         };
@@ -387,15 +460,16 @@ pub fn preview_switch(
             (_, Contents::Complete(value)) | (Contents::Complete(value), _) => Some(value.clone()),
             _ => None,
         };
-        let bytes = dst.bytes();
+        let bytes = dst.unpacked_bytes();
         if status == VersionStatus::Copy {
-            let (dev, available, read_only) = volume_space(&dst.path)?;
+            let (dev, available, read_only, block) = volume(&dst.path)?;
+            let extra = copy_space(&src.path, block)?.saturating_add(2 * block);
             if read_only {
                 blockers.push(format!("目标卷为只读，无法复制 {}", dst.label()));
             }
             let totals = disks.entry(dev).or_insert((0, available));
-            totals.0 = totals.0.saturating_add(bytes);
-            plan.required_bytes = plan.required_bytes.saturating_add(bytes);
+            totals.0 = totals.0.saturating_add(extra);
+            plan.required_bytes = plan.required_bytes.saturating_add(extra);
         }
         let downloadable = image.is_some() && matches!(target, Contents::Absent) && required;
         let download = downloadable.then(|| dst.download_space(&after));

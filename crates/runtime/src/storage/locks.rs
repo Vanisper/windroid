@@ -92,9 +92,25 @@ pub(crate) fn version_read_lease(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+// 不能证明两个独立打开的对象互斥时，此卷只允许接入读取。
+fn confirm_exclusive(another: File, path: &Path) -> io::Result<()> {
+    match another.try_lock_shared() {
+        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Err(e) => Err(contended(path, e)),
+        Ok(()) => Err(io::Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "{} 所在卷不支持可靠的独占锁，可只读接入完整版本",
+                path.display()
+            ),
+        )),
+    }
+}
+
 pub(crate) fn lock_staged_version(path: &Path) -> io::Result<File> {
     let file = object(path)?;
     file.try_lock().map_err(|e| contended(path, e))?;
+    confirm_exclusive(object(path)?, path)?;
     Ok(file)
 }
 
@@ -107,11 +123,10 @@ pub(crate) fn version_write_lease(path: &Path) -> io::Result<Vec<File>> {
     check_volume(parent)?;
     let parent = absolute(parent)?;
     // 版本名由固定清单给出。父目录的真实位置决定协调点，同一卷上的路径别名共用它。
-    let writer = lock(
-        &parent,
-        &format!(".windroid-write-{}.lock", name.to_ascii_lowercase()),
-    )?;
+    let filename = format!(".windroid-write-{}.lock", name.to_ascii_lowercase());
+    let writer = lock(&parent, &filename)?;
     writer.try_lock().map_err(|e| contended(path, e))?;
+    confirm_exclusive(lock(&parent, &filename)?, path)?;
     let mut leases = vec![writer];
     if metadata(path)?.is_some() {
         leases.push(lock_staged_version(path)?);
@@ -122,6 +137,9 @@ pub(crate) fn version_write_lease(path: &Path) -> io::Result<Vec<File>> {
 pub(crate) fn instance_lease(home: &Path, image: &Image) -> io::Result<(RuntimePaths, Vec<File>)> {
     let _selection = resource_lease(home, true, true)?;
     let config = super::StorageLocations::load(home)?;
+    let points = super::mounts::load(home)?;
+    points.check(&config.runtime_root, false)?;
+    points.check(&config.image_root, true)?;
     let paths = RuntimePaths::for_locations(&config);
     let mut leases = Vec::new();
     let mut selected = false;
