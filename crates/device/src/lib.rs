@@ -308,7 +308,7 @@ impl Actor {
 
         // 保留上次诊断，直到后端实际受理本次请求。拒绝时也不泄露半写的事实。
         let mut facts = self.facts.clone();
-        if matches!(cmd, Command::Start) {
+        if matches!(cmd, Command::Start | Command::Restart { .. }) {
             facts.stop_requested = false;
             facts.aborted = false;
             facts.boot_stalled = false;
@@ -318,7 +318,7 @@ impl Actor {
         }
         self.facts = facts;
         match cmd {
-            Command::Start => {
+            Command::Start | Command::Restart { .. } => {
                 self.boot = Some(BootAttempt {
                     started: Instant::now(),
                     adb_seen: None,
@@ -394,6 +394,10 @@ fn guard(cmd: &Command, state: State) -> Option<&'static str> {
         Command::Create { .. } => (!caps.create).then_some("不存在的实例"),
         Command::Delete => (!caps.delete).then_some("已停止"),
         Command::Start => (!caps.start).then_some("已停止"),
+        Command::Restart { cold } => {
+            (!(caps.launch_app || state == State::Stalled || (*cold && caps.start)))
+                .then_some("已就绪、启动较慢或可冷启动的实例")
+        }
         Command::Stop => (!caps.stop).then_some("运行中的实例"),
         Command::Install { .. } => (!caps.install).then_some("系统就绪"),
         Command::Uninstall { .. } => (!caps.install).then_some("系统就绪"),
@@ -494,11 +498,13 @@ impl Backend for FakeBackend {
                 *facts = Facts::default();
                 self.step = 0;
             }
-            Command::Start => {
-                facts.process_alive = true;
-                facts.ever_launched = true;
-                facts.stop_requested = false;
-                facts.boot_stalled = false;
+            Command::Start | Command::Restart { .. } => {
+                *facts = Facts {
+                    dir_exists: true,
+                    process_alive: true,
+                    ever_launched: true,
+                    ..Default::default()
+                };
                 self.step = 1;
                 self.counter = 0;
             }

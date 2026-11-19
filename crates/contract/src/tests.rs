@@ -193,6 +193,7 @@ fn command_roundtrips_through_json() {
         },
         Command::Delete,
         Command::Start,
+        Command::Restart { cold: true },
         Command::Stop,
         Command::Install { apk_path: "/tmp/a.apk".into() },
         Command::Uninstall { package: PackageName::new("com.x"), keep_data: true },

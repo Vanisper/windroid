@@ -295,6 +295,8 @@ pub enum Command {
     Delete,
     /// 启动模拟器进程并进入就绪等待。
     Start,
+    /// 先按替换当前会话预检，再停止并重新启动。冷启动跳过已保存的内存快照。
+    Restart { cold: bool },
     /// 优雅停止：先关流会话，再 emu kill。
     Stop,
     /// 安装 APK。路径为主机侧文件。
