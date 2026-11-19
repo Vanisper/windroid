@@ -71,6 +71,9 @@ fn device_command(data: &JsonValue) -> Result<Command, Rejection> {
     if let Some(cmd) = translate_action(data) {
         return Ok(cmd);
     }
+    if matches!(data["kind"].as_str(), Some("restart" | "coldRestart")) {
+        return Ok(Command::Restart { cold: data["kind"] == "coldRestart" });
+    }
     if data["kind"] == "install" {
         let path = data["apkPath"]
             .as_str()

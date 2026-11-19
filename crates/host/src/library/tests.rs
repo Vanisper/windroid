@@ -17,7 +17,7 @@ fn library() -> (Arc<Library>, mpsc::Receiver<WindowCommand>) {
 }
 use std::path::PathBuf;
 fn create(lib: &Arc<Library>, name: &str) -> String {
-    lib.perform(&json!({"kind":"createInstance","imageId":"system-image","image":lib.preparation()["images"][0]["image"],"name":name,"template":"compact-720"}))
+    lib.perform(&json!({"kind":"createInstance","imageId":"system-image","image":lib.preparation()["images"][0]["image"],"name":name,"template":"compact-720","diskGiB":8,"cpuCores":2,"ramMiB":2560,"gpuMode":"host"}))
         .unwrap();
     lib.snapshot()["selectedId"].as_str().unwrap().into()
 }

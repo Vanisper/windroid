@@ -25,6 +25,7 @@ use crate::{
 
 mod commands;
 mod first_page;
+mod hardware;
 mod observation;
 mod resources;
 mod storage;
@@ -267,6 +268,7 @@ impl Library {
             let result = lib.first_page.as_ref().map(|p| p.shown()).transpose();
             call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
         });
+        self.connect_hardware();
         self.connect_resources();
         self.connect_storage();
         let global = self.lane();
@@ -417,7 +419,7 @@ impl Library {
                 let device = instance.handle.snapshot();
                 json!({
                     "id": id, "name": instance.name, "state": device.state,
-                    "frozen": state.frozen.contains(id),
+                    "frozen": state.frozen.contains(id), "processAlive": device.facts.process_alive,
                     "summary": crate::describe(device.state, device.phase, &device.facts),
                     "config": instance.config, "observed": device.facts.allocation
                 })

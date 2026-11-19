@@ -52,6 +52,7 @@ impl Library {
                     None => Ok(false),
                 });
             }
+            "updateHardware" => return self.update_hardware(&instance, data),
             "selectInstance" => {
                 if let Some(store) = &self.store {
                     store.select(instance.handle.id()).map_err(error)?;
@@ -144,26 +145,16 @@ impl Library {
                     instance_name: instance.name.clone(),
                 })?;
             }
-            "install" | "start" | "stop" | "refreshApps" | "setDefaultHome" | "clearData" => {
-                let _admission = (kind == "start").then(|| self.starting.lock().unwrap());
-                if kind == "start" && caps.start {
-                    let active = self
-                        .state
-                        .lock()
-                        .unwrap()
-                        .instances
-                        .values()
-                        .filter(|i| i.handle.snapshot().facts.process_alive)
-                        .count();
-                    if active >= 3 {
-                        return Err(error("已有 3 台实例运行，请先停止一台"));
-                    }
+            "install" | "start" | "restart" | "coldRestart" | "stop" | "refreshApps"
+            | "setDefaultHome" | "clearData" => {
+                let starting = matches!(kind, "start" | "restart" | "coldRestart");
+                let _resources = starting.then(|| self.starting.lock().unwrap());
+                if starting {
                     self.require_ready_runtime()?;
-                    if let Some(r) = &instance.record {
-                        self.check_budget(&r.spec.template)?;
-                        if !resources::image_available(&self.preparation(), &r.spec.image) {
-                            return Err(error("请先准备此实例使用的系统镜像"));
-                        }
+                    if let Some(record) = &instance.record
+                        && !resources::image_available(&self.preparation(), &record.spec.image)
+                    {
+                        return Err(error("请先准备此实例使用的系统镜像"));
                     }
                 }
                 if kind == "setDefaultHome" && !snap.desktop.is_candidate(package) {
@@ -181,7 +172,10 @@ impl Library {
                 }
                 let seq = self.device(&instance, command)?;
                 match kind {
-                    "start" => {
+                    "start" | "restart" | "coldRestart" => {
+                        if kind != "start" && snap.facts.process_alive {
+                            self.clear_replaced_session(id);
+                        }
                         let mut s = self.state.lock().unwrap();
                         s.frozen.remove(id);
                         s.operations.remove(id);
@@ -224,15 +218,23 @@ impl Library {
         ) {
             return Err(error("请选择列表中的设备模板"));
         }
+        let image = self.selected_image(data)?;
+        let hardware = super::hardware::requested(data)?;
+        let disk_gib = data["diskGiB"]
+            .as_u64()
+            .ok_or_else(|| error("请选择整数 GiB 的用户空间"))?;
         let spec = contract::Spec {
             template: template.into(),
-            image: self.selected_image(data)?,
-            disk_bytes: 8 << 30,
+            image,
+            disk_bytes: disk_gib
+                .checked_mul(1 << 30)
+                .ok_or_else(|| error("用户空间过大"))?,
         };
         let id = if let Some(store) = &self.store {
-            let _admission = self.starting.lock().unwrap();
-            self.check_budget(template)?;
-            let record = store.create_prepared(name, spec).map_err(error)?;
+            let _resources = self.starting.lock().unwrap();
+            let record = store
+                .create_with_hardware(name, spec, hardware)
+                .map_err(error)?;
             let id = record.id.to_string();
             self.add_record(record);
             id
@@ -254,10 +256,18 @@ impl Library {
                 device::FakeBackend::new(),
                 device::Timeouts::default(),
             );
+            let config = super::hardware::demo_config(spec.clone(), hardware)?;
             if let Ack::Rejected { reason } = h.send(Command::Create { spec }) {
                 return Err(reason);
             }
             self.add(name.into(), h, ev, None, Default::default());
+            self.state
+                .lock()
+                .unwrap()
+                .instances
+                .get_mut(&id)
+                .unwrap()
+                .config = Some(config);
             id
         };
         self.select(&id);
@@ -350,26 +360,6 @@ impl Library {
                 .last_interaction
                 .get(id)
                 .is_some_and(|last| last.elapsed() >= Duration::from_secs(600))
-    }
-
-    fn check_budget(&self, template: &str) -> Result<(), Rejection> {
-        let physical = runtime::instances::physical_memory_mib().map_err(error)?;
-        let state = self.state.lock().unwrap();
-        let used: u64 = state
-            .instances
-            .values()
-            .filter(|i| i.handle.snapshot().facts.process_alive)
-            .filter_map(|i| i.record.as_ref())
-            .map(|r| runtime::instances::ram_mib(&r.spec.template))
-            .sum();
-        let requested = runtime::instances::ram_mib(template);
-        if used + requested > physical / 2 {
-            return Err(error(format!(
-                "实例需要 {requested} MiB，当前预算可用 {} MiB，请停止其他实例",
-                (physical / 2).saturating_sub(used)
-            )));
-        }
-        Ok(())
     }
 
     fn require_ready_runtime(&self) -> Result<(), Rejection> {
