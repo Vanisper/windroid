@@ -144,6 +144,31 @@ printf 'List of devices attached\nemulator-5554\tdevice\nemulator-5556\toffline\
 }
 
 #[test]
+fn incompatible_running_service_is_inspected_without_stopping_it() {
+    use std::io::{Read, Write};
+    let f = Fixture::new();
+    let program=f.script("adb",r#"if [ "$1" = version ]; then echo 'Android Debug Bridge version 1.0.41'; else echo "$@" > unexpected; fi"#);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            let (mut client, _) = listener.accept().unwrap();
+            let mut request = [0; 16];
+            client.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"000chost:version");
+            client.write_all(b"OKAY00040028").unwrap();
+        });
+        succeeds(
+            f.child("incompatible")
+                .env("WINDROID_TEST_ADB", program)
+                .env("ANDROID_ADB_SERVER_PORT", &port)
+                .env("ADB_SERVER_SOCKET", format!("tcp:localhost:{port}")),
+        );
+    });
+    assert!(!f.0.join("unexpected").exists());
+}
+
+#[test]
 #[ignore = "由每个测试用隔离的环境和临时工具单独调用"]
 fn isolated_child() {
     let Ok(case) = env::var("WINDROID_ADB_TEST_CASE") else {
@@ -152,6 +177,12 @@ fn isolated_child() {
     let program = PathBuf::from(env::var_os("WINDROID_TEST_ADB").unwrap());
     let device = |serial| adb::Device::new(&program, serial);
     match case.as_str() {
+        "incompatible" => assert!(
+            adb::ensure_server(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("不兼容")
+        ),
         "streams" => {
             let out = adb::run(device("test serial"), &["shell", "two words"]).unwrap();
             assert_eq!(out.code, Some(9));
