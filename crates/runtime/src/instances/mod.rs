@@ -5,6 +5,7 @@ mod avd;
 mod hardware;
 pub(crate) mod process;
 mod quick_boot;
+mod specification;
 
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -20,6 +21,7 @@ pub(crate) use avd::{data_dir, image_subdir};
 use contract::{InstanceId, Spec};
 pub use hardware::InstanceConfig;
 use serde::{Deserialize, Serialize};
+pub use specification::{DiskLimits, GraphicsMode, Hardware, HostCapacity, SpecLimits};
 
 /// 各模板分配的客户机内存，用于 AVD 配置与设备域资源准入。
 pub fn ram_mib(template: &str) -> u64 {

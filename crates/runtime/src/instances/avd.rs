@@ -32,7 +32,7 @@ pub(super) fn validate(spec: &Spec) -> io::Result<()> {
     Ok(())
 }
 
-fn dimensions(template: &str) -> io::Result<(u32, u32, u32)> {
+pub(super) fn dimensions(template: &str) -> io::Result<(u32, u32, u32)> {
     match template {
         "compact-720" => Ok((1280, 720, 240)),
         "phone-1080" => Ok((1080, 2400, 420)),

@@ -45,7 +45,7 @@ pub(super) fn allocation(path: &Path, launched: SystemTime) -> Option<GuestAlloc
     (cpu_cores.is_some() || ram_mib.is_some()).then_some(GuestAllocation { cpu_cores, ram_mib })
 }
 
-fn read_ini(path: &Path, launched: Option<SystemTime>) -> io::Result<String> {
+pub(super) fn read_ini(path: &Path, launched: Option<SystemTime>) -> io::Result<String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -67,11 +67,19 @@ fn read_ini(path: &Path, launched: Option<SystemTime>) -> io::Result<String> {
     Ok(text)
 }
 
-fn number(ini: &str, key: &str) -> Option<u32> {
+/// 未提供的键与内容冲突分别处理；重复的值没有唯一解释。
+pub(super) fn field<'a>(ini: &'a str, key: &str) -> io::Result<Option<&'a str>> {
     let mut matches = ini.lines().filter_map(|line| {
         let (name, value) = line.split_once('=')?;
         (name.trim() == key).then(|| value.trim())
     });
-    let value: u32 = matches.next()?.parse().ok()?;
-    (value > 0 && matches.next().is_none()).then_some(value)
+    let value = matches.next();
+    if matches.next().is_some() {
+        return Err(super::invalid(format!("配置项 {key} 重复")));
+    }
+    Ok(value)
+}
+
+fn number(ini: &str, key: &str) -> Option<u32> {
+    field(ini, key).ok()??.parse().ok().filter(|n| *n > 0)
 }
