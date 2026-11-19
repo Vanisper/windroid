@@ -64,6 +64,15 @@ def fixture(root, case, jar):
         dest = home / "runtime/scrcpy-server/5.0.1/scrcpy-server.jar"
         dest.parent.mkdir(parents=True)
         shutil.copyfile(jar, dest)
+    elif case in {"registry-lock", "readonly-lock", "readonly-registry"}:
+        marker.write_bytes(b"windroid-workspace-v2\n")
+        (home / "instances").mkdir()
+        lock = home / "instances/.registry.lock"
+        if case == "readonly-registry":
+            lock.parent.chmod(0o500)
+        else:
+            lock.touch()
+            lock.chmod(0o400 if case == "readonly-lock" else 0)
     elif case == "unreadable":
         marker.write_bytes(b"windroid-workspace-v2\n")
         marker.chmod(0)
@@ -112,7 +121,8 @@ def main():
     if os.getuid() == 0:
         parser.error("请以普通 macOS 用户执行，以便验证无读取权限的目录")
     args.screenshots.mkdir(parents=True, exist_ok=True)
-    for case in ["legacy", "mixed", "transaction", "unreadable", "seed"]:
+    for case in ["legacy", "mixed", "transaction", "unreadable", "registry-lock",
+                 "readonly-lock", "readonly-registry", "seed"]:
         with tempfile.TemporaryDirectory(prefix="wd-gate-", dir="/private/tmp") as directory:
             root = Path(directory)
             home = fixture(root, case, args.official_jar)

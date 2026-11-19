@@ -1,8 +1,9 @@
 //! 首次打开先检查工作区身份。此模块的 inspect 路径不会创建锁、日志或偏好，
 //! 也不会恢复事务或打开实例私有数据盘。
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -38,6 +39,20 @@ fn plain(path: &Path, directory: bool) -> io::Result<()> {
     }
 }
 
+/// 使用现有凭据探测后续初始化需要的访问权，不创建文件，也不改变锁或权限。
+pub(crate) fn access(path: &Path, mode: libc::c_int) -> io::Result<()> {
+    let name = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: 路径在调用期间有效，access 只查询权限。
+    if unsafe { libc::access(name.as_ptr(), mode) } == 0 {
+        return Ok(());
+    }
+    let cause = io::Error::last_os_error();
+    Err(io::Error::new(
+        cause.kind(),
+        format!("{}：{cause}", path.display()),
+    ))
+}
+
 fn entries(path: &Path) -> io::Result<Vec<OsString>> {
     fs::read_dir(path)?
         .map(|entry| entry.map(|e| e.file_name()))
@@ -61,6 +76,7 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
     }
     let items = entries(home).map_err(unknown)?;
     if items.is_empty() {
+        access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
         return Ok(Workspace::Empty);
     }
     let has = |name: &str| items.iter().any(|item| item == name);
@@ -124,9 +140,16 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
     if value != VERSION {
         return Err(unknown("工作区版本记录损坏或不受支持"));
     }
-    for dir in ["instances", "preferences", "cache", "logs", "system-images"] {
+    for dir in ["logs", "system-images"] {
         if has(dir) {
             plain(&home.join(dir), true).map_err(unknown)?;
+        }
+    }
+    access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
+    for name in ["instances", "preferences", "cache", "storage-cleanup-v2"] {
+        if has(name) {
+            plain(&home.join(name), true).map_err(unknown)?;
+            access(&home.join(name), libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
         }
     }
     // 其他目录可以是用户保留在工作区内的自选资源根。仅识别程序确实使用的
@@ -137,6 +160,7 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
         let meta = fs::symlink_metadata(&path).map_err(unknown)?;
         match name {
             ".storage.lock" | ".components.lock" | ".images.lock" => {
+                access(&path, libc::R_OK | libc::W_OK).map_err(unknown)?;
                 if !meta.is_file() || meta.len() != 0 || meta.nlink() != 1 {
                     return Err(unknown(format!(
                         "工作区锁文件类型或内容异常：{}",
@@ -158,7 +182,9 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
     }
     if has("preferences") {
         for key in entries(&home.join("preferences")).map_err(unknown)? {
-            plain(&home.join("preferences").join(key), false).map_err(unknown)?;
+            let control = home.join("preferences").join(key);
+            plain(&control, false).map_err(unknown)?;
+            access(&control, libc::R_OK).map_err(unknown)?;
         }
     }
     if has("instances") {

@@ -335,7 +335,13 @@ pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
             let kind = entry.file_type()?;
             let name = name.to_str().ok_or_else(|| invalid("注册表文件名无效"))?;
             let known = match name {
-                ".registry.lock" | ".selected" => kind.is_file(),
+                ".registry.lock" => {
+                    crate::workspace::access(&entry.path(), libc::R_OK | libc::W_OK)?;
+                    use std::os::unix::fs::MetadataExt;
+                    let meta = entry.metadata()?;
+                    kind.is_file() && meta.len() == 0 && meta.nlink() == 1
+                }
+                ".selected" => kind.is_file(),
                 _ if name.starts_with(".new-") || name.starts_with(".deleted-") => kind.is_dir(),
                 _ if name.starts_with(".selection-") => kind.is_file(),
                 _ => false,

@@ -244,6 +244,55 @@ fn old_group_files_block_initialization_and_are_preserved() {
     std::fs::remove_dir_all(layout.root).unwrap();
 }
 
+#[test]
+fn inaccessible_existing_control_files_cause_zero_writes_on_attach() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for (relative, mode, directory) in [
+        ("instances/.registry.lock", 0o000, false),
+        ("instances/.registry.lock", 0o400, false),
+        ("instances", 0o500, true),
+        (".components.lock", 0o000, false),
+        (".images.lock", 0o000, false),
+        (".storage.lock", 0o000, false),
+        ("preferences/window-close", 0o000, false),
+    ] {
+        let layout = temporary_workspace();
+        runtime::workspace::open(&layout.root).unwrap();
+        let control = layout.root.join(relative);
+        if directory {
+            std::fs::create_dir_all(&control).unwrap();
+        } else {
+            std::fs::create_dir_all(control.parent().unwrap()).unwrap();
+            std::fs::write(&control, b"").unwrap();
+        }
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(mode)).unwrap();
+        // 特权用户能越过权限位，普通用户覆盖真实 EACCES。
+        if std::fs::metadata(&layout.root).unwrap().uid() != 0 {
+            let before = std::fs::symlink_metadata(&control).unwrap();
+            let count = std::fs::read_dir(&layout.root).unwrap().count();
+            let (tx, _) = mpsc::channel();
+            let (_, rx) = mpsc::channel();
+            let refusal = Library::attach(HostChannel::new(), layout.clone(), false, tx, rx);
+            assert!(
+                matches!(refusal, Err(ref reason) if reason.contains("无法确认工作区格式") && reason.contains(relative)),
+                "{relative} mode {mode:o}"
+            );
+            assert_eq!(std::fs::read_dir(&layout.root).unwrap().count(), count);
+            assert!(!layout.root.join("preferences/first-page.pending").exists());
+            assert!(!layout.root.join("cache").exists());
+            if directory {
+                assert!(!control.join(".registry.lock").exists());
+            }
+            let after = std::fs::symlink_metadata(&control).unwrap();
+            assert_eq!(
+                (before.mode(), before.mtime_nsec(), before.ino()),
+                (after.mode(), after.mtime_nsec(), after.ino())
+            );
+        }
+        std::fs::remove_dir_all(layout.root).unwrap();
+    }
+}
+
 fn ready(lib: &Arc<Library>, id: &str) -> Instance {
     let i = lib.state.lock().unwrap().instances[id].clone();
     lib.perform(&json!({"kind":"start","instanceId":id}))
