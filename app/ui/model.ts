@@ -26,10 +26,12 @@ export interface RunningApp { instanceId: string; package: string; label: string
 export interface Component {
   id: string; name: string; version: string; source: string; sizeBytes: number; ready: boolean;
   license: string; licenseUrl: string; licenseText?: string;
+  location: string; downloadedBytes: number; borrowed: boolean; issue: string | null;
+  image: InstanceConfig["image"] | null; minEmulator: string | null;
 }
 export interface Preparation {
   phase: "missing" | "downloading" | "verifying" | "installing" | "paused" | "failed" | "ready";
-  components: Component[]; downloadedBytes: number; totalBytes: number;
+  componentsReady: boolean; components: Component[]; images: Component[]; downloadedBytes: number; totalBytes: number;
   currentComponent: string | null; error: string | null; borrowed: boolean;
 }
 interface InstallError { code: string; detail: string }
@@ -60,15 +62,19 @@ export interface Snapshot {
   catalogStatus?: { kind: "pending" | "ready" | "failed"; message?: string };
   groups: AppSection[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
-  instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string;
-  storage?: { home: string; sdk: string; images: string };
+  instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string; templateRamMiB?: Record<string, number>;
+  showWelcome?: boolean;
+  storage?: { home: string; sdk: string; runtimeRoot: string; images: string; imagesInherited: boolean; borrowed: boolean; error?: string | null };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 
 type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "refreshApps" | "openDevice" | "addApk";
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
-  | { kind: "createInstance"; name: string; template: string }
+  | { kind: "createInstance"; name: string; template: string; imageId: string }
+  | { kind: "applyStorage"; plan: { previewId: number } }
+  | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
+  | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
   | { kind: "pausePreparation" | "recheckRuntime" }
   | { kind: DeviceCommand; instanceId: string }
@@ -89,7 +95,13 @@ export const selected = computed(() => {
 export const currentId = computed(() => selected()?.id ?? null);
 export const preparation = computed(() => snapshot()?.preparation);
 export const running = computed(() => (snapshot()?.running ?? []).filter(app => app.instanceId === currentId()));
-export const environmentReady = computed(() => Boolean(snapshot()) && (!preparation() || preparation()?.phase === "ready"));
+export const environmentReady = computed(() => Boolean(snapshot()) && (!preparation() || (preparation()?.componentsReady ?? preparation()?.phase === "ready")));
+export const images = computed(() => preparation()?.images ?? []);
+export const activeTransfer = computed(() => ["downloading", "verifying", "installing"].includes(preparation()?.phase ?? ""));
+
+export function pickResource(kind: "imageZip" | "runtimeDirectory" | "imageDirectory") {
+  return host.call<string | null>("windroid.pickResource", { kind }, { timeout: 3_600_000 });
+}
 export const can = (key: Capability) => currentId() !== null && snapshot()?.capabilities?.[key] === true
   && (key !== "start" || environmentReady());
 
@@ -97,6 +109,22 @@ type Screen = "instances" | "library" | "manage" | "create" | "environment" | "s
 export const screen = signal<Screen>("instances");
 export const instancePage = computed(() => screen() === "library" || screen() === "manage");
 export const managementBack = signal<"library" | "instances">("instances");
+type GuideOrigin = "first" | "instances" | "settings";
+export const guideOrigin = signal<GuideOrigin>("instances");
+export function openGuide(origin: GuideOrigin) {
+  guideOrigin.set(origin);
+  navigate("guide");
+}
+export const environmentTab = signal<"components" | "images">("components");
+export function openEnvironment(tab: "components" | "images") {
+  environmentTab.set(tab);
+  navigate("environment");
+}
+export const creationImage = signal<string | null>(null);
+export function startCreation(imageId?: string) {
+  creationImage.set(imageId ?? null);
+  navigate("create");
+}
 let navigation = 0;
 export function navigate(page: Screen) {
   ++navigation;
@@ -155,7 +183,12 @@ async function readChanges() {
       const first = !snapshot();
       snapshot.set(s);
       observeOperation(s.operation);
-      if (first && currentId() && navigation === 0) screen.set("library");
+      if (first) {
+        if (navigation === 0) {
+          if (currentId()) screen.set("library");
+          else if (s.showWelcome) openGuide("first");
+        }
+      }
       if (instancePage() && !currentId()) navigate("instances");
       loadError.set("");
     } while (dirty);
@@ -166,6 +199,17 @@ async function readChanges() {
   }
 }
 
+// 首次取到快照时路由仍在挂载。以首个工作台页面的原生布局回执确认已展示。
+let firstPageSaved = false;
+export function firstPageShown() {
+  if (firstPageSaved || snapshot()?.showWelcome === undefined) return;
+  firstPageSaved = true;
+  void host.call("windroid.firstPageShown").catch(e => {
+    firstPageSaved = false;
+    report("未能保存首次进入记录 · " + String(e), true);
+  });
+}
+
 // 受理和完成分开展示。异步完成、设备拒绝及窗口异常分别由宿主的 operation / Ack / streamNote 给出。
 export async function send(cmd: Command, label: string): Promise<boolean> {
   const instanceId = "instanceId" in cmd ? cmd.instanceId : null;
@@ -174,7 +218,7 @@ export async function send(cmd: Command, label: string): Promise<boolean> {
   requests.update(items => ({ ...items, [key]: label }));
   messages.update(items => items.filter(item => item.instanceId !== null && (cmd.kind === "selectInstance" || item.instanceId !== instanceId)));
   try {
-    const ack = await host.call<Ack>("windroid.command", cmd, { timeout: 300_000 });
+    const ack = await host.call<Ack>("windroid.command", cmd, { timeout: cmd.kind === "applyStorage" ? 3_600_000 : 300_000 });
     if (ack?.status !== "accepted") {
       const r = ack?.reason;
       if (cmd.kind === "install" && r?.kind === "error" && r.code && r.detail !== undefined) {

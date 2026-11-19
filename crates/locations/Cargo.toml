@@ -1,0 +1,11 @@
+[package]
+name = "windroid-locations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windroid 受管资源的持久化位置"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

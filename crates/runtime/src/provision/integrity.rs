@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::Path;
 
 use sha2::Digest as Hasher;
@@ -19,8 +19,20 @@ pub(super) fn check_digest(
     if regular(path)?.len() != pkg.bytes {
         return Err(invalid(format!("{} 的文件大小与发布记录不符", pkg.name)));
     }
+    check_file(&File::open(path)?, pkg, check)
+}
+
+pub(super) fn check_file(
+    mut file: &File,
+    pkg: Artifact,
+    check: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    if file.metadata()?.len() != pkg.bytes {
+        return Err(invalid(format!("{} 的文件大小与发布记录不符", pkg.name)));
+    }
+    file.rewind()?;
     // 即使另一个进程持续追加，这次校验的读取量也有界。
-    let input = File::open(path)?.take(pkg.bytes + 1);
+    let input = file.take(pkg.bytes + 1);
     let actual = match pkg.digest {
         Digest::Sha1(_) => hash::<sha1::Sha1>(input, check)?,
         Digest::Sha256(_) => hash::<sha2::Sha256>(input, check)?,

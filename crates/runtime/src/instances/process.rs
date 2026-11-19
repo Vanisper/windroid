@@ -2,7 +2,7 @@
 use std::path::Path;
 use std::{fs, io};
 
-use super::{InstanceRecord, InstanceStore, data_dir, image_relative, invalid};
+use super::{InstanceRecord, InstanceStore, data_dir, image_subdir, invalid};
 use crate::provision::RuntimePaths;
 use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
@@ -45,6 +45,7 @@ pub(crate) struct OwnedEmulator {
     launched: SystemTime,
     pid_file: PathBuf,
     _lease: File,
+    _resources: Vec<File>,
     pub record: InstanceRecord,
 }
 
@@ -54,6 +55,7 @@ impl OwnedEmulator {
         id: &InstanceId,
         port: u16,
         paths: &RuntimePaths,
+        resources: Vec<File>,
     ) -> io::Result<Self> {
         let (record, dir, lease) = store.lease(id, port)?;
         let sdk = paths.sdk.canonicalize().map_err(|e| {
@@ -62,14 +64,8 @@ impl OwnedEmulator {
                 format!("Android SDK {}：{e}", paths.sdk.display()),
             )
         })?;
-        let image = sdk.join(image_relative(&record.spec)?);
-        for part in [
-            "system.img",
-            "vendor.img",
-            "ramdisk.img",
-            "kernel-ranchu",
-            "userdata.img",
-        ] {
+        let image = paths.images.join(image_subdir(&record.spec.image)?);
+        for part in ["system.img", "vendor.img", "ramdisk.img", "kernel-ranchu"] {
             if !image.join(part).is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -99,6 +95,7 @@ impl OwnedEmulator {
                 )));
             }
         }
+        super::avd::sync_image(&data, &image, &paths.sdk)?;
         let log = OpenOptions::new()
             .create(true)
             .write(true)
@@ -148,6 +145,7 @@ impl OwnedEmulator {
             launched,
             pid_file,
             _lease: lease,
+            _resources: resources,
             record,
         };
         // 先构造 RAII owner，写入 PID 失败也能回收刚启动的进程组。

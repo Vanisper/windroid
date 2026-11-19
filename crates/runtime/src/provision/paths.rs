@@ -3,12 +3,17 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use super::catalog::{Artifact, BUILD_TOOLS, EMULATOR_VERSION, IMAGE_DIR, Kind};
+use windroid_locations::StorageLocations;
+
+use super::catalog::{Artifact, BUILD_TOOLS, IMAGE_DIR, Kind};
 use super::integrity::{check_digest, invalid};
 
 /// 各设备域使用同一组路径。私有模式完全忽略系统 SDK、PATH 和 Homebrew。
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
+    pub runtime_root: PathBuf,
+    /// 镜像根目录，其下按 API、标签和 ABI 区分安装。
+    pub images: PathBuf,
     pub sdk: PathBuf,
     pub emulator: PathBuf,
     pub adb: PathBuf,
@@ -18,6 +23,39 @@ pub struct RuntimePaths {
     pub borrowed: bool,
     adb_override: bool,
     jar_override: bool,
+    config_error: Option<String>,
+}
+
+pub(crate) struct ManagedPackage {
+    pub(crate) path: PathBuf,
+    artifact: Artifact,
+}
+
+impl ManagedPackage {
+    pub(crate) fn receipt(&self) -> Option<String> {
+        self.artifact.prefix.map(|_| receipt(self.artifact))
+    }
+
+    pub(crate) fn owned(&self) -> io::Result<bool> {
+        let result = if let Some(expected) = self.receipt() {
+            small_text(&self.path.join(RECEIPT)).map(|found| found == expected)
+        } else {
+            validate_payload(&self.path, self.artifact).map(|_| true)
+        };
+        match result {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::InvalidData
+                ) =>
+            {
+                Ok(false)
+            }
+            result => result,
+        }
+    }
 }
 
 impl RuntimePaths {
@@ -40,7 +78,7 @@ impl RuntimePaths {
                             Path::new(base).join("Cellar/scrcpy/5.0.1/share/scrcpy/scrcpy-server")
                         })
                         .find(|path| path.is_file())
-                        .unwrap_or_else(|| home.join("runtime/scrcpy-server.jar"))
+                        .unwrap_or_else(|| Self::managed(home).server_jar)
                 };
                 Self::from_sdk(sdk, jar.clone().unwrap_or_else(default_jar), true)
             }
@@ -72,12 +110,85 @@ impl RuntimePaths {
     }
 
     pub(super) fn managed(home: &Path) -> Self {
-        let root = home.join("runtime");
-        Self::from_sdk(root.join("sdk"), root.join("scrcpy-server.jar"), false)
+        let config = StorageLocations::load(home);
+        let issue = config.as_ref().err().map(ToString::to_string);
+        let config = config.unwrap_or_else(|_| StorageLocations::defaults(home));
+        let mut paths = Self::for_locations(&config);
+        paths.config_error = issue;
+        paths
+    }
+
+    fn for_locations(config: &StorageLocations) -> Self {
+        let root = &config.runtime_root;
+        let mut paths = Self::from_sdk(root.join("sdk"), root.join("scrcpy-server.jar"), false);
+        paths.images = config.images();
+        paths.image = paths
+            .images
+            .join(Path::new(IMAGE_DIR).strip_prefix("system-images").unwrap());
+        paths
+    }
+
+    /// 迁移可能已由另一进程完成。持有资源锁后再确认一次，避免写回旧目录。
+    pub(super) fn current(&self, home: &Path) -> Self {
+        if self.borrowed {
+            return self.clone();
+        }
+        let mut paths = Self::managed(home);
+        if self.adb_override {
+            paths.adb.clone_from(&self.adb);
+            paths.adb_override = true;
+        }
+        if self.jar_override {
+            paths.server_jar.clone_from(&self.server_jar);
+            paths.jar_override = true;
+        }
+        paths
+    }
+
+    pub(crate) fn check_configuration(
+        &self,
+        home: &Path,
+        components: bool,
+        images: bool,
+    ) -> io::Result<()> {
+        if self.borrowed {
+            return Ok(());
+        }
+        if let Some(message) = &self.config_error {
+            return Err(invalid(message));
+        }
+        let current = StorageLocations::load(home)?;
+        if components && !crate::storage::same_location(&self.runtime_root, &current.runtime_root)
+            || images && !crate::storage::same_location(&self.images, &current.images())
+        {
+            return Err(invalid("存储位置已更改，请重新检查运行环境"));
+        }
+        crate::storage::check_locations(home, &current, components, images, false)
+    }
+
+    pub(crate) fn claim_locations(
+        &self,
+        home: &Path,
+        components: bool,
+        images: bool,
+    ) -> io::Result<()> {
+        self.check_configuration(home, components, images)?;
+        if !self.borrowed {
+            crate::storage::check_locations(
+                home,
+                &StorageLocations::load(home)?,
+                components,
+                images,
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn from_sdk(sdk: PathBuf, server_jar: PathBuf, borrowed: bool) -> Self {
         Self {
+            runtime_root: sdk.parent().unwrap_or(&sdk).to_owned(),
+            images: sdk.join("system-images"),
             emulator: sdk.join("emulator/emulator"),
             adb: sdk.join("platform-tools/adb"),
             aapt: sdk.join(BUILD_TOOLS).join("aapt"),
@@ -87,6 +198,7 @@ impl RuntimePaths {
             borrowed,
             adb_override: false,
             jar_override: false,
+            config_error: None,
         }
     }
 
@@ -100,13 +212,36 @@ impl RuntimePaths {
         kind == Kind::Adb && self.adb_override
     }
 
-    pub(super) fn destination(&self, kind: Kind) -> PathBuf {
-        match kind {
+    pub(super) fn installation_root(&self, pkg: Artifact) -> &Path {
+        if pkg.kind == Kind::Image && !self.images.starts_with(&self.runtime_root) {
+            &self.images
+        } else {
+            &self.runtime_root
+        }
+    }
+
+    pub(crate) fn managed_packages(config: &StorageLocations) -> Vec<ManagedPackage> {
+        let paths = Self::for_locations(config);
+        super::catalog::CATALOG
+            .iter()
+            .map(|pkg| ManagedPackage {
+                path: paths.destination(*pkg),
+                artifact: *pkg,
+            })
+            .collect()
+    }
+
+    pub(super) fn destination(&self, pkg: Artifact) -> PathBuf {
+        match pkg.kind {
             Kind::Emulator => self.sdk.join("emulator"),
             Kind::Adb if self.adb_override => self.adb.clone(),
             Kind::Adb => self.sdk.join("platform-tools"),
             Kind::Aapt => self.sdk.join(BUILD_TOOLS),
-            Kind::Image => self.image.clone(),
+            Kind::Image => {
+                let image = pkg.image().expect("catalog image identity");
+                self.images
+                    .join(crate::instances::image_subdir(&image).expect("catalog ABI"))
+            }
             Kind::Server => self.server_jar.clone(),
         }
     }
@@ -134,6 +269,9 @@ pub(super) fn directory(home: &Path, path: &Path, create: bool) -> io::Result<()
     }
     if create {
         fs::create_dir_all(home)?;
+    }
+    if !fs::symlink_metadata(home)?.is_dir() {
+        return Err(invalid(format!("根目录必须为普通目录：{}", home.display())));
     }
     let mut dir = home.to_path_buf();
     for part in suffix.components() {
@@ -165,7 +303,7 @@ pub(super) fn regular(path: &Path) -> io::Result<fs::Metadata> {
     Ok(m)
 }
 
-fn small_text(path: &Path) -> io::Result<String> {
+pub(super) fn small_text(path: &Path) -> io::Result<String> {
     regular(path)?;
     let mut s = String::new();
     File::open(path)?.take(16_385).read_to_string(&mut s)?;
@@ -176,7 +314,8 @@ fn small_text(path: &Path) -> io::Result<String> {
 }
 
 pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io::Result<()> {
-    let dest = paths.destination(pkg.kind);
+    paths.check_configuration(home, pkg.kind != Kind::Image, pkg.kind == Kind::Image)?;
+    let dest = paths.destination(pkg);
     if paths.read_only(pkg.kind) {
         // 只读检查显式选中的链接目标。单独指定 adb 时可以使用开发者自己的可执行文件。
         let selected = dest.canonicalize()?;
@@ -197,22 +336,11 @@ pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io:
     } else {
         dest.parent().unwrap()
     };
-    directory(home, parent, false)?;
+    directory(paths.installation_root(pkg), parent, false)?;
     if pkg.prefix.is_some() && small_text(&dest.join(RECEIPT))? != receipt(pkg) {
         return Err(invalid("组件安装记录与发布版本不符"));
     }
     validate_payload(&dest, pkg)
-}
-
-fn revision(value: &str) -> Option<[u32; 3]> {
-    let mut parts = value.split('.');
-    let mut result = [0; 3];
-    for field in &mut result {
-        if let Some(part) = parts.next() {
-            *field = part.parse().ok()?;
-        }
-    }
-    parts.next().is_none().then_some(result)
 }
 
 /// 受信任包在发布前以及后续每次重扫都要满足同一份布局/版本契约。
@@ -222,39 +350,7 @@ pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
         return check_digest(dest, pkg, || Ok(()));
     }
     let props = small_text(&dest.join("source.properties"))?;
-    let property = |key: &str| {
-        props
-            .lines()
-            .filter_map(|s| s.trim().split_once('='))
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.trim())
-    };
-    if property("Pkg.Revision") != Some(pkg.version) {
-        return Err(invalid(format!(
-            "{} 需要版本 {}，实际为 {}",
-            pkg.name,
-            pkg.version,
-            property("Pkg.Revision").unwrap_or("未知")
-        )));
-    }
-    if pkg.kind == Kind::Image
-        && (property("AndroidVersion.ApiLevel") != Some("34")
-            || property("SystemImage.TagId") != Some("google_apis_playstore")
-            || property("SystemImage.Abi") != Some("arm64-v8a"))
-    {
-        return Err(invalid("系统镜像的 API、标签或 ABI 不匹配"));
-    }
-    if pkg.kind == Kind::Image {
-        // 当前镜像只声明一项最低依赖，例如 emulator#34.2.16。比较数字而非词典序。
-        let required = property("Pkg.Dependencies")
-            .and_then(|v| v.strip_prefix("emulator#"))
-            .and_then(revision);
-        if !required
-            .is_some_and(|v| v <= revision(EMULATOR_VERSION).expect("pinned emulator revision"))
-        {
-            return Err(invalid("镜像声明的最低模拟器版本不兼容"));
-        }
-    }
+    super::metadata::verify(&props, pkg)?;
     let executable = pkg.kind != Kind::Image;
     for &(name, bytes) in pkg.essentials {
         let path = dest.join(name);

@@ -40,6 +40,7 @@ pub(super) struct Artifact {
     pub id: &'static str,
     pub name: &'static str,
     pub version: &'static str,
+    pub image_spec: Option<ImageSpec>,
     pub url: &'static str,
     pub bytes: u64,
     pub digest: Digest,
@@ -50,7 +51,24 @@ pub(super) struct Artifact {
     pub essentials: &'static [(&'static str, u64)],
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ImageSpec {
+    pub api: u32,
+    pub min_emulator: &'static str,
+}
+
+pub(super) const IMAGE_ABI: &str = "arm64-v8a";
+pub(super) const PLAY_TAG: &str = "google_apis_playstore";
+
 impl Artifact {
+    pub fn image(self) -> Option<contract::Image> {
+        self.image_spec.map(|spec| contract::Image {
+            api: spec.api,
+            tag: PLAY_TAG.into(),
+            abi: IMAGE_ABI.into(),
+        })
+    }
+
     pub fn license(self) -> (&'static str, &'static str, &'static str) {
         match self.kind {
             Kind::Image => (
@@ -72,11 +90,12 @@ impl Artifact {
     }
 }
 
-pub(super) const CATALOG: [Artifact; 5] = [
+pub(super) const CATALOG: [Artifact; 7] = [
     Artifact {
         kind: Kind::Emulator,
         id: "emulator",
-        name: "Android 模拟器",
+        name: "Android Emulator",
+        image_spec: None,
         version: EMULATOR_VERSION,
         url: "https://dl.google.com/android/repository/emulator-darwin_aarch64-16740729.zip",
         bytes: 416_113_219,
@@ -95,7 +114,8 @@ pub(super) const CATALOG: [Artifact; 5] = [
     Artifact {
         kind: Kind::Adb,
         id: "platform-tools",
-        name: "设备连接工具",
+        name: "Android SDK Platform-Tools",
+        image_spec: None,
         version: "37.0.1",
         url: "https://dl.google.com/android/repository/platform-tools_r37.0.1-darwin.zip",
         bytes: 16_110_554,
@@ -107,7 +127,8 @@ pub(super) const CATALOG: [Artifact; 5] = [
     Artifact {
         kind: Kind::Aapt,
         id: "build-tools",
-        name: "应用包解析工具",
+        name: "Android SDK Build-Tools",
+        image_spec: None,
         version: "34.0.0",
         url: "https://dl.google.com/android/repository/build-tools_r34-macosx.zip",
         bytes: 76_559_180,
@@ -120,7 +141,8 @@ pub(super) const CATALOG: [Artifact; 5] = [
         // 发布者提供的 SHA-256：<https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/SHA256SUMS.txt>
         kind: Kind::Server,
         id: "scrcpy-server",
-        name: "画面与输入服务",
+        name: "scrcpy-server",
+        image_spec: None,
         version: "5.0.1",
         url: "https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-server-v5.0.1",
         bytes: 733_930,
@@ -132,7 +154,11 @@ pub(super) const CATALOG: [Artifact; 5] = [
     Artifact {
         kind: Kind::Image,
         id: "system-image",
-        name: "Android 14 系统镜像",
+        name: "Android 14 · Google Play",
+        image_spec: Some(ImageSpec {
+            api: 34,
+            min_emulator: "34.2.16",
+        }),
         version: "14",
         url: "https://dl.google.com/android/repository/sys-img/google_apis_playstore/arm64-v8a-34_r14.zip",
         bytes: 1_548_905_381,
@@ -144,6 +170,51 @@ pub(super) const CATALOG: [Artifact; 5] = [
             ("vendor.img", 95_420_416),
             ("kernel-ranchu", 12_784_248),
             ("ramdisk.img", 1_539_730),
+            ("userdata.img", 1_048_576),
+            ("encryptionkey.img", 18_874_368),
+        ],
+    },
+    Artifact {
+        kind: Kind::Image,
+        id: "system-image-35",
+        name: "Android 15 · Google Play",
+        image_spec: Some(ImageSpec {
+            api: 35,
+            min_emulator: "33.1.24",
+        }),
+        version: "9",
+        url: "https://dl.google.com/android/repository/sys-img/google_apis_playstore/arm64-v8a-35_r09.zip",
+        bytes: 1_789_211_399,
+        digest: Digest::Sha1("b01416bc0bca12a85295dad179f9b8a1cae3d1e6"),
+        prefix: Some(IMAGE_ABI),
+        unpacked: 2_308_619_205,
+        essentials: &[
+            ("system.img", 2_203_058_176),
+            ("vendor.img", 50_331_648),
+            ("kernel-ranchu", 14_474_326),
+            ("ramdisk.img", 1_802_106),
+            ("encryptionkey.img", 18_874_368),
+        ],
+    },
+    Artifact {
+        kind: Kind::Image,
+        id: "system-image-33",
+        name: "Android 13 · Google Play",
+        image_spec: Some(ImageSpec {
+            api: 33,
+            min_emulator: "30.7.3",
+        }),
+        version: "9",
+        url: "https://dl.google.com/android/repository/sys-img/google_apis_playstore/arm64-v8a-33_r09.zip",
+        bytes: 1_713_468_508,
+        digest: Digest::Sha1("97b81c9eb787667e53d5ae9de428284e4f230259"),
+        prefix: Some(IMAGE_ABI),
+        unpacked: 3_536_280_695,
+        essentials: &[
+            ("system.img", 3_376_414_720),
+            ("vendor.img", 98_566_144),
+            ("kernel-ranchu", 21_242_145),
+            ("ramdisk.img", 1_485_251),
             ("userdata.img", 1_048_576),
             ("encryptionkey.img", 18_874_368),
         ],

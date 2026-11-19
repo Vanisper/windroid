@@ -111,6 +111,27 @@ fn runtime_and_explicit_paths_take_precedence() {
     fs::create_dir_all(default_adb.parent().unwrap()).unwrap();
     fs::write(&default_adb, []).unwrap();
     succeeds(path(&default_adb).env("WINDROID_SERIAL", "emulator-5554"));
+    let settings = windroid_locations::StorageLocations {
+        runtime_root: f.0.join("moved tools"),
+        image_root: Some(f.0.join("independent images")),
+    };
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(windroid_locations::SETTINGS),
+        format!(
+            r#"{{"runtimeRoot":"{}","imageRoot":null}}"#,
+            settings.runtime_root.display()
+        ),
+    )
+    .unwrap();
+    succeeds(
+        path(&settings.runtime_root.join("sdk/platform-tools/adb")).env("WINDROID_HOME", &home),
+    );
+    succeeds(
+        path(&sdk.join("platform-tools/adb"))
+            .env("WINDROID_HOME", &home)
+            .env("WINDROID_SDK", &sdk),
+    );
 }
 
 #[test]

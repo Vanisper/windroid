@@ -19,13 +19,15 @@ use runtime::{
 use serde_json::json;
 
 use crate::{
-    SnapshotView,
-    names,
+    SnapshotView, names,
     surface::{WindowCommand, WindowEvent, WindowKey},
 };
 
 mod commands;
+mod first_page;
 mod observation;
+mod resources;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -109,7 +111,8 @@ impl ViewState {
 pub struct Library {
     layout: Layout,
     recommended_template: &'static str,
-    runtime: Option<Provisioner>,
+    first_page: Option<first_page::FirstPage>,
+    runtime: Option<Mutex<storage::Resources>>,
     store: Option<InstanceStore>,
     channel: HostChannel,
     windows: mpsc::Sender<WindowCommand>,
@@ -130,7 +133,15 @@ impl Library {
         windows: mpsc::Sender<WindowCommand>,
         events: mpsc::Receiver<WindowEvent>,
     ) -> Result<Arc<Self>, String> {
-        let library = Self::new(channel, layout, fake, windows, false);
+        let first_page = if fake {
+            None
+        } else {
+            let enabled =
+                std::env::var("WINDROID_SHOW_GUIDE_ON_FIRST_LAUNCH").as_deref() == Ok("1");
+            Some(first_page::FirstPage::open(&layout.root, enabled).map_err(|e| e.to_string())?)
+        };
+        let mut library = Self::new(channel, layout, fake, windows, false);
+        Arc::get_mut(&mut library).unwrap().first_page = first_page;
         if let Some(store) = &library.store {
             for record in store.list().map_err(|e| e.to_string())? {
                 library.add_record(record);
@@ -172,7 +183,8 @@ impl Library {
             } else {
                 "phone-1080"
             },
-            runtime: (!fake).then(|| Provisioner::new(layout.root.clone())),
+            first_page: None,
+            runtime: (!fake).then(|| Mutex::new(storage::Resources::open(&layout.root))),
             store: (!fake).then(|| InstanceStore::new(layout.clone())),
             layout,
             channel,
@@ -240,6 +252,16 @@ impl Library {
     }
 
     fn connect(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.channel.handle("windroid.firstPageShown", move |call| {
+            let Some(lib) = weak.upgrade() else {
+                return call.reject("应用库已关闭");
+            };
+            let result = lib.first_page.as_ref().map(|p| p.shown()).transpose();
+            call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
+        });
+        self.connect_resources();
+        self.connect_storage();
         let global = self.lane();
         let weak = Arc::downgrade(self);
         self.channel.handle(names::COMMAND, move |call| {
@@ -255,6 +277,9 @@ impl Library {
                         | "createInstance"
                         | "deleteInstance"
                         | "prepareRuntime"
+                        | "applyStorage"
+                        | "importImage"
+                        | "prepareImage"
                         | "pausePreparation"
                         | "recheckRuntime"
                 )
@@ -343,10 +368,6 @@ impl Library {
     fn revision(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
-    fn preparation(&self) -> JsonValue {
-        self.runtime.as_ref().map(|p|crate::to_json(&p.snapshot())).unwrap_or_else(||json!({"phase":"ready","borrowed":false,"components":[],"currentComponent":null,"downloadedBytes":0,"totalBytes":0,"error":null}))
-    }
-
     /// 包含所选设备事实和全库导航数据。全部来自内存，查询不会调用 adb 或扫描磁盘。
     pub fn snapshot(&self) -> JsonValue {
         let preparation = self.preparation();
@@ -371,9 +392,12 @@ impl Library {
         let id = snap.id.to_string();
         let mut view = SnapshotView::of(snap.clone()).with_apps(&snap.apps, &snap.desktop);
         // actor 判断设备状态，应用库再叠加同一份准备快照中的主机条件。
-        if preparation["phase"] != "ready" {
+        if preparation["componentsReady"] != true {
             view.capabilities.create = false;
             view.capabilities.start = false;
+        }
+        if let Some(record) = current.and_then(|row| row.record.as_ref()) {
+            view.capabilities.start &= resources::image_available(&preparation, &record.spec.image);
         }
         let mut out = crate::to_json(&view);
         out["instances"] = state
@@ -389,6 +413,7 @@ impl Library {
                 })
             })
             .collect();
+        out["showWelcome"] = json!(self.first_page.as_ref().is_some_and(|p| p.welcome()));
         out["selectedId"] = json!(state.selected);
         out["frozen"] = json!(state.frozen.contains(&id));
         out["operation"] = state
@@ -400,12 +425,24 @@ impl Library {
         state.write_running(&mut out, &snap);
         out["preparation"] = preparation;
         if let Some(runtime) = &self.runtime {
-            let paths = runtime.paths();
-            out["storage"] = json!({
-                "home": self.layout.root, "sdk": paths.sdk,
-                "images": paths.sdk.join("system-images")
-            });
+            out["storage"] = runtime.lock().unwrap().locations(&self.layout.root);
         }
+        out["templateRamMiB"] = [
+            "phone-1080",
+            "compact-720",
+            "tablet-1200",
+            "tv-1080",
+            "tv-4k",
+        ]
+        .into_iter()
+        .map(|template| {
+            (
+                template.to_owned(),
+                json!(runtime::instances::ram_mib(template)),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
         out["recommendedTemplate"] = self.recommended_template.into();
         out
     }
@@ -416,7 +453,7 @@ impl Library {
             return;
         }
         if let Some(runtime) = &self.runtime {
-            let _ = runtime.pause();
+            let _ = runtime.lock().unwrap().provisioner.pause();
         }
         let handles: Vec<_> = self
             .state
