@@ -1,7 +1,7 @@
 use contract::{Image, Spec};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 每个测试创建全新的私有根目录，子测试只访问其父测试创建并传入的目录。
 pub struct Temp(pub PathBuf);
@@ -12,16 +12,19 @@ impl Temp {
     }
 
     pub fn in_directory(base: &Path) -> Self {
-        let path = base.join(format!(
-            "windroid-instance-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!(
+                "windroid-instance-test-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("无法建立临时目录 {}：{e}", path.display()),
+            }
+        }
     }
 }
 impl Drop for Temp {
