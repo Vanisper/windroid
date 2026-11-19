@@ -729,7 +729,7 @@ fn conflicts_are_preserved_and_damaged_jar_needs_explicit_repair() {
 fn interrupted_publication_restores_or_commits_only_identified_objects() {
     use std::os::unix::fs::MetadataExt;
     let pkg = fixture(b"official", "https://example.invalid".into());
-    for step in 0..3 {
+    for step in 0..5 {
         let t = Temp::new();
         stage(&t.0, pkg, b"official");
         let p = controller(&t.0, pkg);
@@ -744,17 +744,23 @@ fn interrupted_publication_restores_or_commits_only_identified_objects() {
             let m = fs::metadata(path).unwrap();
             [m.dev(), m.ino()]
         };
-        let record = serde_json::json!({"old":identity(&dest),"new":identity(&scratch)});
+        let old = (step != 4).then(|| identity(&dest));
+        let record = serde_json::json!({"old":old,"new":identity(&scratch)});
         fs::write(
             work.join("publish.json"),
             serde_json::to_vec(&record).unwrap(),
         )
         .unwrap();
-        if step >= 1 {
+        if step == 4 {
+            fs::remove_dir_all(&dest).unwrap();
+        } else if step >= 1 {
             fs::rename(&dest, work.join("previous")).unwrap();
         }
         if step >= 2 {
             fs::rename(&scratch, &dest).unwrap();
+            if step >= 3 {
+                fs::write(dest.join("scrcpy-server.jar"), b"damaged").unwrap();
+            }
         }
         p.recheck().unwrap();
         assert_eq!(p.snapshot().components[0].integrity, "damaged");

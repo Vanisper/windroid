@@ -196,22 +196,30 @@ pub(super) fn recover(
         return Err(invalid(format!("原版本备份发生变化：{}", backup.display())));
     }
     if current == Some(record.new) {
-        if let Err(e) = super::manifest::check(home, dest, pkg, true, || Ok(())) {
-            if previous.is_some() {
-                // 只撤回已识别、没有新加入用户文件的本次发布物。
-                let _previous = crate::storage::lock_staged_version(&backup)?;
-                super::manifest::repairable(dest, pkg)?;
-                crate::storage::rename_exclusive(dest, &stage.join("rejected"))?;
-                crate::storage::rename_exclusive(&backup, dest)?;
-                remove_owned(&stage.join("rejected"))?;
-                fs::remove_file(&journal)?;
+        match super::manifest::check(home, dest, pkg, true, || Ok(())) {
+            Ok(_) if previous.is_some() => {
+                let _lease = crate::storage::lock_staged_version(&backup)?;
+                super::manifest::repairable(&backup, pkg)?;
+                remove_owned(&backup)?;
             }
-            return Err(e);
-        }
-        if previous.is_some() {
-            let _lease = crate::storage::lock_staged_version(&backup)?;
-            super::manifest::repairable(&backup, pkg)?;
-            remove_owned(&backup)?;
+            Ok(_) => (),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                super::manifest::repairable(dest, pkg)?;
+                if previous.is_some() {
+                    restored = Some(crate::storage::lock_staged_version(&backup)?);
+                    crate::storage::rename_exclusive(dest, &stage.join("rejected"))?;
+                    crate::storage::rename_exclusive(&backup, dest)?;
+                }
+                // 首次发布没有备份时保留现状，本次明确修复会在新副本通过验收后再替换。
+            }
+            Err(e) => return Err(e),
         }
     } else if current.is_none() && previous.is_some() {
         restored = Some(crate::storage::lock_staged_version(&backup)?);
@@ -222,8 +230,21 @@ pub(super) fn recover(
             dest.display()
         )));
     }
+    let rejected = stage.join("rejected");
+    if let Some(identity) = object(&rejected)? {
+        if identity != record.new {
+            return Err(invalid("撤回版本的对象身份已变化"));
+        }
+        super::manifest::repairable(&rejected, pkg)?;
+        remove_owned(&rejected)?;
+    }
     fs::remove_file(journal)?;
     Ok(restored)
+}
+
+/// 调用方已取得版本写锁并恢复发布事务，可以回收该次中断留下的解压空间。
+pub(super) fn discard_unpack(stage: &Path) -> io::Result<()> {
+    remove_owned(&stage.join("unpack"))
 }
 
 pub(super) fn install(
@@ -237,7 +258,8 @@ pub(super) fn install(
 ) -> io::Result<()> {
     let scratch = stage.join("unpack");
     let backup = stage.join("previous");
-    remove_owned(&scratch)?;
+    let guard = File::open(stage.join("owner"))?.metadata()?;
+    discard_unpack(stage)?;
     if object(&backup)?.is_some() {
         return Err(invalid("无法确认原版本备份的来源"));
     }
@@ -300,7 +322,10 @@ pub(super) fn install(
         // 另一线程可能正在 fork 子进程，显式解锁后才向调用方报告新版本可读。
         File::unlock(&_next)
     })();
-    if result.is_err() && check().is_ok() {
+    if result.is_err()
+        && fs::symlink_metadata(stage.join("owner"))
+            .is_ok_and(|m| (m.dev(), m.ino()) == (guard.dev(), guard.ino()))
+    {
         remove_owned(&scratch)?;
     }
     result

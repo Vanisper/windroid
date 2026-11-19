@@ -283,7 +283,10 @@ impl Provisioner {
                 .map_err(|e| e.to_string())?;
         }
         // 选中已核验的版本不要求资源卷可写。批量准备只补缺失项，损坏项须逐项确认。
-        state.snapshot = shared.scan();
+        // 完整核验的第一遍大文件读取也在 worker 中，按钮回调立即返回可见进度。
+        if !matches!(task, Task::Verify) {
+            state.snapshot = shared.scan();
+        }
         let mut selected = Vec::new();
         for pkg in packages.drain(..) {
             let row = if candidate_job {
@@ -297,8 +300,10 @@ impl Provisioner {
                     .clone()
             };
             match task {
-                Task::Verify if row.integrity != "missing" => (),
-                Task::Verify => return Err("版本尚未安装".into()),
+                Task::Verify => {
+                    fs::symlink_metadata(paths.destination(pkg))
+                        .map_err(|e| format!("无法打开待核验版本：{e}"))?;
+                }
                 Task::Repair(ref confirmed) if *confirmed != paths.destination(pkg) => {
                     return Err("资源位置已变化，请重新确认此版本及路径".into());
                 }
@@ -652,6 +657,26 @@ impl Shared {
             .iter()
             .try_for_each(|&pkg| self.prepare(pkg, &task, paths, candidate));
         let mut snap = self.scan();
+        let result = result.and_then(|()| {
+            let unexpected = if candidate {
+                let row = component(&self.home, paths, packages[0]);
+                (!row.ready).then_some(row)
+            } else {
+                snap.components
+                    .iter()
+                    .chain(&snap.images)
+                    .find(|row| !row.ready && packages.iter().any(|p| p.id == row.id))
+                    .cloned()
+            };
+            match unexpected {
+                Some(row) => Err(invalid(format!(
+                    "发布后复查 {} 失败：{}",
+                    row.location.display(),
+                    row.issue.as_deref().unwrap_or("找不到所选版本")
+                ))),
+                None => Ok(()),
+            }
+        });
         let mut state = self.state.lock().unwrap();
         let current = state.snapshot.current_component;
         if candidate {
@@ -748,8 +773,9 @@ impl Shared {
             prefix_bytes(paths, pkg)
         };
         let stage_path = archive::stage_path(&dest, pkg);
-        let recovering =
-            archive::is_workspace(&stage_path) && stage_path.join("publish.json").try_exists()?;
+        let recovering = archive::is_workspace(&stage_path)
+            && (stage_path.join("publish.json").try_exists()?
+                || stage_path.join("unpack").try_exists()?);
         // 已经换入的新版本只需复查和回收备份，不要求再腾出一份完整解压空间。
         if !recovering {
             check_capacity(parent, pkg, prefix)?;
@@ -794,6 +820,7 @@ impl Shared {
             }
         }
         if recovering {
+            archive::discard_unpack(&stage)?;
             check_capacity(parent, pkg, prefix)?;
         }
         let part = partial(&stage, pkg);

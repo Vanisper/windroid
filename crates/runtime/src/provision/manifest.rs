@@ -225,10 +225,12 @@ pub fn preview_seed(home: &Path) -> io::Result<Vec<String>> {
                 return Err(conflict(format!("预放目录含未知项目：{}", path.display())));
             }
             if let Some(pkg) = packages.iter().find(|pkg| pkg.path == path) {
+                let _lease = crate::storage::version_read_lease(&path)?;
                 if !empty_skeleton(&path, pkg.artifact)? {
                     pkg.verify_at(&path)?;
                     versions.push(pkg.label());
                 }
+                let _ = _lease.unlock();
             } else if containers.contains(path.as_path()) {
                 todo.push(path);
             } else {
