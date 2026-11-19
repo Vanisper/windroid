@@ -12,6 +12,8 @@ fn main() -> Result<(), String> {
     let mtm = MainThreadMarker::new().expect("必须在主线程启动");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    // 格式确认可能是首个原生窗口。先让 AppKit 完成启动，模态按钮与辅助功能才可用。
+    app.finishLaunching();
     let layout = runtime::Layout::default_root();
     if !open_workspace(mtm, &layout.root) {
         return Ok(());
