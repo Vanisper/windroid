@@ -726,6 +726,7 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     press(&mut ui.app, "guide-from-inventory");
     press(&mut ui.app, "guide-begin");
     wait(&mut ui.app, "id:components");
+    assert!(bounds(&ui.app, "guide-skip-components").bottom().0 < 520.0);
     press(&mut ui.app, "prepare-runtime");
     wait(&mut ui.app, "id:component-progress");
     press(&mut ui.app, "guide-skip-components");

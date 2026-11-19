@@ -33,7 +33,10 @@ export function Components(props: { next?: () => void; skip?: () => void }) {
   const missing = computed(() => info()?.components.filter(c => c.integrity === "missing") ?? []);
   const start = () => send({ kind: "prepareRuntime", acceptedLicenses: true }, "准备运行组件");
   return <View testID="components" style={{ gap: 12 }}>
-    <Heading text={phaseTitle[phase()]} />
+    <View style={row}>
+      <Heading text={phaseTitle[phase()]} />
+      {props.skip ? <Button id="guide-skip-components" label="跳过" press={props.skip} /> : null}
+    </View>
     <Detail text={"Android 实例共用以下运行组件。" + (props.skip && active() ? "退出引导后会继续下载。" : "")} />
     <View style={card()}>
       <Heading text="组件与许可" />
@@ -51,7 +54,6 @@ export function Components(props: { next?: () => void; skip?: () => void }) {
             label={phase() === "paused" ? "同意并继续下载" : phase() === "failed" ? "同意并重试" : "同意并下载组件"} /> : null}
         {phase() === "downloading" ? <Button id="pause-preparation" label="暂停下载" disabled={busy()} press={() => send({ kind: "pausePreparation" }, "暂停下载")} /> : null}
         <Button id="recheck-runtime" label="重新检查" disabled={busy() || activeTransfer()} press={() => send({ kind: "recheckRuntime" }, "检查环境")} />
-        {props.skip ? <Button id="guide-skip-components" label="跳过" press={props.skip} /> : null}
       </View>
     </View>
   </View>;
