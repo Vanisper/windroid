@@ -8,6 +8,7 @@ pub(super) struct Resources {
     pub error: Option<String>,
     paths: RuntimePaths,
     cleanup: Vec<String>,
+    defaults: (bool, bool),
     preview: Option<(u64, MigrationPlan)>,
 }
 
@@ -16,8 +17,10 @@ impl Resources {
     pub fn open(home: &Path) -> Self {
         let result = storage::recover(home).and_then(|_| StorageLocations::load(home));
         let provisioner = Provisioner::new(home);
+        let paths = provisioner.paths();
         Self {
-            paths: provisioner.paths(),
+            defaults: default_state(home, &paths),
+            paths,
             provisioner,
             error: result.err().map(|e| e.to_string()),
             cleanup: storage::pending_cleanup(home).unwrap_or_default(),
@@ -39,8 +42,17 @@ impl Resources {
         let defaults = StorageLocations::defaults(home);
         json!({"home":home,"runtimeRoot":self.paths.runtime_root,"imageRoot":self.paths.images,
                "defaultRuntimeRoot":defaults.runtime_root,"defaultImageRoot":defaults.image_root,
+               "runtimeIsDefault":self.defaults.0,"imageIsDefault":self.defaults.1,
                "error":self.error,"cleanupNotes":self.cleanup})
     }
+}
+
+fn default_state(home: &Path, paths: &RuntimePaths) -> (bool, bool) {
+    let defaults = StorageLocations::defaults(home);
+    (
+        storage::same_location(&defaults.runtime_root, &paths.runtime_root),
+        storage::same_location(&defaults.image_root, &paths.images),
+    )
 }
 
 fn transfer_uses(plan: &MigrationPlan, p: &Provisioner) -> bool {
@@ -66,6 +78,7 @@ impl Library {
         let mut res = runtime.lock().unwrap();
         res.preview = None;
         res.paths = p.paths();
+        res.defaults = default_state(&self.layout.root, &res.paths);
         res.error = result.as_ref().err().cloned();
         result.map(|notes| res.cleanup = notes)
     }
@@ -99,7 +112,9 @@ impl Library {
         }
         let mut plan = storage::preview_switch(&self.layout.root, &requested, mode, cleanup)
             .map_err(|e| e.to_string())?;
-        if plan.before != expected {
+        if plan.before != expected
+            || StorageLocations::load(&self.layout.root).map_err(|e| e.to_string())? != expected
+        {
             return Err(stale());
         }
         let id = self.revision();
@@ -129,13 +144,15 @@ impl Library {
             .runtime
             .as_ref()
             .ok_or_else(|| error("演示环境没有资源目录"))?;
-        let resources = runtime.lock().unwrap();
-        let plan = &resources
-            .preview
-            .as_ref()
-            .filter(|(selected, _)| *selected == id)
-            .ok_or_else(|| error("预览已过期，请重新核验"))?
-            .1;
+        let (provisioner, plan) = {
+            let resources = runtime.lock().unwrap();
+            let (_, plan) = resources
+                .preview
+                .as_ref()
+                .filter(|(selected, _)| *selected == id)
+                .ok_or_else(|| error("预览已过期，请重新核验"))?;
+            (resources.provisioner.clone(), plan.clone())
+        };
         if plan.before != StorageLocations::load(&self.layout.root).map_err(error)?
             || !plan
                 .versions
@@ -144,8 +161,8 @@ impl Library {
         {
             return Err(error("请重新预览并选择目标目录所缺的镜像"));
         }
-        resources
-            .provisioner
+        plan.check_candidate_image_root().map_err(error)?;
+        provisioner
             .start_image_at(package, &plan.after)
             .map_err(error)?;
         Ok(self.revision())
