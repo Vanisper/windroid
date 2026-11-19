@@ -312,7 +312,15 @@ impl Provisioner {
                 Task::Repair(_) => {
                     return Err(row.issue.unwrap_or_else(|| "此版本不能替换".into()));
                 }
-                _ if row.ready => continue,
+                _ if row.ready => {
+                    if candidate_job {
+                        state.snapshot.candidate_target = target.clone();
+                        state.snapshot.candidate_downloaded_bytes = Some(pkg.bytes);
+                        state.snapshot.current_component = Some(pkg.id);
+                        state.snapshot.phase = "ready";
+                    }
+                    continue;
+                }
                 _ if row.integrity == "missing" => (),
                 _ if components && matches!(task, Task::Missing) => continue,
                 _ => {

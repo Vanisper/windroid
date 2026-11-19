@@ -859,5 +859,13 @@ fn candidate_download_progress_and_prefix_stay_with_the_selected_volume() {
     assert!(!done.images[0].ready && !done.images[0].location.exists());
     assert_eq!(*http.ranges.lock().unwrap(), [0, retained as usize]);
     assert!(dest.join("system.img").is_file());
+    let reused = controller(&home.0, image);
+    reused.start_image_at(image.id, &settings).unwrap();
+    let ready = reused.snapshot();
+    assert_eq!(ready.phase, "ready");
+    assert_eq!(ready.candidate_target.as_ref(), Some(&dest));
+    assert_eq!(ready.candidate_downloaded_bytes, Some(bytes.len() as u64));
+    assert!(!ready.images[0].ready);
+    assert_eq!(http.ranges.lock().unwrap().len(), 2);
     assert!(!home.0.join(windroid_locations::SETTINGS).exists());
 }
