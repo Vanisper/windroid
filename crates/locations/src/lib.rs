@@ -1,7 +1,8 @@
 //! 运行时与 adb 共用的目录设置。实例、日志和设置始终归属原工作区。
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, ErrorKind};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub const SETTINGS: &str = "storage-v2.json";
@@ -24,15 +25,25 @@ impl StorageLocations {
 
     pub fn load(home: &Path) -> io::Result<Self> {
         let path = home.join(SETTINGS);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) => {
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => {
+                let meta = file.metadata()?;
                 if !meta.is_file() || meta.len() > 32 * 1024 {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "资源位置设置必须为普通 JSON 文件"));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "资源位置设置必须为普通 JSON 文件",
+                    ));
                 }
-                let file = File::open(path)?;
                 let locations: Self = serde_json::from_reader(file)?;
                 for path in [&locations.runtime_root, &locations.image_root] {
                     if !path.is_absolute()
+                        || path
+                            .to_str()
+                            .is_none_or(|name| name.chars().any(char::is_control))
                         || path
                             .components()
                             .any(|p| p == std::path::Component::ParentDir)
