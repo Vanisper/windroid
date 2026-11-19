@@ -17,30 +17,44 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+/// 旧客户端可能只留下 active.pid；仅探测是否仍存活，不能据此接管进程。
+pub(crate) fn live_marker(dir: &Path) -> io::Result<Option<i32>> {
+    use std::io::Read;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("active.pid"))
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() || file.metadata()?.len() > 32 {
+        return Err(super::invalid("实例运行记录无效"));
+    }
+    let mut value = String::new();
+    file.take(33).read_to_string(&mut value)?;
+    let pid = value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| super::invalid("实例运行记录的 PID 无效"))?;
+    Ok((unsafe { libc::kill(pid, 0) } == 0
+        || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
+    .then_some(pid))
+}
+
 pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
-    let marker = dir.join("active.pid");
-    match fs::read_to_string(&marker) {
-        Ok(value) => {
-            let pid: i32 = value
-                .trim()
-                .parse()
-                .map_err(|_| super::invalid("实例运行记录无效"))?;
-            if pid <= 0 {
-                return Err(super::invalid("实例进程号无效"));
-            }
-            // 信号 0 仅探测，重用的 PID 不会收到停止信号。
-            if unsafe { libc::kill(pid, 0) } == 0
-                || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("实例上次启动的进程 {pid} 尚未确认退出，请先关闭它"),
-                ));
-            }
-            fs::remove_file(marker)
-        }
+    if let Some(pid) = live_marker(dir)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("实例上次启动的进程 {pid} 尚未确认退出，请先关闭它"),
+        ));
+    }
+    match fs::remove_file(dir.join("active.pid")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        result => result,
     }
 }
 
@@ -126,7 +140,10 @@ impl OwnedEmulator {
         let (hardware, demand, budget) = launch_requirements(store, &record, paths)?;
         adb::ensure_server(&paths.adb)?;
         // adb 服务启动可能等待握手。完成后才读取宿主状态、取得额度并启动子进程。
-        let reservation = active.admission.reserve(port, demand, budget)?;
+        let mut reservation =
+            active
+                .admission
+                .reserve(port, demand, budget, Some((store, &dir)))?;
         super::avd::sync_image(&data, &image)?;
         let log = OpenOptions::new()
             .create(true)
@@ -191,6 +208,7 @@ impl OwnedEmulator {
                 format!("无法启动 {}：{e}", paths.emulator.display()),
             )
         })?;
+        reservation.child_inherited();
         let owned = Self {
             child,
             launched,
@@ -225,13 +243,14 @@ impl OwnedEmulator {
         let record = store.get(&self.record.id)?;
         let resources = active.resolve_versions(store.home(), &record.spec.image)?;
         let dir = self.pid_file.parent().unwrap();
+        crate::workspace::access(&resources.paths.emulator, libc::X_OK)?;
         launch_paths(dir, &record, &resources.paths)?;
         super::quick_boot::requires_cold_start(dir)?;
         let (_, demand, budget) = launch_requirements(store, &record, &resources.paths)?;
         adb::ensure_server(&resources.paths.adb)?;
         active
             .admission
-            .check_replacement(&self.reservation, demand, budget)
+            .check_replacement(&self.reservation, demand, budget, Some(store))
     }
 
     pub fn alive(&mut self) -> io::Result<bool> {

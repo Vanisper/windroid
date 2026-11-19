@@ -278,9 +278,13 @@ esac
     let store = InstanceStore::new(layout.clone());
     let a = store.create("工作 A", spec("compact-720")).unwrap();
     let fixture = runtime::ActiveRuntime::new(|home, _| {
+        if home.join("next-lease-unavailable").exists() {
+            return Err(std::io::Error::other("新的资源根不可用"));
+        }
         Ok((runtime::provision::RuntimePaths::discover(home), Vec::new()))
     });
     let pressure_path = root.join("pressure-critical");
+    let empty_headroom = root.join("no-headroom");
     let fixture = fixture.with_admission(runtime::admission::Admission::new(
         root.join("admission"),
         move || {
@@ -290,7 +294,7 @@ esac
             } else {
                 MemoryPressure::Normal
             };
-            MemoryObservation::current(pressure, 16 << 10)
+            MemoryObservation::current(pressure, if empty_headroom.exists() { 0 } else { 16 << 10 })
         },
     ));
     let mut backend = EmulatorBackend::with_runtime(a.id.clone(), layout.clone(), a.port, fixture);
@@ -324,6 +328,16 @@ esac
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(pid_marker.exists());
     fs::remove_file(&pid_marker).unwrap();
+    let old = store.create("此前启动的实例", spec("compact-720")).unwrap();
+    let unknown_pid = layout.instance(&old.id).join("active.pid");
+    fs::write(&unknown_pid, std::process::id().to_string()).unwrap();
+    let failure = backend.exec(&Command::Start, &mut facts).unwrap_err();
+    assert!(
+        matches!(failure, Rejection::Error { detail, .. } if detail.contains("此前启动的实例") && detail.contains("原有会话"))
+    );
+    assert!(!facts.process_alive && unknown_pid.exists());
+    fs::remove_file(unknown_pid).unwrap();
+    store.delete(&old.id).unwrap();
     // 在已经预留后制造 spawn 失败。恢复可执行文件后同一实例应能立即再次申请。
     let emulator = runtime::provision::RuntimePaths::discover(&root).emulator;
     let unavailable = emulator.with_extension("disabled");
@@ -347,6 +361,16 @@ esac
     assert_eq!(fs::read_to_string(&pid_marker).unwrap(), original_pid);
     assert!(backend.active_runtime().current().is_some());
     fs::remove_file(root.join("pressure-critical")).unwrap();
+    fs::write(root.join("next-lease-unavailable"), b"1").unwrap();
+    let rejection = backend
+        .exec(&Command::Restart { cold: false }, &mut facts)
+        .unwrap_err();
+    assert!(
+        matches!(rejection, Rejection::Error { detail, .. } if detail.contains("资源根不可用"))
+    );
+    assert_eq!(fs::read_to_string(&pid_marker).unwrap(), original_pid);
+    assert!(backend.active_runtime().current().is_some());
+    fs::remove_file(root.join("next-lease-unavailable")).unwrap();
     let mut another = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
     assert!(
         another
@@ -460,7 +484,16 @@ esac
         assert!(Instant::now() < deadline, "冷启动参数未交给子进程");
         std::thread::sleep(Duration::from_millis(10));
     }
-    backend.exec(&Command::Stop, &mut facts).unwrap();
+    // 替换同规格在旧会话占用的额度内可行；真正退出后，按新的宿主页数再查整笔申请。
+    fs::write(root.join("no-headroom"), "").unwrap();
+    let rejection = backend
+        .exec(&Command::Restart { cold: false }, &mut facts)
+        .unwrap_err();
+    assert!(
+        matches!(rejection, Rejection::Error { detail, .. } if detail.contains("预计可分配 0 MiB"))
+    );
+    assert!(!facts.process_alive && facts.stop_requested);
+    fs::remove_file(root.join("no-headroom")).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     assert_eq!(backend.catalog_status(), CatalogStatus::Pending);
     assert_eq!(State::of(&facts), State::Stopped);

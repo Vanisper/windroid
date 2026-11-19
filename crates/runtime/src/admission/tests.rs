@@ -52,24 +52,31 @@ fn full_cpu_and_memory_budgets_are_inclusive_on_different_hosts() {
         let admission = d.controller(gib << 10);
         let budget = host(cores, gib);
         let first = admission
-            .reserve(5554, guest(cores - 1, (gib << 9) as u32 - 2560), budget)
+            .reserve(
+                5554,
+                guest(cores - 1, (gib << 9) as u32 - 2560),
+                budget,
+                None,
+            )
             .unwrap();
         let exceeds_ram = admission
-            .reserve(5556, guest(1, 2561), budget)
+            .reserve(5556, guest(1, 2561), budget, None)
             .err()
             .unwrap();
         assert!(exceeds_ram.to_string().contains("共享额度剩余 2560 MiB"));
         let exceeds_cpu = admission
-            .reserve(5556, guest(2, 2560), budget)
+            .reserve(5556, guest(2, 2560), budget, None)
             .err()
             .unwrap();
         assert!(exceeds_cpu.to_string().contains("当前可分配 1 核"));
-        let second = admission.reserve(5556, guest(1, 2560), budget).unwrap();
+        let second = admission
+            .reserve(5556, guest(1, 2560), budget, None)
+            .unwrap();
         drop((first, second));
         // 异常退出或 spawn 失败后关闭最后一个 fd，旧记录立即失效。
         assert!(
             admission
-                .reserve(5554, guest(cores, (gib << 9) as u32), budget)
+                .reserve(5554, guest(cores, (gib << 9) as u32), budget, None)
                 .is_ok()
         );
     }
@@ -83,16 +90,41 @@ fn a_fourth_guest_fits_when_both_budgets_and_its_port_are_available() {
         .into_iter()
         .map(|port| {
             admission
-                .reserve(port, guest(2, 2048), host(8, 16))
+                .reserve(port, guest(2, 2048), host(8, 16), None)
                 .unwrap()
         })
         .collect();
     assert!(
         admission
-            .reserve(5560, guest(1, 2048), host(32, 64))
+            .reserve(5560, guest(1, 2048), host(32, 64), None)
             .is_err()
     );
     drop(guests);
+}
+
+#[test]
+fn later_checks_use_the_live_guest_allocation() {
+    let dir = Temp::new();
+    let controller = dir.controller(8192);
+    let budget = host(4, 8);
+    let mut grant = controller
+        .reserve(5554, guest(2, 2048), budget, None)
+        .unwrap();
+    controller
+        .reconcile(
+            &mut grant,
+            contract::GuestAllocation {
+                cpu_cores: None,
+                ram_mib: Some(2560),
+            },
+        )
+        .unwrap();
+    let reason = controller
+        .reserve(5556, guest(1, 2048), budget, None)
+        .err()
+        .unwrap();
+    assert!(reason.to_string().contains("共享额度剩余 1536 MiB"));
+    assert_eq!(grant.grant.demand.cores, 2);
 }
 
 #[test]
@@ -107,7 +139,7 @@ fn simultaneous_requests_cannot_spend_the_same_headroom_twice() {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    controller.reserve(port, guest(1, 2560), host(10, 16))
+                    controller.reserve(port, guest(1, 2560), host(10, 16), None)
                 })
             })
             .collect();
@@ -124,7 +156,7 @@ fn simultaneous_requests_cannot_spend_the_same_headroom_twice() {
     });
     assert!(
         dir.controller(2560)
-            .reserve(5554, guest(1, 2560), host(10, 16))
+            .reserve(5554, guest(1, 2560), host(10, 16), None)
             .is_ok()
     );
 }
@@ -133,6 +165,7 @@ fn simultaneous_requests_cannot_spend_the_same_headroom_twice() {
 fn only_post_sample_grants_count_toward_headroom_even_if_an_older_guest_exits() {
     let now = 5 * SAMPLE_LIFETIME_NS;
     let old = Grant {
+        instance: None,
         port: 5554,
         since: 100,
         demand: guest(2, 4096),
@@ -140,6 +173,7 @@ fn only_post_sample_grants_count_toward_headroom_even_if_an_older_guest_exits() 
     };
     let observed = sample(4096, now - 3);
     let newer = Grant {
+        instance: None,
         port: 5556,
         since: now - 2,
         demand: guest(2, 2560),
@@ -192,7 +226,7 @@ fn stale_missing_and_critical_observations_are_never_unlimited() {
         });
         assert!(
             admission
-                .reserve(5554, guest(1, 2048), host(4, 8))
+                .reserve(5554, guest(1, 2048), host(4, 8), None)
                 .err()
                 .unwrap()
                 .to_string()
@@ -207,20 +241,28 @@ fn stale_missing_and_critical_observations_are_never_unlimited() {
         }
         MemoryObservation::current(MemoryPressure::Warning, 2048)
     });
-    let current = recovered.reserve(5554, guest(1, 2048), host(4, 8)).unwrap();
+    let current = recovered
+        .reserve(5554, guest(1, 2048), host(4, 8), None)
+        .unwrap();
     let critical = Admission::new(dir.0.clone(), || {
         MemoryObservation::current(MemoryPressure::Critical, 32000)
     });
     assert!(
         critical
-            .check_replacement(&current, guest(1, 2048), host(4, 8))
+            .check_replacement(&current, guest(1, 2048), host(4, 8), None)
             .unwrap_err()
             .to_string()
             .contains("压力过高")
     );
-    assert!(recovered.reserve(5554, guest(1, 2048), host(4, 8)).is_err());
+    assert!(
+        recovered
+            .reserve(5554, guest(1, 2048), host(4, 8), None)
+            .is_err()
+    );
     drop(current);
-    recovered.reserve(5554, guest(1, 2048), host(4, 8)).unwrap();
+    recovered
+        .reserve(5554, guest(1, 2048), host(4, 8), None)
+        .unwrap();
 }
 
 #[test]
@@ -231,8 +273,8 @@ fn inherited_grant_survives_launcher_exit_and_is_released_by_child_exit() {
     use std::process::{Command, Stdio};
     let dir = Temp::new();
     let admission = dir.controller(2560);
-    let grant = admission
-        .reserve(5554, guest(1, 2560), host(10, 16))
+    let mut grant = admission
+        .reserve(5554, guest(1, 2560), host(10, 16), None)
         .unwrap();
     let fd = grant.file.as_raw_fd();
     let mut cmd = Command::new("/bin/sh");
@@ -249,6 +291,7 @@ fn inherited_grant_survives_launcher_exit_and_is_released_by_child_exit() {
         });
     }
     let mut child = cmd.spawn().unwrap();
+    grant.child_inherited();
     assert_eq!(
         BufReader::new(child.stdout.take().unwrap())
             .lines()
@@ -260,14 +303,14 @@ fn inherited_grant_survives_launcher_exit_and_is_released_by_child_exit() {
     drop(grant);
     assert!(
         admission
-            .reserve(5554, guest(1, 2560), host(10, 16))
+            .reserve(5554, guest(1, 2560), host(10, 16), None)
             .is_err()
     );
     child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(
         admission
-            .reserve(5554, guest(1, 2560), host(10, 16))
+            .reserve(5554, guest(1, 2560), host(10, 16), None)
             .is_ok()
     );
 }

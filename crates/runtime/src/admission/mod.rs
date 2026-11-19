@@ -2,6 +2,7 @@
 //! 每个活动端口的文件锁由启动者及模拟器继承；异常退出无需清理持久计数器。
 
 mod observation;
+use crate::instances::InstanceStore;
 pub use observation::{MemoryObservation, MemoryPressure};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -49,6 +50,8 @@ pub(crate) struct Budget {
 struct Grant {
     port: u16,
     since: u64,
+    #[serde(default)]
+    instance: Option<(u64, u64)>,
     demand: Demand,
     sample: MemoryObservation,
 }
@@ -56,6 +59,22 @@ struct Grant {
 pub(crate) struct Reservation {
     pub file: File,
     grant: Grant,
+    child_holds_lock: bool,
+}
+
+impl Reservation {
+    pub fn child_inherited(&mut self) {
+        self.child_holds_lock = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // spawn 之前失败时可立即归还。已交接时由持有同一文件描述的最后一个进程释放。
+        if !self.child_holds_lock {
+            let _ = self.file.unlock();
+        }
+    }
 }
 
 impl Admission {
@@ -133,9 +152,16 @@ impl Admission {
         port: u16,
         demand: Demand,
         budget: Budget,
+        workspace: Option<(&InstanceStore, &Path)>,
     ) -> io::Result<Reservation> {
         let _guard = self.lock()?;
         let grants = self.grants()?;
+        let instance = if let Some((store, dir)) = workspace {
+            check_workspace(store, &grants)?;
+            Some(object(dir)?)
+        } else {
+            None
+        };
         if grants.iter().any(|g| g.port == port) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -148,6 +174,7 @@ impl Admission {
         let grant = Grant {
             port,
             since,
+            instance,
             demand,
             sample,
         };
@@ -156,7 +183,11 @@ impl Admission {
         file.set_len(0)?;
         serde_json::to_writer(&mut file, &grant)?;
         file.flush()?;
-        Ok(Reservation { file, grant })
+        Ok(Reservation {
+            file,
+            grant,
+            child_holds_lock: false,
+        })
     }
 
     /// 同一启动回读到 QEMU 最终参数后，以真实分配计入后续共享额度。
@@ -190,9 +221,13 @@ impl Admission {
         current: &Reservation,
         demand: Demand,
         budget: Budget,
+        workspace: Option<&InstanceStore>,
     ) -> io::Result<()> {
         let _guard = self.lock()?;
         let grants = self.grants()?;
+        if let Some(store) = workspace {
+            check_workspace(store, &grants)?;
+        }
         if !grants
             .iter()
             .any(|g| g.port == current.grant.port && g.since == current.grant.since)
@@ -208,6 +243,32 @@ impl Admission {
             observation::now()?,
         )
     }
+}
+
+fn object(dir: &Path) -> io::Result<(u64, u64)> {
+    let meta = fs::metadata(dir)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+fn check_workspace(store: &InstanceStore, grants: &[Grant]) -> io::Result<()> {
+    // 旧版窗口能在当前工作区留下仍在运行、只有 PID 而没有额度记录的实例。
+    // 端口可被其他工作区复用，同时核对实例目录对象才能认作同一笔活动预留。
+    for record in store.list()? {
+        let dir = store.home().join("instances").join(record.id.as_str());
+        if let Some(pid) = crate::instances::process::live_marker(&dir)? {
+            let source = object(&dir)?;
+            if !grants
+                .iter()
+                .any(|g| g.port == record.port && g.instance == Some(source))
+            {
+                return Err(io::Error::other(format!(
+                    "无法确认实例「{}」的活动资源（PID {pid}），请先关闭其原有会话再启动",
+                    record.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lock_file(path: &Path) -> io::Result<File> {
