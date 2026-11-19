@@ -2,6 +2,7 @@ import { cleanup, computed, signal, View } from "nsh";
 import { Input } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
+import { hardwareDraft, HardwareFields, hardwareLimits } from "./hardware";
 import { ImageList, imageDescription } from "./images";
 import { busy, creationImage, environmentReady, images, instances, navigate, report, send, snapshot } from "./model";
 
@@ -26,18 +27,24 @@ export function CreateInstance(props: { skip?: () => void }) {
   const number = instances().length + 1;
   const name = signal(number === 1 ? "我的 Android" : "Android " + number);
   const template = signal(templates.find(item => item.id === snapshot()?.recommendedTemplate) ?? templates[0]);
+  const limits = hardwareLimits(() => {
+    const resource = image();
+    return resource?.image ? { template: template().id, imageId: resource.id, image: resource.image } : null;
+  });
+  const hardware = hardwareDraft(limits);
   const invalid = computed(() => {
     const value = name().trim();
     return !value || Array.from(value).length > 64 || /[\u0000-\u001f\u007f-\u009f]/.test(value);
   });
   async function create() {
     const selectedImage = image();
-    if (!selectedImage || invalid() || busy() || !environmentReady()) return;
+    if (!selectedImage || invalid() || hardware.issue() || busy() || !environmentReady()) return;
     if (!selectedImage.image || !(selectedImage.image.revision > 0)) {
       report("所选镜像缺少修订号，请重新检查发布清单。", true);
       return;
     }
-    if (await send({ kind: "createInstance", name: name().trim(), template: template().id, imageId: selectedImage.id, image: selectedImage.image }, "创建实例") && mounted) navigate("library");
+    if (await send({ kind: "createInstance", name: name().trim(), template: template().id, imageId: selectedImage.id, image: selectedImage.image,
+      ...hardware.values(), diskGiB: hardware.disk.amount() }, "创建实例") && mounted) navigate("library");
   }
   const chooseTemplate = () => Menu.popup(templates.map(t => ({ label: t.name + " · " + t.dimensions, checked: template().id === t.id, onSelect: () => template.set(t) })))
     .catch(e => report("无法显示设备模板 · " + String(e), true));
@@ -59,13 +66,12 @@ export function CreateInstance(props: { skip?: () => void }) {
           {invalid() ? <Detail text="请输入 1 至 64 个字符，名称不能包含控制字符。" /> : null}
           <Heading text="设备模板" />
           <Button id="choose-template" disabled={busy()} label={template().name + " · " + template().dimensions + "  ▾"} press={chooseTemplate} />
-          <Detail text={"处理器 · 2 核" + (snapshot()?.templateRamMiB?.[template().id] ? "    内存 · " + snapshot()!.templateRamMiB![template().id] + " MiB" : "")} />
-          <Detail text="用户空间 · 8 GiB" />
           <Heading text="系统镜像" />
           <Detail text={image() ? image()!.name + " · " + imageDescription(image()!) : "请选择镜像"} />
           <Button id="change-image" disabled={busy()} label="更换系统镜像" press={() => pick.set(true)} />
+          <HardwareFields draft={hardware} />
           <View style={row}>
-            <Button id="create" label="创建实例" primary disabled={invalid() || busy() || !environmentReady()} press={create} />
+            <Button id="create" label="创建实例" primary disabled={invalid() || !!hardware.issue() || busy() || !environmentReady()} press={create} />
             <Button id="cancel-create" label={props.skip ? "跳过" : "取消"} disabled={busy()} press={cancel} />
           </View>
         </View>

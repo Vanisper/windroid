@@ -13,13 +13,14 @@ export function describeImage(image: ImageIdentity) {
   return "API " + image.api + " · " + variant + " · " + image.abi + " · " + (image.revision > 0 ? "修订版 " + image.revision : "缺少修订号");
 }
 
+export type GpuMode = "host" | "batch" | "auto" | "software";
 export interface InstanceConfig {
   template: string; image: ImageIdentity;
   cpuCores: number | null; ramMiB: number | null; screenWidth: number | null;
-  screenHeight: number | null; diskBytes: number;
+  screenHeight: number | null; diskBytes: number; graphics: GpuMode | null;
 }
 export interface Instance {
-  id: string; name: string; state: DeviceState; frozen?: boolean; summary?: string;
+  id: string; name: string; state: DeviceState; processAlive?: boolean; frozen?: boolean; summary?: string;
   config?: InstanceConfig | null; observed?: { cpuCores: number | null; ramMiB: number | null } | null;
 }
 export const instanceState = (item: Instance) => item.frozen ? "已冻结" : stateName[item.state];
@@ -78,10 +79,11 @@ export interface Snapshot {
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 
-type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "refreshApps" | "openDevice" | "addApk";
+type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "restart" | "coldRestart" | "stop" | "refreshApps" | "openDevice" | "addApk";
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
-  | { kind: "createInstance"; name: string; template: string; imageId: string; image: ImageIdentity }
+  | { kind: "createInstance"; name: string; template: string; imageId: string; image: ImageIdentity; cpuCores: number; ramMiB: number; diskGiB: number; gpuMode: GpuMode }
+  | { kind: "updateHardware"; instanceId: string; cpuCores: number; ramMiB: number; gpuMode: GpuMode }
   | { kind: "applyStorage"; plan: { previewId: number } }
   | { kind: "prepareCandidateImage"; previewId: number; resourceId: string; acceptedLicenses: true }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }

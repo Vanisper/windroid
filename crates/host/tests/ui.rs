@@ -107,7 +107,7 @@ impl LibraryUi {
     }
 
     fn create(&mut self) -> String {
-        wait(&mut self.app, "id:create-form");
+        wait(&mut self.app, "id:hardware-fields");
         press(&mut self.app, "create");
         wait(&mut self.app, "id:start");
         gone(&mut self.app, "id:pending");
@@ -358,6 +358,10 @@ impl Scripted {
         channel.handle("windroid.snapshot", move |call| {
             call.resolve(view.lock().unwrap().clone())
         });
+        channel.handle("windroid.hardwareLimits", |call| {
+            let limits = hardware_limits(call.data());
+            call.resolve(limits);
+        });
         let view = state.clone();
         let seen = requests.clone();
         channel.handle("windroid.command", move |call| {
@@ -386,6 +390,16 @@ fn image(id: &str, api: u32, ready: bool) -> Value {
         "ready":ready, "location":"/tmp/images","repairToken":null, "integrity":if ready {"quick"} else {"missing"},
         "writable":true,"requiredBytes":if ready {0} else {3145728},"availableBytes":1073741824, "downloadedBytes":0, "issue":null,
         "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a","revision":14},"minEmulator":"34.0.0"})
+}
+
+fn hardware_limits(target: &Value) -> Value {
+    let minimum = if target["template"] == "tv-4k" {
+        4096
+    } else {
+        2560
+    };
+    json!({"minRamMiB":minimum,"maxRamMiB":8192,"maxCpuCores":8,"defaultCpuCores":2,
+        "defaultRamMiB":minimum,"maxDiskGiB":40,"defaultDiskGiB":8})
 }
 
 fn ready_view() -> Value {
@@ -641,6 +655,7 @@ fn images_require_separate_consent_selection_and_instance_creation() {
     press(&mut ui.app, "use-r35");
     wait(&mut ui.app, "id:create-form >> text:/Android API 35/");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     gone(&mut ui.app, "id:pending");
     assert_eq!(ui.commands.lock().unwrap().len(), 2);
@@ -666,6 +681,7 @@ fn selection_pins_one_of_two_revisions_of_the_same_image() {
     wait(&mut ui.app, "id:image-api34-r15 >> text:/修订版 15/");
     press(&mut ui.app, "use-api34-r14");
     wait(&mut ui.app, "id:create-form >> text:/修订版 14/");
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     gone(&mut ui.app, "id:pending");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
@@ -808,6 +824,7 @@ fn creation_reply_does_not_redirect_a_new_guide_session() {
     press(&mut ui.app, "show-guide");
     press(&mut ui.app, "guide-begin");
     press(&mut ui.app, "use-r34");
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     let request = waiting.recv_timeout(WAIT).unwrap();
     press(&mut ui.app, "show-settings");
@@ -1366,13 +1383,15 @@ fn recommended_template_can_be_overridden_before_creation() {
         .set_viewport(Size::new(Points(480.0), Points(650.0)))
         .unwrap();
     wait(&mut ui.app, "text:/平板/");
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     wait(&mut ui.app, "text:实例已创建");
     gone(&mut ui.app, "text:创建实例请求已受理");
     assert_eq!(
         *ui.commands.lock().unwrap(),
         [
-            json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作","imageId":"r34","image":image("r34",34,true)["image"]})
+            json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作","imageId":"r34","image":image("r34",34,true)["image"],
+                "cpuCores":2,"ramMiB":2560,"gpuMode":"host","diskGiB":8})
         ]
     );
 }
