@@ -291,3 +291,102 @@ fn api35_initializes_private_userdata_from_a_separate_image_directory() {
     stop(&mut backend, &mut facts);
     store.delete(&id).unwrap();
 }
+
+#[test]
+#[ignore = "需要官方运行组件与 API 33/34/35 镜像"]
+fn resource_limits_use_each_installed_revision_and_its_final_display() {
+    if isolated(
+        "resource_limits_use_each_installed_revision_and_its_final_display",
+        &[33, 34, 35],
+    ) {
+        return;
+    }
+    let layout = Layout::default_root();
+    let store = InstanceStore::new(layout);
+    for (api, revision, minimum) in [(33, 9, 2048), (34, 14, 2560), (35, 9, 2560)] {
+        let mut image = spec("phone-1080").image;
+        image.api = api;
+        image.revision = revision;
+        let phone = store.spec_limits("phone-1080", &image).unwrap();
+        let large = store.spec_limits("tv-4k", &image).unwrap();
+        assert_eq!((phone.min_ram_mib, large.min_ram_mib), (minimum, 4096));
+        println!(
+            "API {api} r{revision}：手机 {} MiB，4K {} MiB，单台最高 {} 核、{} MiB",
+            phone.min_ram_mib, large.min_ram_mib, phone.max_cpu_cores, phone.max_ram_mib
+        );
+    }
+}
+
+#[test]
+#[ignore = "使用全新 WINDROID_HOME、受管运行组件与 Android 14 镜像开机两次"]
+fn stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot() {
+    use runtime::instances::{GraphicsMode, Hardware};
+    if isolated(
+        "stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot",
+        &[34],
+    ) {
+        return;
+    }
+    let layout = Layout::default_root();
+    let store = InstanceStore::new(layout.clone());
+    // 第三项之前，compact-720 保存的内存小于这个镜像的要求。保留其 AVD、修订与保存值。
+    let original = store.create("既有实例", spec("compact-720")).unwrap();
+    let legacy_path = avd(&layout.root, &original).join("config.ini");
+    let legacy = fs::read_to_string(&legacy_path)
+        .unwrap()
+        .replace("windroid.graphics.batch=false\n", "");
+    fs::write(&legacy_path, &legacy).unwrap();
+    let saved = original.config(&layout);
+    assert_eq!(
+        (saved.cpu_cores, saved.ram_mib, saved.graphics),
+        (Some(2), Some(1536), Some(GraphicsMode::Host))
+    );
+    assert_eq!(store.launch_hardware(&original).unwrap().ram_mib, 2560);
+    assert_eq!(fs::read_to_string(legacy_path).unwrap(), legacy);
+
+    let mut chosen = spec("phone-1080");
+    chosen.disk_bytes = 6 << 30;
+    let first = Hardware {
+        cpu_cores: 1,
+        ram_mib: 2560,
+        graphics: GraphicsMode::Host,
+    };
+    let second = Hardware {
+        cpu_cores: 2,
+        ram_mib: 3072,
+        graphics: GraphicsMode::Batch,
+    };
+    let record = store
+        .create_with_hardware("规格验证", chosen.clone(), first)
+        .unwrap();
+    let (mut backend, mut facts) = boot(&layout, &record);
+    let allocated = facts.allocation.as_ref().unwrap();
+    assert_eq!(
+        (allocated.cpu_cores, allocated.ram_mib),
+        (Some(1), Some(2560))
+    );
+    assert!(store.update_hardware(&record.id, second).is_err());
+    guest(
+        &backend,
+        &record,
+        "echo retained > /data/local/tmp/windroid-hardware",
+    );
+    stop(&mut backend, &mut facts);
+    store.update_hardware(&record.id, second).unwrap();
+    let reopened = InstanceStore::new(layout.clone());
+    let saved = reopened.get(&record.id).unwrap();
+    assert_eq!(saved.spec, chosen);
+    assert_eq!(saved.config(&layout).graphics, Some(GraphicsMode::Batch));
+    assert_eq!(reopened.launch_hardware(&saved).unwrap(), second);
+    let (mut backend, mut facts) = boot(&layout, &saved);
+    let allocated = facts.allocation.as_ref().unwrap();
+    assert_eq!(
+        (allocated.cpu_cores, allocated.ram_mib),
+        (Some(2), Some(3072))
+    );
+    assert_eq!(
+        guest(&backend, &saved, "cat /data/local/tmp/windroid-hardware"),
+        "retained"
+    );
+    stop(&mut backend, &mut facts);
+}
