@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "adb"
 version = "0.1.0"
+dependencies = [
+ "windroid-locations",
+]
 
 [[package]]
 name = "adler2"
@@ -5304,6 +5307,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.7",
  "sha2 0.10.9",
+ "windroid-locations",
  "zip",
 ]
 
@@ -7341,6 +7345,14 @@ dependencies = [
  "runtime",
  "serde_json",
  "stream",
+]
+
+[[package]]
+name = "windroid-locations"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

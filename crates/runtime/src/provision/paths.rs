@@ -3,12 +3,17 @@ use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use windroid_locations::StorageLocations;
+
 use super::catalog::{Artifact, BUILD_TOOLS, EMULATOR_VERSION, IMAGE_DIR, Kind};
 use super::integrity::{check_digest, invalid};
 
 /// 各设备域使用同一组路径。私有模式完全忽略系统 SDK、PATH 和 Homebrew。
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
+    pub runtime_root: PathBuf,
+    /// 镜像根目录，其下按 API、标签和 ABI 区分安装。
+    pub images: PathBuf,
     pub sdk: PathBuf,
     pub emulator: PathBuf,
     pub adb: PathBuf,
@@ -18,6 +23,7 @@ pub struct RuntimePaths {
     pub borrowed: bool,
     adb_override: bool,
     jar_override: bool,
+    config_error: Option<String>,
 }
 
 impl RuntimePaths {
@@ -40,7 +46,7 @@ impl RuntimePaths {
                             Path::new(base).join("Cellar/scrcpy/5.0.1/share/scrcpy/scrcpy-server")
                         })
                         .find(|path| path.is_file())
-                        .unwrap_or_else(|| home.join("runtime/scrcpy-server.jar"))
+                        .unwrap_or_else(|| Self::managed(home).server_jar)
                 };
                 Self::from_sdk(sdk, jar.clone().unwrap_or_else(default_jar), true)
             }
@@ -72,12 +78,38 @@ impl RuntimePaths {
     }
 
     pub(super) fn managed(home: &Path) -> Self {
-        let root = home.join("runtime");
-        Self::from_sdk(root.join("sdk"), root.join("scrcpy-server.jar"), false)
+        let config = StorageLocations::load(home);
+        let issue = config.as_ref().err().map(ToString::to_string);
+        let config = config.unwrap_or_else(|_| StorageLocations::defaults(home));
+        let root = &config.runtime_root;
+        let mut paths = Self::from_sdk(root.join("sdk"), root.join("scrcpy-server.jar"), false);
+        paths.images = config.images();
+        paths.image = paths
+            .images
+            .join(Path::new(IMAGE_DIR).strip_prefix("system-images").unwrap());
+        paths.config_error = issue;
+        paths
+    }
+
+    /// 迁移可能已由另一进程完成。持有资源锁后再确认一次，避免写回旧目录。
+    pub(crate) fn check_configuration(&self, home: &Path) -> io::Result<()> {
+        if self.borrowed {
+            return Ok(());
+        }
+        if let Some(message) = &self.config_error {
+            return Err(invalid(message));
+        }
+        let current = StorageLocations::load(home)?;
+        if self.runtime_root != current.runtime_root || self.images != current.images() {
+            return Err(invalid("存储位置已更改，请重新检查运行环境"));
+        }
+        Ok(())
     }
 
     pub(super) fn from_sdk(sdk: PathBuf, server_jar: PathBuf, borrowed: bool) -> Self {
         Self {
+            runtime_root: sdk.parent().unwrap_or(&sdk).to_owned(),
+            images: sdk.join("system-images"),
             emulator: sdk.join("emulator/emulator"),
             adb: sdk.join("platform-tools/adb"),
             aapt: sdk.join(BUILD_TOOLS).join("aapt"),
@@ -87,6 +119,7 @@ impl RuntimePaths {
             borrowed,
             adb_override: false,
             jar_override: false,
+            config_error: None,
         }
     }
 
@@ -98,6 +131,14 @@ impl RuntimePaths {
 
     pub(super) fn explicit_adb(&self, kind: Kind) -> bool {
         kind == Kind::Adb && self.adb_override
+    }
+
+    pub(super) fn installation_root(&self, pkg: Artifact) -> &Path {
+        if pkg.kind == Kind::Image && !self.images.starts_with(&self.runtime_root) {
+            &self.images
+        } else {
+            &self.runtime_root
+        }
     }
 
     pub(super) fn destination(&self, kind: Kind) -> PathBuf {
@@ -134,6 +175,9 @@ pub(super) fn directory(home: &Path, path: &Path, create: bool) -> io::Result<()
     }
     if create {
         fs::create_dir_all(home)?;
+    }
+    if !fs::symlink_metadata(home)?.is_dir() {
+        return Err(invalid(format!("根目录必须为普通目录：{}", home.display())));
     }
     let mut dir = home.to_path_buf();
     for part in suffix.components() {
@@ -176,6 +220,7 @@ fn small_text(path: &Path) -> io::Result<String> {
 }
 
 pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io::Result<()> {
+    paths.check_configuration(home)?;
     let dest = paths.destination(pkg.kind);
     if paths.read_only(pkg.kind) {
         // 只读检查显式选中的链接目标。单独指定 adb 时可以使用开发者自己的可执行文件。
@@ -197,7 +242,7 @@ pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io:
     } else {
         dest.parent().unwrap()
     };
-    directory(home, parent, false)?;
+    directory(paths.installation_root(pkg), parent, false)?;
     if pkg.prefix.is_some() && small_text(&dest.join(RECEIPT))? != receipt(pkg) {
         return Err(invalid("组件安装记录与发布版本不符"));
     }

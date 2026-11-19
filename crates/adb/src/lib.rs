@@ -25,13 +25,17 @@ pub fn program() -> io::Result<PathBuf> {
     if let Some(sdk) = env::var_os("WINDROID_SDK").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(sdk).join("platform-tools").join(exe));
     }
-    let tool = PathBuf::from("runtime/sdk/platform-tools").join(&exe);
+    let tool = PathBuf::from("sdk/platform-tools").join(&exe);
     if let Some(home) = env::var_os("WINDROID_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(home).join(tool));
+        return Ok(windroid_locations::StorageLocations::load(home.as_ref())?
+            .runtime_root
+            .join(tool));
     }
     let home = env::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定 Windroid 运行时目录"))?;
-    let managed = home.join(".windroid").join(tool);
+    let managed = windroid_locations::StorageLocations::load(&home.join(".windroid"))?
+        .runtime_root
+        .join(tool);
     // 单独指定 serial 是现有的只读 real_catalog 手工入口。在有私有 SDK 时仍优先用它。
     if !managed.exists() && env::var_os("WINDROID_SERIAL").is_some_and(|s| !s.is_empty()) {
         return Ok(exe.into());
