@@ -77,6 +77,17 @@ pub fn install(
     rx: Receiver<WindowCommand>,
     events: Sender<WindowEvent>,
 ) {
+    channel.handle("windroid.pickResource", |call| {
+        let kind = match call.data()["kind"].as_str() {
+            Some("imageZip") => surface::ResourcePicker::ImageZip,
+            Some("runtimeDirectory") => surface::ResourcePicker::RuntimeDirectory,
+            Some("imageDirectory") => surface::ResourcePicker::ImageDirectory,
+            _ => return call.reject("无法识别要选择的资源"),
+        };
+        surface::on_main(move |mtm| {
+            surface::pick_resource(mtm, kind, move |path| call.resolve(serde_json::json!(path)));
+        });
+    });
     // 设置页与关窗 sheet 都在 AppKit 队列中读写同一个偏好，顺序与用户操作一致。
     channel.handle("windroid.windowSettings", |call| {
         post(move |manager, _| call.resolve(manager.preferences.snapshot()));

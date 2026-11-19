@@ -9,7 +9,7 @@ use dispatch2::DispatchQueue;
 use nsh_platform_macos::objc2::rc::Retained;
 use nsh_platform_macos::objc2::runtime::ProtocolObject;
 use nsh_platform_macos::objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
 };
 use nsh_platform_macos::objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplication,
@@ -386,14 +386,54 @@ pub fn pick_apk(
     panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[NSString::from_str(
         "apk",
     )])));
-    let selection = panel.clone();
+    begin_picker(&panel, chosen);
+    panel
+}
+
+/// 资源选择只返回路径。档案校验、预览和用户确认在独立步骤中进行。
+pub enum ResourcePicker {
+    ImageZip,
+    RuntimeDirectory,
+    ImageDirectory,
+}
+
+pub fn pick_resource(
+    mtm: MainThreadMarker,
+    kind: ResourcePicker,
+    chosen: impl FnOnce(Option<PathBuf>) + 'static,
+) {
+    let panel = NSOpenPanel::openPanel(mtm);
+    let directory = !matches!(kind, ResourcePicker::ImageZip);
+    let title = match kind {
+        ResourcePicker::ImageZip => "选择官方系统镜像 ZIP",
+        ResourcePicker::RuntimeDirectory => "选择运行组件目录",
+        ResourcePicker::ImageDirectory => "选择系统镜像目录",
+    };
+    panel.setTitle(Some(&NSString::from_str(title)));
+    panel.setCanChooseDirectories(directory);
+    panel.setCanCreateDirectories(directory);
+    panel.setCanChooseFiles(!directory);
+    panel.setAllowsMultipleSelection(false);
+    if !directory {
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[NSString::from_str(
+            "zip",
+        )])));
+    }
+    begin_picker(&panel, chosen);
+}
+
+fn begin_picker(panel: &NSOpenPanel, chosen: impl FnOnce(Option<PathBuf>) + 'static) {
+    let selection = panel.retain();
+    let chosen = RefCell::new(Some(chosen));
     let reply = RcBlock::new(move |code| {
-        chosen(
-            (code == NSModalResponseOK)
-                .then(|| selection.URL()?.to_file_path())
-                .flatten(),
-        );
+        if let Some(chosen) = chosen.take() {
+            chosen(
+                (code == NSModalResponseOK)
+                    .then(|| selection.URL()?.to_file_path())
+                    .flatten(),
+            );
+        }
     });
     panel.beginWithCompletionHandler(&reply);
-    panel
 }
