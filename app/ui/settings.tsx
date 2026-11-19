@@ -1,7 +1,8 @@
-import { cleanup, host, signal, Text, View } from "nsh";
+import { cleanup, host, Scroll, signal, Text, View } from "nsh";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
-import { openGuide, snapshot } from "./model";
+import { openGuide } from "./model";
+import { Storage } from "./storage";
 
 const choices = { ask: "每次询问", background: "保留后台", quit: "完全退出" };
 type CloseAction = keyof typeof choices;
@@ -57,7 +58,7 @@ function WindowSettingsPanel() {
 }
 
 export function Settings() {
-  return <View testID="settings" style={{ gap: 16 }}>
+  return <View testID="settings" style={{ flex: 1, minHeight: 0, gap: 16 }}>
     <View style={{ ...row, justifyContent: "space-between" }}>
       <Title text="设置" /><Button id="show-guide" label="引导" press={() => openGuide("settings")} />
     </View>
@@ -72,13 +73,10 @@ export function Settings() {
         </View>
       }</Each>
     </View>
-    {selectedTab() === "window" ? <WindowSettingsPanel /> : selectedTab() === "storage" ? <View style={card()}>
-      <Heading text="存储位置" />
-      <Detail text={"主数据目录 · " + (snapshot()?.storage?.home ?? "未知")} />
-      <Detail text={"运行组件目录（SDK） · " + (snapshot()?.storage?.sdk ?? "未知")} />
-      <Detail text={"系统镜像目录 · " + (snapshot()?.storage?.images ?? "未知")} />
-    </View> : <View style={card()}>
+    <Scroll testID="workspace-scroll" style={{ flex: 1, minHeight: 0 }}>
+    {selectedTab() === "window" ? <WindowSettingsPanel /> : selectedTab() === "storage" ? <Storage /> : <View style={card()}>
       <Heading text="应用日志" /><Detail text="Windroid 当前将运行记录写到标准错误。按启动记录浏览历史将在后续版本提供。" />
     </View>}
+    </Scroll>
   </View>;
 }

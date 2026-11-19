@@ -27,6 +27,7 @@ mod commands;
 mod first_page;
 mod observation;
 mod resources;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -111,7 +112,7 @@ pub struct Library {
     layout: Layout,
     recommended_template: &'static str,
     first_page: Option<first_page::FirstPage>,
-    runtime: Option<Provisioner>,
+    runtime: Option<Mutex<storage::Resources>>,
     store: Option<InstanceStore>,
     channel: HostChannel,
     windows: mpsc::Sender<WindowCommand>,
@@ -183,7 +184,7 @@ impl Library {
                 "phone-1080"
             },
             first_page: None,
-            runtime: (!fake).then(|| Provisioner::new(layout.root.clone())),
+            runtime: (!fake).then(|| Mutex::new(storage::Resources::open(&layout.root))),
             store: (!fake).then(|| InstanceStore::new(layout.clone())),
             layout,
             channel,
@@ -260,6 +261,7 @@ impl Library {
             call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
         });
         self.connect_resources();
+        self.connect_storage();
         let global = self.lane();
         let weak = Arc::downgrade(self);
         self.channel.handle(names::COMMAND, move |call| {
@@ -275,6 +277,7 @@ impl Library {
                         | "createInstance"
                         | "deleteInstance"
                         | "prepareRuntime"
+                        | "applyStorage"
                         | "importImage"
                         | "prepareImage"
                         | "pausePreparation"
@@ -422,11 +425,7 @@ impl Library {
         state.write_running(&mut out, &snap);
         out["preparation"] = preparation;
         if let Some(runtime) = &self.runtime {
-            let paths = runtime.paths();
-            out["storage"] = json!({
-                "home": self.layout.root, "sdk": paths.sdk,
-                "images": paths.sdk.join("system-images")
-            });
+            out["storage"] = runtime.lock().unwrap().locations(&self.layout.root);
         }
         out["templateRamMiB"] = [
             "phone-1080",
@@ -454,7 +453,7 @@ impl Library {
             return;
         }
         if let Some(runtime) = &self.runtime {
-            let _ = runtime.pause();
+            let _ = runtime.lock().unwrap().provisioner.pause();
         }
         let handles: Vec<_> = self
             .state

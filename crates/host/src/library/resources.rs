@@ -42,7 +42,14 @@ impl Library {
             thread::spawn(move || {
                 let result = (|| {
                     let path = call.data()["path"].as_str().ok_or("请选择官方镜像 ZIP")?;
-                    let provisioner = lib.runtime.as_ref().ok_or("演示环境不支持导入")?.clone();
+                    let provisioner = lib
+                        .runtime
+                        .as_ref()
+                        .ok_or("演示环境不支持导入")?
+                        .lock()
+                        .unwrap()
+                        .provisioner
+                        .clone();
                     let component = provisioner.inspect_image_zip(Path::new(path))?;
                     Ok(json!({"imageId":component.id}))
                 })();
@@ -53,7 +60,7 @@ impl Library {
 
     pub(super) fn preparation(&self) -> JsonValue {
         if let Some(p) = &self.runtime {
-            return crate::to_json(&p.snapshot());
+            return p.lock().unwrap().preparation();
         }
         json!({
             "phase":"ready", "componentsReady":true, "borrowed":false, "components":[],
@@ -69,6 +76,15 @@ impl Library {
             .runtime
             .as_ref()
             .ok_or_else(|| error("演示环境已就绪"))?;
+        if kind == "recheckRuntime" {
+            self.reload_resources().map_err(error)?;
+            return Ok(self.revision());
+        }
+        let p = p.lock().unwrap();
+        if let Some(failure) = &p.error {
+            return Err(error(failure));
+        }
+        let p = &p.provisioner;
         let image_id = || {
             data["imageId"]
                 .as_str()
@@ -89,7 +105,7 @@ impl Library {
                 p.import_image(image_id()?, path.into())
             }
             "pausePreparation" => p.pause(),
-            _ => p.recheck(),
+            _ => unreachable!("unknown resource action"),
         }
         .map_err(error)?;
         Ok(self.revision())
@@ -105,6 +121,9 @@ impl Library {
                 .ok_or_else(|| error("演示环境中没有该镜像"));
         };
         let row = p
+            .lock()
+            .unwrap()
+            .provisioner
             .snapshot()
             .images
             .into_iter()

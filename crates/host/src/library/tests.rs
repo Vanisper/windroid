@@ -666,7 +666,7 @@ fn missing_runtime_blocks_create_and_start_but_keeps_selection_available() {
         tx,
         false,
     );
-    Arc::get_mut(&mut lib).unwrap().runtime = Some(Provisioner::managed(&root));
+    Arc::get_mut(&mut lib).unwrap().runtime = Some(Mutex::new(storage::Resources::open(&root)));
     assert_ne!(lib.snapshot()["preparation"]["phase"], "ready");
     assert_eq!(lib.snapshot()["capabilities"]["create"], false);
     assert!(

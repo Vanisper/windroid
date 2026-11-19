@@ -12,6 +12,7 @@ impl Library {
             | "recheckRuntime" => {
                 return self.prepare(kind, data);
             }
+            "applyStorage" => return self.apply_storage(data),
             "createInstance" => return self.create_instance(data),
             _ => {}
         }
@@ -156,13 +157,13 @@ impl Library {
                     if active >= 3 {
                         return Err(error("已有 3 台实例运行，请先停止一台"));
                     }
+                    self.require_ready_runtime()?;
                     if let Some(r) = &instance.record {
                         self.check_budget(&r.spec.template)?;
                         if !resources::image_available(&self.preparation(), &r.spec.image) {
                             return Err(error("请先准备此实例使用的系统镜像"));
                         }
                     }
-                    self.require_ready_runtime()?;
                 }
                 if kind == "setDefaultHome" && !snap.desktop.is_candidate(package) {
                     return Err(error("应用不在 Android 桌面候选中"));
@@ -371,11 +372,15 @@ impl Library {
     }
 
     fn require_ready_runtime(&self) -> Result<(), Rejection> {
-        if self
-            .runtime
-            .as_ref()
-            .is_some_and(|p| !p.snapshot().components_ready)
-        {
+        // 选择后卷可能已卸载，执行依赖资源的命令前再核对本机文件。
+        if let Some(runtime) = &self.runtime {
+            let runtime = runtime.lock().unwrap();
+            if let Some(message) = &runtime.error {
+                return Err(error(message));
+            }
+            runtime.provisioner.refresh_locations();
+        }
+        if self.preparation()["componentsReady"] != true {
             Err(error("请先准备运行环境"))
         } else {
             Ok(())
