@@ -297,7 +297,7 @@ pub enum Command {
     Start,
     /// 先按替换当前会话预检，再停止并重新启动。冷启动跳过已保存的内存快照。
     Restart { cold: bool },
-    /// 优雅停止：先关流会话，再 emu kill。
+    /// 请求优雅停止，退出后释放本轮会话和资源预留。
     Stop,
     /// 安装 APK。路径为主机侧文件。
     Install { apk_path: String },

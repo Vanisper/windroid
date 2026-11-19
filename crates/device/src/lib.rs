@@ -518,7 +518,7 @@ impl Backend for FakeBackend {
                 self.counter = 0;
             }
             Command::Stop => {
-                // 优雅停止：进程退出。真实后端会先关流会话，再 emu kill。
+                // 假后端立即完成停止。真实后端等待模拟器退出后发布相同的事实。
                 facts.process_alive = false;
                 facts.adb_visible = false;
                 facts.services = Default::default();
