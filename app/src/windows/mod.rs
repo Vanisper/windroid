@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use host::surface::{
     self, CloseChoice, CloseIntent, VideoWindow, WindowCommand, WindowEvent, WindowKey,
 };
+use nsh_engine::HostChannel;
 use nsh_platform_macos::objc2::MainThreadMarker;
+use nsh_platform_macos::objc2::rc::Retained;
+use nsh_platform_macos::objc2_app_kit::NSOpenPanel;
 
 use crate::streaming::{Notice, Source, Worker};
 use registry::{MAX_APP_WINDOWS, Registry, Route};
@@ -46,9 +49,10 @@ struct Manager {
     windows: Registry<Entry, Worker, Request>,
     next_generation: u64,
     preferences: Preferences,
+    channel: HostChannel,
     events: Sender<WindowEvent>,
-    picking: bool,
-    _termination: Option<nsh_platform_macos::objc2::rc::Retained<surface::TerminationDelegate>>,
+    picker: Option<Retained<NSOpenPanel>>,
+    _termination: Option<Retained<surface::TerminationDelegate>>,
 }
 
 thread_local! { static MANAGER: RefCell<Option<Manager>> = const { RefCell::new(None) }; }
@@ -66,18 +70,36 @@ fn post(action: impl FnOnce(&mut Manager, MainThreadMarker) + Send + 'static) {
 
 pub fn install(
     mtm: MainThreadMarker,
+    channel: HostChannel,
     home: PathBuf,
     rx: Receiver<WindowCommand>,
     events: Sender<WindowEvent>,
 ) {
+    // 设置页与关窗 sheet 都在 AppKit 队列中读写同一个偏好，顺序与用户操作一致。
+    channel.handle("windroid.windowSettings", |call| {
+        post(move |manager, _| call.resolve(manager.preferences.snapshot()));
+    });
+    channel.handle("windroid.setWindowSettings", |call| {
+        let choice = match call.data()["closeAction"].as_str() {
+            Some("ask") => None,
+            Some("background") => Some(CloseChoice::Background),
+            Some("quit") => Some(CloseChoice::Quit),
+            _ => return call.reject("无法识别应用窗口关闭方式"),
+        };
+        post(move |manager, _| match manager.save_preference(choice) {
+            Ok(()) => call.resolve(manager.preferences.snapshot()),
+            Err(error) => call.reject(format!("无法保存关窗偏好：{error}")),
+        });
+    });
     MANAGER.with_borrow_mut(|slot| {
         assert!(slot.is_none(), "重复安装窗口管理器");
         *slot = Some(Manager {
             windows: Registry::new(),
             next_generation: 1,
             preferences: Preferences::load(&home),
+            channel,
             events,
-            picking: false,
+            picker: None,
             _termination: surface::TerminationDelegate::install(mtm),
         });
     });
@@ -185,7 +207,10 @@ impl Manager {
                     self.close(&key);
                 }
             }
-            WindowCommand::PickApk { instance_id } => self.pick(mtm, instance_id),
+            WindowCommand::PickApk {
+                instance_id,
+                instance_name,
+            } => self.pick(mtm, instance_id, &instance_name),
         }
     }
 
@@ -332,7 +357,7 @@ impl Manager {
     }
 
     fn apply_choice(&mut self, ticket: Ticket, choice: CloseChoice, remember: bool) {
-        if let Err(e) = self.preferences.remember(choice, remember) {
+        if remember && let Err(e) = self.save_preference(Some(choice)) {
             self.error(&ticket.key.instance_id, format!("无法保存关窗偏好：{e}"));
         }
         match choice {
@@ -354,6 +379,15 @@ impl Manager {
                 }
             }
         }
+    }
+
+    fn save_preference(&mut self, choice: Option<CloseChoice>) -> std::io::Result<()> {
+        self.preferences.set(choice)?;
+        let _ = self.channel.send(
+            "windroid.windowSettingsChanged",
+            self.preferences.snapshot(),
+        );
+        Ok(())
     }
 
     fn close(&mut self, key: &WindowKey) {
@@ -426,19 +460,19 @@ impl Manager {
         }
     }
 
-    fn pick(&mut self, mtm: MainThreadMarker, instance_id: String) {
-        if self.picking {
+    fn pick(&mut self, mtm: MainThreadMarker, instance_id: String, instance_name: &str) {
+        if let Some(panel) = &self.picker {
+            panel.makeKeyAndOrderFront(None);
             return;
         }
-        self.picking = true;
-        surface::pick_apk(mtm, move |path| {
+        self.picker = Some(surface::pick_apk(mtm, instance_name, move |path| {
             let instance_id = instance_id.clone();
             post(move |manager, _mtm| {
-                manager.picking = false;
+                manager.picker = None;
                 if let Some(path) = path {
                     manager.send(WindowEvent::ApkPicked { instance_id, path });
                 }
             });
-        });
+        }));
     }
 }

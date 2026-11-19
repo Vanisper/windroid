@@ -100,6 +100,15 @@ impl Services {
     }
 }
 
+/// 模拟器为本次启动生成的客户机硬件参数，单位分别为核、MiB。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestAllocation {
+    pub cpu_cores: Option<u32>,
+    #[serde(rename = "ramMiB")]
+    pub ram_mib: Option<u32>,
+}
+
 /// 从一个实例上能观测到的事实。状态是它的纯函数，别无其他来源。
 ///
 /// 注意 [Facts::boot_stalled]：超时本是时间现象，不是可观测事实。
@@ -122,6 +131,8 @@ pub struct Facts {
     pub boot_completed: bool,
     /// 活跃流会话数，由流域上报。
     pub session_count: u32,
+    /// 仅在确认该次启动的虚拟机配置后填入。旧快照和停止的实例均为 None。
+    pub allocation: Option<GuestAllocation>,
     /// 用户已请求停止。
     pub stop_requested: bool,
     /// 启动等待已超过第二层超时。

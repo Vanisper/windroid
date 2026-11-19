@@ -5,7 +5,7 @@ use contract::{Ack, Command, ErrorCode, Image, InstanceId, Rejection, Spec};
 use device::FakeBackend;
 use host::surface::{WindowCommand, WindowEvent};
 use nsh_core::{
-    Points, Size,
+    Bounds, Points, Size,
     platform::{Idiom, Os},
 };
 use nsh_engine::{Bundle, EngineConfig, HostChannel};
@@ -52,6 +52,15 @@ fn gone(app: &mut Headless, selector: &str) {
         .unwrap_or_else(|e| panic!("{selector}: {e}"));
 }
 
+fn bounds(app: &Headless, test_id: &str) -> Bounds<Points> {
+    app.screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| node.test_id.as_deref() == Some(test_id))
+        .unwrap()
+        .bounds
+}
+
 fn press(app: &mut Headless, id: &str) {
     app.press(&format!("id:{id}"))
         .unwrap_or_else(|e| panic!("{id}: {e}"));
@@ -84,8 +93,11 @@ impl LibraryUi {
             rx,
         )
         .expect("挂载 Fake 应用库");
+        let mut app = render(config);
+        wait(&mut app, "id:inventory");
+        press(&mut app, "workspace-next");
         Self {
-            app: render(config),
+            app,
             library,
             windows,
             events,
@@ -122,25 +134,40 @@ fn windows_follow_the_instance_through_background_restore_and_quit() {
     gone(app, "id:pending");
     wait(app, "id:app-com.example.reader");
     press(app, "app-com.example.reader");
+    gone(app, "id:pending");
+    press(app, "panel-tasks");
     wait(app, "text:窗口已打开");
-    gone(app, "id:pending");
-    press(app, "background-com.example.reader");
-    wait(app, "text:后台运行");
-    gone(app, "id:pending");
-    press(app, "focus-com.example.reader");
-    wait(app, "text:窗口已打开");
-    gone(app, "id:pending");
+    gone(app, "id:app-com.example.reader");
+
     press(app, "new-instance");
     let second = ui.create();
-    assert_ne!(first, second);
-    gone(&mut ui.app, "id:focus-com.example.reader");
+    ui.start();
+    press(&mut ui.app, "app-com.example.reader");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "panel-tasks");
+    wait(&mut ui.app, "text:窗口已打开");
+    assert_eq!(ui.library.snapshot()["running"][0]["instanceId"], second);
+
     press(&mut ui.app, &format!("instance-{first}"));
-    wait(&mut ui.app, "id:focus-com.example.reader");
+    wait(&mut ui.app, "id:app-com.example.reader");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "panel-tasks");
+    press(&mut ui.app, "background-com.example.reader");
+    wait(&mut ui.app, "text:后台运行");
+    gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "focus-com.example.reader");
+    wait(&mut ui.app, "text:窗口已打开");
     gone(&mut ui.app, "id:pending");
     press(&mut ui.app, "quit-com.example.reader");
-    gone(&mut ui.app, "id:focus-com.example.reader");
+    wait(&mut ui.app, "id:tasks-empty");
     wait(&mut ui.app, "text:应用已退出");
     assert_eq!(ui.library.snapshot()["running"], json!([]));
+
+    press(&mut ui.app, &format!("instance-{second}"));
+    wait(&mut ui.app, "id:app-com.example.reader");
+    press(&mut ui.app, "panel-tasks");
+    wait(&mut ui.app, "text:窗口已打开");
+    assert_eq!(ui.library.snapshot()["running"][0]["instanceId"], second);
 }
 
 #[test]
@@ -149,50 +176,47 @@ fn custom_group_membership_is_local_and_deleting_a_group_restores_its_apps() {
     let first = ui.create();
     ui.start();
     let app = &mut ui.app;
+    press(app, "show-groups");
     press(app, "new-group");
     app.type_text("id:group-name", "工作").unwrap();
     press(app, "save-group");
-    wait(app, "text:工作");
-    gone(app, "id:pending");
-    press(app, "group-installed");
-    app.right_click("id:app-com.example.reader").unwrap();
-    choose(app, "移至工作");
-    gone(app, "id:app-com.example.reader");
-    gone(app, "id:pending");
-    press(app, "group-group-1");
-    wait(app, "id:app-com.example.reader");
-    assert_eq!(
-        ui.library.snapshot()["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|g| g["apps"].as_array().unwrap())
-            .filter(|a| a["package"] == READER)
-            .count(),
-        1
-    );
-    press(app, "menu-com.example.reader");
-    choose(app, "移至原始分组");
     wait(app, "text:这个分组还没有应用");
     gone(app, "id:pending");
-    press(app, "group-installed");
+    press(app, "group-all");
     app.right_click("id:app-com.example.reader").unwrap();
     choose(app, "移至工作");
-    gone(app, "id:app-com.example.reader");
     gone(app, "id:pending");
+    press(app, "group-group-1");
+    wait(app, "id:section-installed >> id:app-com.example.reader");
+    gone(app, "id:section-system");
+
+    // 默认展示按包来源归类，旧分组的成员仍在正确的来源区，宿主保留自建关系。
+    press(app, "show-groups");
+    wait(app, "id:section-installed >> id:app-com.example.reader");
+    wait(app, "id:section-system >> id:app-com.example.launcher");
+    let groups = ui.library.snapshot()["groups"].as_array().unwrap().clone();
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["name"] == "工作" && g["apps"][0]["package"] == READER)
+    );
     press(app, "new-instance");
     ui.create();
+    press(&mut ui.app, "show-groups");
     gone(&mut ui.app, "text:工作");
     press(&mut ui.app, &format!("instance-{first}"));
-    wait(&mut ui.app, "text:工作");
+    wait(&mut ui.app, "id:app-com.example.reader");
     gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "show-groups");
     press(&mut ui.app, "group-group-1");
     press(&mut ui.app, "delete-group");
     wait(&mut ui.app, "text:删除「工作」分组？");
     press(&mut ui.app, "confirm-action");
     gone(&mut ui.app, "id:group-group-1");
-    press(&mut ui.app, "group-installed");
-    wait(&mut ui.app, "id:app-com.example.reader");
+    wait(
+        &mut ui.app,
+        "id:section-installed >> id:app-com.example.reader",
+    );
 }
 
 #[test]
@@ -202,7 +226,7 @@ fn apk_picker_keeps_its_opening_instance_and_window_errors_remain_visible() {
     ui.start();
     press(&mut ui.app, "add-apk");
     let target = match ui.windows.recv_timeout(WAIT).unwrap() {
-        WindowCommand::PickApk { instance_id } => instance_id,
+        WindowCommand::PickApk { instance_id, .. } => instance_id,
         other => panic!("应弹出文件选择器: {other:?}"),
     };
     assert_eq!(target, first);
@@ -221,7 +245,7 @@ fn apk_picker_keeps_its_opening_instance_and_window_errors_remain_visible() {
     // 无 JS 回执的文件面板事件也走真实命令队列。空路径让内存设备产生可重复的拒绝。
     press(&mut ui.app, "add-apk");
     assert!(
-        matches!(ui.windows.recv_timeout(WAIT).unwrap(), WindowCommand::PickApk { instance_id } if instance_id == first)
+        matches!(ui.windows.recv_timeout(WAIT).unwrap(), WindowCommand::PickApk { instance_id, .. } if instance_id == first)
     );
     ui.events
         .send(WindowEvent::ApkPicked {
@@ -266,13 +290,14 @@ fn creation_template_and_instance_deletion_confirmation() {
     press(&mut ui.app, "stop");
     wait(&mut ui.app, "id:start");
     gone(&mut ui.app, "id:pending");
+    press(&mut ui.app, "open-management");
     press(&mut ui.app, "delete-instance");
     wait(&mut ui.app, "text:删除「我的 Android」？");
     press(&mut ui.app, "cancel-confirmation");
     assert_eq!(ui.library.snapshot()["selectedId"], id);
     press(&mut ui.app, "delete-instance");
     press(&mut ui.app, "confirm-action");
-    wait(&mut ui.app, "text:创建第一个实例");
+    wait(&mut ui.app, "id:inventory");
     assert_eq!(ui.library.snapshot()["instances"], json!([]));
 }
 
@@ -302,10 +327,12 @@ fn a_stalled_boot_reports_the_missing_service() {
     };
     assert!(handle.send(Command::Create { spec }).is_accepted());
     let mut app = render(config);
-    wait(&mut app, "id:start");
+    wait(&mut app, "id:instance-ui-test >> text:已停止");
+    let stopped = bounds(&app, "instance-ui-test");
     press(&mut app, "start");
     wait(&mut app, "text:等待package 服务");
-    wait(&mut app, "text:/启动较慢，服务 0/3/");
+    wait(&mut app, "id:instance-ui-test >> text:/启动较慢，服务 0/3/");
+    assert_eq!(stopped, bounds(&app, "instance-ui-test"));
 }
 
 /// 可控回执让测试推进下载阶段或文件拖入，而不用点击真实的下载器、文件面板。
@@ -353,7 +380,7 @@ impl Scripted {
 fn ready_view() -> Value {
     json!({"id":"a","instances":[{"id":"a","name":"工作机","state":"ready"}],"selectedId":"a",
         "state":"ready","summary":"已就绪","capabilities":{"install":true,"launchApp":true,"deviceView":true,"stop":true,"refreshApps":true},
-        "facts":{"services":{"activity":true,"package":true,"window":true},"adbVisible":true},"groups":[],"running":[],"desktop":null,"tasksLoaded":true,
+        "facts":{"services":{"activity":true,"package":true,"window":true},"adbVisible":true},"groups":[],"catalogStatus":{"kind":"ready"},"running":[],"desktop":null,"tasksLoaded":true,
         "preparation":{"phase":"ready","components":[],"currentComponent":null,"totalBytes":0,"downloadedBytes":0,"borrowed":false,"error":null}})
 }
 
@@ -381,6 +408,13 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
         }
         json!({"status":"accepted"})
     });
+    wait(&mut ui.app, "text:还没有实例");
+    press(&mut ui.app, "show-settings");
+    wait(&mut ui.app, "id:settings");
+    press(&mut ui.app, "toggle-sidebar");
+    press(&mut ui.app, "all-instances");
+    wait(&mut ui.app, "id:inventory");
+    press(&mut ui.app, "workspace-next");
     wait(&mut ui.app, "text:准备 Android 环境");
     press(&mut ui.app, "license-image");
     wait(&mut ui.app, "text:镜像完整许可正文");
@@ -407,7 +441,9 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
     wait(&mut ui.app, "text:下载已暂停");
     gone(&mut ui.app, "id:pending");
     press(&mut ui.app, "recheck-runtime");
-    wait(&mut ui.app, "text:创建第一个实例");
+    wait(&mut ui.app, "text:运行环境已就绪");
+    press(&mut ui.app, "return-library");
+    wait(&mut ui.app, "id:inventory");
     let commands = ui.commands.lock().unwrap();
     assert_eq!(
         commands
@@ -552,7 +588,7 @@ fn a_delayed_install_keeps_its_own_error_while_another_instance_is_in_use() {
         .drop_files("id:apk-drop", vec!["file:///tmp/reader.apk".into()])
         .unwrap();
     let install = waiting.recv_timeout(WAIT).unwrap();
-    wait(&mut ui.app, "text:安装 APK…");
+    wait(&mut ui.app, "id:pending");
     gone(&mut ui.app, &format!("text:{stale}"));
     press(&mut ui.app, "instance-b");
     gone(&mut ui.app, "id:pending");
@@ -612,7 +648,7 @@ fn catalog_reports_loading_failure_and_verified_empty_separately() {
         json!({"status":"accepted"})
     });
     wait(&mut ui.app, "text:正在读取应用…");
-    gone(&mut ui.app, "text:拖入 APK 开始");
+    gone(&mut ui.app, "id:empty-library");
     ui.update(|v| v["capabilities"]["refreshApps"] = json!(false));
     wait(&mut ui.app, "text:实例就绪后将读取应用列表。");
     gone(&mut ui.app, "id:empty-library");
@@ -627,9 +663,9 @@ fn catalog_reports_loading_failure_and_verified_empty_separately() {
     wait(&mut ui.app, "id:app-com.example.reader");
     ui.update(|v| v["groups"] = json!([]));
     gone(&mut ui.app, "id:app-com.example.reader");
-    gone(&mut ui.app, "text:拖入 APK 开始");
+    gone(&mut ui.app, "id:empty-library");
     press(&mut ui.app, "refresh-apps");
-    wait(&mut ui.app, "text:拖入 APK 开始");
+    wait(&mut ui.app, "id:empty-library");
     gone(&mut ui.app, "id:catalog-error");
 }
 
@@ -665,6 +701,8 @@ fn recommended_template_can_be_overridden_before_creation() {
         v["operation"] = json!({"instanceId":"new","message":"实例已创建","failed":false,"seq":1});
         json!({"status":"accepted"})
     });
+    wait(&mut ui.app, "id:inventory");
+    press(&mut ui.app, "workspace-next");
     wait(&mut ui.app, "text:/紧凑设备/");
     press(&mut ui.app, "choose-template");
     choose(&mut ui.app, "平板 · 1920 × 1200");
@@ -721,6 +759,7 @@ fn home_picker_tracks_late_candidates_and_instance_changes_in_place() {
     });
     wait(&mut ui.app, "id:app-demo.store");
     gone(&mut ui.app, "id:app-demo.home");
+    press(&mut ui.app, "open-management");
     wait(&mut ui.app, "text:默认桌面 · demo.stock");
     press(&mut ui.app, "choose-desktop");
     choose(&mut ui.app, "书房桌面");
@@ -732,36 +771,229 @@ fn home_picker_tracks_late_candidates_and_instance_changes_in_place() {
     press(&mut ui.app, "instance-b");
     gone(&mut ui.app, "id:choose-desktop");
     gone(&mut ui.app, "text:默认桌面 · 书房桌面");
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "open-management");
     ui.update(|v| v["desktop"] = json!({"defaultPackage":"demo.work","candidates":["demo.work"]}));
     wait(&mut ui.app, "text:默认桌面 · demo.work");
     press(&mut ui.app, "instance-a");
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "open-management");
     wait(&mut ui.app, "text:默认桌面 · 书房桌面");
     gone(&mut ui.app, "text:默认桌面 · demo.work");
 }
 
 #[test]
-fn home_only_candidates_and_loading_or_failed_task_queries_remain_distinct() {
+fn task_query_distinguishes_pending_cached_failure_and_confirmed_empty() {
     let mut view = ready_view();
-    view["desktop"] = json!({"defaultPackage":null,"candidates":["demo.home"]});
     view["tasksLoaded"] = json!(false);
-    let mut ui = Scripted::new(view, |cmd, view| {
-        view["desktop"]["defaultPackage"] = cmd["package"].clone();
-        json!({"status":"accepted"})
-    });
+    let mut ui = Scripted::new(view, |_, _| unreachable!());
+    wait(&mut ui.app, "id:panel-tasks >> text:运行中");
+    press(&mut ui.app, "panel-tasks");
     wait(&mut ui.app, "text:正在读取运行中的应用…");
-    press(&mut ui.app, "choose-desktop");
-    choose(&mut ui.app, "demo.home");
-    wait(&mut ui.app, "text:默认桌面 · demo.home");
-    assert_eq!(
-        *ui.commands.lock().unwrap(),
-        [json!({"kind":"setDefaultHome","instanceId":"a","package":"demo.home"})]
-    );
+    gone(&mut ui.app, "id:tasks-empty");
+    ui.update(|view| {
+        view["tasksLoaded"] = json!(true);
+        view["running"] =
+            json!([{"instanceId":"a","package":READER,"label":"阅读器","windowOpen":false}]);
+    });
+    wait(&mut ui.app, "id:panel-tasks >> text:运行中 · 1");
+    wait(&mut ui.app, "text:后台运行");
     ui.update(|view| view["runningError"] = json!("设备暂时离线"));
     wait(&mut ui.app, "text:/设备暂时离线/");
-    gone(&mut ui.app, "text:此实例没有运行中的应用");
+    wait(&mut ui.app, "id:panel-tasks >> text:运行中");
+    wait(&mut ui.app, "text:后台运行");
+    gone(&mut ui.app, "id:tasks-empty");
+    press(&mut ui.app, "panel-apps");
+    gone(&mut ui.app, "id:running-error");
+    ui.update(|view| {
+        view["runningError"] = Value::Null;
+        view["running"] = json!([]);
+    });
+    press(&mut ui.app, "panel-tasks");
+    wait(&mut ui.app, "id:tasks-empty");
+    wait(&mut ui.app, "id:panel-tasks >> text:运行中 · 0");
     ui.app
         .set_viewport(Size::new(Points(420.0), Points(600.0)))
         .unwrap();
-    wait(&mut ui.app, "id:workspace-scroll");
-    ui.app.scroll("id:workspace-scroll", Points(300.0)).unwrap();
+    wait(&mut ui.app, "id:task-scroll");
+    let tasks_bounds = bounds(&ui.app, "task-scroll");
+    press(&mut ui.app, "panel-apps");
+    wait(&mut ui.app, "id:apk-drop");
+    assert_eq!(tasks_bounds, bounds(&ui.app, "apk-drop"));
+}
+
+#[test]
+fn keyboard_restores_the_task_from_the_selected_instance() {
+    let mut view = ready_view();
+    view["running"] =
+        json!([{"instanceId":"a","package":READER,"label":"阅读器","windowOpen":false}]);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(
+            cmd,
+            &json!({"kind":"focusApp","instanceId":"a","package":READER})
+        );
+        view["running"][0]["windowOpen"] = json!(true);
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:panel-apps");
+    // Tab 进入标签栏，方向键切换内容区。遍历一次窗口的按钮，避免测试依赖某个绝对焦点序号。
+    let stops = ui.app.screen().count("role:button").unwrap() + 2;
+    for _ in 0..stops {
+        ui.app.press_key("Tab").unwrap();
+        ui.app.press_key("Right").unwrap();
+        if ui.app.screen().matches("id:running-list").unwrap() {
+            break;
+        }
+    }
+    wait(&mut ui.app, "role:button[恢复 阅读器 窗口]");
+    ui.app.press_key("Tab").unwrap();
+    ui.app.press_key("Enter").unwrap();
+    wait(&mut ui.app, "text:窗口已打开");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn inventory_routes_to_the_row_and_distinguishes_configured_observed_and_unknown() {
+    let mut view = ready_view();
+    view["instances"] = json!([
+        {"id":"a","name":"工作机","state":"ready","config":{"cpuCores":2,"ramMiB":3072,"screenWidth":1080,"screenHeight":2400,"diskBytes":8589934592_i64}},
+        {"id":"b","name":"阅读机","state":"ready","config":{"cpuCores":4,"ramMiB":1536,"screenWidth":1280,"screenHeight":720,"diskBytes":17179869184_i64},
+            "observed":{"cpuCores":3,"ramMiB":2048}}
+    ]);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd["kind"], "selectInstance");
+        view["id"] = cmd["instanceId"].clone();
+        view["selectedId"] = cmd["instanceId"].clone();
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library >> text:工作机");
+    press(&mut ui.app, "all-instances");
+    for (id, values) in [
+        ("a", ["2 核", "3 GiB", "1080 × 2400", "8 GiB"]),
+        ("b", ["4 核", "1536 MiB", "1280 × 720", "16 GiB"]),
+    ] {
+        for value in values {
+            wait(&mut ui.app, &format!("id:row-{id} >> text:{value}"));
+        }
+    }
+    press(&mut ui.app, "manage-b");
+    wait(&mut ui.app, "id:manage-instance >> text:阅读机");
+    wait(&mut ui.app, "text:CPU · 4 核");
+    wait(&mut ui.app, "text:观测到的 CPU · 3 核     内存 · 2 GiB");
+    press(&mut ui.app, "manage-back");
+    wait(&mut ui.app, "id:inventory");
+
+    // 旧工作区缺少 AVD 配置时仍有原名称、状态及导航，逐项留下未知。
+    ui.update(|view| {
+        view["instances"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("config");
+    });
+    wait(&mut ui.app, "id:row-a >> text:未知");
+    assert_eq!(ui.app.screen().count("id:row-a >> text:未知").unwrap(), 4);
+    press(&mut ui.app, "enter-a");
+    wait(&mut ui.app, "id:library >> text:工作机");
+    press(&mut ui.app, "open-management");
+    wait(&mut ui.app, "text:CPU · 未知");
+    wait(&mut ui.app, "text:观测到的 CPU · 未知     内存 · 未知");
+    press(&mut ui.app, "manage-back");
+    wait(&mut ui.app, "id:library >> text:工作机");
+    assert_eq!(
+        *ui.commands.lock().unwrap(),
+        [
+            json!({"kind":"selectInstance","instanceId":"b"}),
+            json!({"kind":"selectInstance","instanceId":"a"})
+        ]
+    );
+}
+
+#[test]
+fn only_the_visible_app_catalog_accepts_an_apk_drop() {
+    let mut ui = Scripted::new(ready_view(), |cmd, _| {
+        assert_eq!(
+            cmd,
+            &json!({"kind":"install","instanceId":"a","apkPath":"/tmp/reader.apk"})
+        );
+        json!({"status":"accepted"})
+    });
+    ui.channel.handle("windroid.windowSettings", |call| {
+        call.resolve(json!({"closeAction":"ask"}))
+    });
+    wait(&mut ui.app, "id:library");
+    for (entry, target) in [
+        ("panel-tasks", "task-scroll"),
+        ("open-management", "manage-instance"),
+        ("all-instances", "inventory"),
+        ("show-settings", "settings"),
+        ("show-environment", "environment"),
+    ] {
+        press(&mut ui.app, entry);
+        let selector = format!("id:{target}");
+        wait(&mut ui.app, &selector);
+        gone(&mut ui.app, "id:apk-drop");
+        let err = ui
+            .app
+            .drop_files(&selector, vec!["file:///tmp/reader.apk".into()])
+            .unwrap_err();
+        assert!(err.contains("onFileDrop"), "{err}");
+    }
+    assert!(ui.commands.lock().unwrap().is_empty());
+    press(&mut ui.app, "instance-a");
+    wait(&mut ui.app, "id:apk-drop");
+    ui.app
+        .drop_files("id:apk-drop", vec!["file:///tmp/reader.apk".into()])
+        .unwrap();
+    gone(&mut ui.app, "id:pending");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn window_settings_share_the_native_close_choice() {
+    let mut ui = Scripted::new(ready_view(), |_, _| unreachable!());
+    let (reads, pending) = mpsc::channel();
+    ui.channel.handle("windroid.windowSettings", move |call| {
+        reads.send(call.into_reply().unwrap()).unwrap();
+    });
+    let (writes, saved) = mpsc::channel();
+    ui.channel
+        .handle("windroid.setWindowSettings", move |call| {
+            let settings = call.data().clone();
+            writes.send(settings.clone()).unwrap();
+            call.resolve(settings);
+        });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-settings");
+    let first_read = pending.recv_timeout(WAIT).unwrap();
+    // 关窗面板的选择先于初始读取回执到达。较旧的 ask 快照不能覆盖这次用户选择。
+    ui.channel
+        .send(
+            "windroid.windowSettingsChanged",
+            json!({"closeAction":"background"}),
+        )
+        .unwrap();
+    wait(&mut ui.app, "id:close-preference >> text:/保留后台/");
+    first_read.resolve(json!({"closeAction":"ask"}));
+    ui.app.idle(Duration::from_millis(50)).unwrap();
+    assert!(
+        ui.app
+            .screen()
+            .matches("id:close-preference >> text:/保留后台/")
+            .unwrap()
+    );
+    press(&mut ui.app, "close-preference");
+    choose(&mut ui.app, "完全退出");
+    assert_eq!(
+        saved.recv_timeout(WAIT).unwrap(),
+        json!({"closeAction":"quit"})
+    );
+    wait(&mut ui.app, "id:close-preference >> text:/完全退出/");
+    ui.channel
+        .send(
+            "windroid.windowSettingsChanged",
+            json!({"closeAction":"ask"}),
+        )
+        .unwrap();
+    wait(&mut ui.app, "id:close-preference >> text:/每次询问/");
+    assert!(ui.commands.lock().unwrap().is_empty());
 }

@@ -4,14 +4,14 @@ use std::{fs, io};
 
 use super::{InstanceRecord, InstanceStore, data_dir, image_relative, invalid};
 use crate::provision::RuntimePaths;
-use contract::InstanceId;
+use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
     let marker = dir.join("active.pid");
@@ -42,6 +42,7 @@ pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
 
 pub(crate) struct OwnedEmulator {
     child: Child,
+    launched: SystemTime,
     pid_file: PathBuf,
     _lease: File,
     pub record: InstanceRecord,
@@ -131,6 +132,7 @@ impl OwnedEmulator {
         super::quick_boot::clear(&dir)?;
         let pid_file = dir.join("active.pid");
         let mut pid = File::create_new(&pid_file)?;
+        let launched = SystemTime::now();
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -143,6 +145,7 @@ impl OwnedEmulator {
         };
         let owned = Self {
             child,
+            launched,
             pid_file,
             _lease: lease,
             record,
@@ -155,6 +158,11 @@ impl OwnedEmulator {
 
     pub fn alive(&mut self) -> io::Result<bool> {
         Ok(self.child.try_wait()?.is_none())
+    }
+
+    pub fn allocation(&self) -> Option<GuestAllocation> {
+        let avd = data_dir(self.pid_file.parent()?, &self.record);
+        super::hardware::allocation(&avd.join("hardware-qemu.ini"), self.launched)
     }
 
     // 未回收且仍存活的子进程持有 PID；要求它是我们新建的进程组组长。

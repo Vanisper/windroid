@@ -6,7 +6,15 @@ export const stateName: Record<DeviceState, string> = {
   ready: "就绪", streaming: "运行中", stopping: "正在停止", failed: "启动失败",
 };
 
-export interface Instance { id: string; name: string; state: DeviceState; frozen?: boolean }
+export interface InstanceConfig {
+  template: string; image: { api: number; tag: string; abi: string };
+  cpuCores: number | null; ramMiB: number | null; screenWidth: number | null;
+  screenHeight: number | null; diskBytes: number;
+}
+export interface Instance {
+  id: string; name: string; state: DeviceState; frozen?: boolean; summary?: string;
+  config?: InstanceConfig | null; observed?: { cpuCores: number | null; ramMiB: number | null } | null;
+}
 export const instanceState = (item: Instance) => item.frozen ? "已冻结" : stateName[item.state];
 export interface Action {
   kind: "launch" | "setDefaultHome" | "forceStop" | "clearData";
@@ -53,6 +61,7 @@ export interface Snapshot {
   groups: Group[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
   instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string;
+  storage?: { home: string; sdk: string; images: string };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 
@@ -83,20 +92,38 @@ export const selected = computed(() => {
 export const currentId = computed(() => selected()?.id ?? null);
 export const preparation = computed(() => snapshot()?.preparation);
 export const running = computed(() => (snapshot()?.running ?? []).filter(app => app.instanceId === currentId()));
-export const can = (key: Capability) => currentId() !== null && snapshot()?.capabilities?.[key] === true;
-export const screen = signal<"library" | "create" | "environment">("library");
-export const groupId = signal("");
+export const environmentReady = computed(() => Boolean(snapshot()) && (!preparation() || preparation()?.phase === "ready"));
+export const can = (key: Capability) => currentId() !== null && snapshot()?.capabilities?.[key] === true
+  && (key !== "start" || environmentReady());
+
+type Screen = "instances" | "library" | "manage" | "create" | "environment" | "settings" | "guide";
+export const screen = signal<Screen>("instances");
+export const instancePage = computed(() => screen() === "library" || screen() === "manage");
+export const managementBack = signal<"library" | "instances">("instances");
+let navigation = 0;
+export function navigate(page: Screen) {
+  ++navigation;
+  screen.set(page);
+}
+export async function openInstance(id: string, page: "library" | "manage") {
+  const request = ++navigation;
+  const origin = screen();
+  if (id !== currentId() && !await send({ kind: "selectInstance", instanceId: id }, "切换实例")) return;
+  if (request !== navigation || currentId() !== id) return;
+  if (page === "manage") managementBack.set(origin === "library" ? "library" : "instances");
+  screen.set(page);
+}
 // 延迟到达的结果留在其发起实例。最近的全局消息和当前实例消息按到达顺序展示。
 const messages = signal<Message[]>([]);
 export const notice = computed(() => {
-  const visible = messages().filter(item => item.instanceId === null || item.instanceId === currentId());
+  const visible = messages().filter(item => item.instanceId === null || (instancePage() && item.instanceId === currentId()));
   return visible[visible.length - 1] ?? null;
 });
 export const loadError = signal("");
 // 安装等设备操作只锁定发起它的实例。用户仍能切到另一台设备。
 const requests = signal<Record<string, string>>({});
 export const switching = computed(() => Boolean(requests().global || requests().selection));
-export const pendingLabel = computed(() => requests().global || requests().selection || requests()["instance:" + currentId()] || "");
+export const pendingLabel = computed(() => requests().global || requests().selection || (instancePage() && requests()["instance:" + currentId()]) || "");
 export const busy = computed(() => Boolean(pendingLabel()));
 
 function remember(note: Message) {
@@ -128,10 +155,11 @@ async function readChanges() {
     do {
       dirty = false;
       const s = await host.call<Snapshot>("windroid.snapshot");
-      const previousId = currentId();
+      const first = !snapshot();
       snapshot.set(s);
       observeOperation(s.operation);
-      if (previousId !== currentId()) groupId.set("");
+      if (first && currentId() && navigation === 0) screen.set("library");
+      if (instancePage() && !currentId()) navigate("instances");
       loadError.set("");
     } while (dirty);
   } catch (error) {

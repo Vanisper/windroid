@@ -221,6 +221,7 @@ impl EmulatorBackend {
         self.reset_catalog();
         self.next_probe = None;
         facts.process_alive = false;
+        facts.allocation = None;
         facts.session_count = 0;
         clear_device(facts);
         Ok(())
@@ -363,12 +364,14 @@ impl Backend for EmulatorBackend {
             false
         });
         if !facts.process_alive {
+            facts.allocation = None;
             clear_device(facts);
             return;
         }
         if self.next_probe.is_some_and(|t| t > Instant::now()) {
             return;
         }
+        let previously_ready = facts.services.ready();
         clear_device(facts);
         let serial = self.serial();
         if let Ok(output) = adb::shell(&serial, HEALTH) {
@@ -381,6 +384,13 @@ impl Backend for EmulatorBackend {
             }
         }
         let ready = facts.services.ready();
+        if ready
+            && facts
+                .allocation
+                .is_none_or(|a| a.cpu_cores.is_none() || a.ram_mib.is_none())
+        {
+            facts.allocation = self.process.as_ref().and_then(OwnedEmulator::allocation);
+        }
         self.next_probe = Some(
             Instant::now()
                 + if ready {
@@ -389,7 +399,12 @@ impl Backend for EmulatorBackend {
                     Duration::from_millis(350)
                 },
         );
-        if ready && self.apps_dirty && self.apps_retry_at.is_none_or(|t| Instant::now() >= t) {
+        // 先发布第一次就绪，任务观察器即可独立读取活动栈。目录与标签读取可能需要数秒。
+        if ready
+            && previously_ready
+            && self.apps_dirty
+            && self.apps_retry_at.is_none_or(|t| Instant::now() >= t)
+        {
             let _ = self.refresh_catalog();
         }
     }

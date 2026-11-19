@@ -167,6 +167,7 @@ impl Library {
                 }
                 self.window(WindowCommand::PickApk {
                     instance_id: id.into(),
+                    instance_name: instance.name.clone(),
                 })?;
             }
             "install" | "start" | "stop" | "refreshApps" | "setDefaultHome" | "clearData" => {
@@ -196,7 +197,12 @@ impl Library {
                 {
                     return Err(error("此应用不提供清除数据操作"));
                 }
-                let seq = self.device(&instance, crate::device_command(data)?)?;
+                let command = crate::device_command(data)?;
+                // 文件面板回调没有等待它的界面请求，安装阶段也写入发起实例的快照。
+                if kind == "install" {
+                    self.note(Some(id), false, "正在安装 APK…");
+                }
+                let seq = self.device(&instance, command)?;
                 match kind {
                     "start" => {
                         let mut s = self.state.lock().unwrap();

@@ -2,6 +2,7 @@
 //! 分配、选择、启动加锁与删除共享一把目录锁。每个在运行的实例另持有独占文件锁。
 
 mod avd;
+mod hardware;
 pub(crate) mod process;
 mod quick_boot;
 
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::{Layout, serial_for};
 pub(crate) use avd::{data_dir, image_relative};
 use contract::{InstanceId, Spec};
+pub use hardware::InstanceConfig;
 use serde::{Deserialize, Serialize};
 
 /// 各模板分配的客户机内存，用于 AVD 配置与设备域资源准入。

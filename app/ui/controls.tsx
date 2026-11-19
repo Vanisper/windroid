@@ -3,13 +3,13 @@ import { Dialog } from "nsh/base";
 import { currentId, type DeviceState } from "./model";
 
 const light = {
-  canvas: "#FBFCFA", rail: "#F1F4F1", card: "#FFFFFF", ink: "#192922", muted: "#53685C", faint: "#67776D",
-  line: "#D7DFD8", wash: "#E7EDE8", accent: "#186749", selected: "#DCEEE2", onAccent: "#FFFFFF",
+  canvas: "#FAFAFC", rail: "#F3F4F7", card: "#FFFFFF", ink: "#252632", muted: "#565D70", faint: "#697080",
+  line: "#DFE1E8", wash: "#E9EBF3", accent: "#344592", selected: "#E3E7F5", onAccent: "#FFFFFF",
   warn: "#82560B", warnBg: "#FBF2D9", bad: "#A83830", badBg: "#FAE9E5",
 };
 const dark: typeof light = {
-  canvas: "#18211C", rail: "#111914", card: "#1F2A23", ink: "#E8F0E9", muted: "#B4C3B7", faint: "#95A69A",
-  line: "#38483C", wash: "#2B382F", accent: "#8BD7AE", selected: "#284335", onAccent: "#10271A",
+  canvas: "#1C1D24", rail: "#191A20", card: "#242630", ink: "#EBECF5", muted: "#B4B8CA", faint: "#9CA2B5",
+  line: "#3B3E4B", wash: "#313440", accent: "#B4C0FF", selected: "#353C59", onAccent: "#1A2040",
   warn: "#E9C26B", warnBg: "#3A3020", bad: "#FFABA2", badBg: "#452A26",
 };
 export const colors = computed(() => colorScheme() === "dark" ? dark : light);
@@ -27,10 +27,10 @@ export function Detail(props: { text: string; id?: string }) {
   return <Text testID={props.id} style={{ fontSize: 13, color: colors().muted }}>{props.text}</Text>;
 }
 export function Button(props: {
-  id: string; label: string; press: () => void; disabled?: boolean; primary?: boolean; danger?: boolean; tooltip?: string;
+  id: string; label: string; press: () => void; disabled?: boolean; primary?: boolean; danger?: boolean; tooltip?: string; accessibilityLabel?: string;
 }) {
   return (
-    <View testID={props.id} role="button" accessibilityLabel={props.label} tooltip={props.tooltip}
+    <View testID={props.id} role="button" accessibilityLabel={props.accessibilityLabel ?? props.label} tooltip={props.tooltip}
       disabled={props.disabled === true} onPress={props.press}
       style={{ alignItems: "center", justifyContent: "center", alignSelf: "flex-start", minHeight: 32,
         paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, borderWidth: 1,

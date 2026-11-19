@@ -50,6 +50,14 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
         (&b, "tv-4k", 3840, 2160, 320),
     ] {
         let dir = avd(&root.0, record);
+        let saved = record.config(&layout);
+        assert_eq!(saved.cpu_cores, Some(2));
+        assert_eq!(saved.ram_mib, Some(ram_mib(template) as u32));
+        assert_eq!(
+            (saved.screen_width, saved.screen_height),
+            (Some(w), Some(h))
+        );
+        assert_eq!(saved.spec.disk_bytes, record.spec.disk_bytes);
         let config = fs::read_to_string(dir.join("config.ini")).unwrap();
         for expected in [
             format!("hw.lcd.width={w}"),
@@ -73,6 +81,19 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
                 .any(|l| l == format!("path={}", dir.display()))
         );
     }
+    // 旧清单没有专门的硬件字段，展示磁盘上已有的值。残缺项不套用当前模板默认值。
+    let config_path = avd(&root.0, &a).join("config.ini");
+    fs::write(
+        &config_path,
+        "hw.cpu.ncore = 4\nhw.ramSize=invalid\nhw.lcd.width=1\nhw.lcd.width=2",
+    )
+    .unwrap();
+    let saved = reopened.get(&a.id).unwrap().config(&layout);
+    assert_eq!(saved.cpu_cores, Some(4));
+    assert_eq!(saved.ram_mib, None);
+    assert_eq!((saved.screen_width, saved.screen_height), (None, None));
+    fs::remove_file(config_path).unwrap();
+    assert_eq!(reopened.get(&a.id).unwrap().config(&layout).spec, a.spec);
     assert!(physical_memory_mib().unwrap() > 0);
     store.delete(&a.id).unwrap();
     store.delete(&a.id).unwrap();
@@ -247,6 +268,8 @@ esac
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(pid_marker.exists());
     fs::remove_file(pid_marker).unwrap();
+    let hardware = avd(&root, &a).join("hardware-qemu.ini");
+    fs::write(&hardware, "hw.cpu.ncore=8\nhw.ramSize=8192").unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
     assert!(store.delete(&a.id).is_err());
     let mut another = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
@@ -289,6 +312,24 @@ esac
     )
     .unwrap();
     await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    assert_eq!(backend.catalog_status(), CatalogStatus::Pending);
+    assert!(
+        !fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .contains("pm list packages")
+    );
+    assert!(
+        facts.allocation.is_none(),
+        "前次启动遗留的有效参数不能算作本次观测"
+    );
+    fs::write(&hardware, "hw.cpu.ncore = 2\nhw.ramSize = 2560").unwrap();
+    await_observation(&mut backend, &mut facts, |f| f.allocation.is_some());
+    let allocation = facts.allocation.unwrap();
+    assert_eq!(
+        (allocation.cpu_cores, allocation.ram_mib),
+        (Some(2), Some(2560))
+    );
+    assert_eq!(a.config(&layout).ram_mib, Some(1536));
     assert_eq!(State::of(&facts), State::Ready);
     assert_eq!(backend.catalog_status(), CatalogStatus::Ready);
     assert_eq!(backend.apps()[0].package.as_str(), "dev.sample");
@@ -322,10 +363,13 @@ esac
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(store.quick_boot_saved(&a.id).unwrap());
+    assert!(facts.allocation.is_none());
     // 下一次退出时若没有写入，磁盘上残留的旧快照不能让界面误报“已冻结”。
     fs::remove_file(root.join("save-on-exit")).unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
+    await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    assert!(facts.allocation.is_none());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     assert_eq!(backend.catalog_status(), CatalogStatus::Pending);

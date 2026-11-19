@@ -32,7 +32,7 @@ fn main() -> Result<(), String> {
     let fake = std::env::var("WINDROID_FAKE").as_deref() == Ok("1");
     let library =
         host::Library::attach(library_window.channel(), layout, fake, commands, windows_rx)?;
-    windows::install(mtm, home, rx, events);
+    windows::install(mtm, library_window.channel(), home, rx, events);
     load_ui(&library_window)?;
     library_window.show(mtm);
     app.run();

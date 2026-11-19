@@ -7336,8 +7336,10 @@ dependencies = [
  "host",
  "log",
  "nsh-core",
+ "nsh-engine",
  "nsh-platform-macos",
  "runtime",
+ "serde_json",
  "stream",
 ]
 

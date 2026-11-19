@@ -1,7 +1,7 @@
 import { computed, openUrl, Scroll, signal, Text, View, windowSize } from "nsh";
 import { Dialog } from "nsh/base";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
-import { busy, preparation, report, screen, send, type Component, type Preparation } from "./model";
+import { busy, preparation, navigate, report, send, type Component, type Preparation } from "./model";
 
 const phaseTitle: Record<Preparation["phase"], string> = {
   missing: "准备 Android 环境", downloading: "正在下载组件", verifying: "正在校验文件",
@@ -84,7 +84,7 @@ export function Environment() {
       {info()?.error ? <Text testID="preparation-error" role="alert" style={{ userSelect: "text", fontSize: 13, color: colors().bad }}>{info()?.error}</Text> : null}
       {!info()?.borrowed && !active() && phase() !== "ready" ? <Detail text="开始或继续下载即表示同意下列组件各自的许可条款。" /> : null}
       <View style={row}>
-        {phase() === "ready" ? <Button id="return-library" label="进入应用库" primary press={() => screen.set("library")} /> : null}
+        {phase() === "ready" ? <Button id="return-library" label="查看全部实例" primary press={() => navigate("instances")} /> : null}
         {!info()?.borrowed && !active() && phase() !== "ready" ?
           <Button id="prepare-runtime" primary disabled={busy() || !info()?.components.length} press={start}
             label={phase() === "paused" ? "同意并继续下载" : phase() === "failed" ? "同意并重试" : "同意并下载"} /> : null}
@@ -95,6 +95,10 @@ export function Environment() {
     <View style={card()}>
       <Heading text="组件与许可" />
       <Each of={info()?.components} key={item => item.id}>{item => <ComponentRow item={item()} />}</Each>
+    </View>
+    <View style={card()}>
+      <Heading text="系统镜像" />
+      <Detail text="当前准备清单包含 Android 14 系统镜像。按版本选择和导入镜像将在后续版本提供。" />
     </View>
     <LicenseDialog />
   </View>;

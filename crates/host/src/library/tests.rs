@@ -31,31 +31,87 @@ fn until(predicate: impl Fn() -> bool) {
 
 #[test]
 fn picker_keeps_its_instance_when_selection_changes() {
+    struct WaitForInstall {
+        inner: device::FakeBackend,
+        started: mpsc::Sender<String>,
+        proceed: mpsc::Receiver<()>,
+    }
+    impl device::Backend for WaitForInstall {
+        fn exec(&mut self, command: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if let Command::Install { apk_path } = command {
+                self.started.send(apk_path.clone()).unwrap();
+                self.proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.inner.exec(command, facts)
+        }
+        fn observe(&mut self, facts: &mut Facts) {
+            self.inner.observe(facts);
+        }
+        fn abort(&mut self, facts: &mut Facts) {
+            self.inner.abort(facts);
+        }
+    }
     let (lib, windows) = library();
-    let a = create(&lib, "平板");
-    lib.perform(&json!({"kind":"start","instanceId":a}))
-        .unwrap();
-    until(|| lib.snapshot()["capabilities"]["install"] == true);
+    let a = "installer";
+    let (started, install_path) = mpsc::channel();
+    let (allow, proceed) = mpsc::channel();
+    let (handle, events) = device::spawn(
+        InstanceId::new(a),
+        a.into(),
+        WaitForInstall {
+            inner: device::FakeBackend::new(),
+            started,
+            proceed,
+        },
+        Default::default(),
+    );
+    lib.add("平板".into(), handle.clone(), events, None);
+    assert!(matches!(
+        handle.send(Command::Create { spec: fake_spec() }),
+        Ack::Accepted { .. }
+    ));
+    let select = |id: &str| {
+        lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
+            .unwrap()
+    };
+    select(a);
+    ready(&lib, a);
     lib.perform(&json!({"kind":"addApk","instanceId":a}))
         .unwrap();
     assert!(
-        matches!(windows.recv().unwrap(), WindowCommand::PickApk{instance_id} if instance_id==a)
+        matches!(windows.recv().unwrap(), WindowCommand::PickApk {instance_id, instance_name}
+            if instance_id == a && instance_name == "平板")
     );
     let b = create(&lib, "手机");
     lib.window_event(WindowEvent::ApkPicked {
-        instance_id: a.clone(),
+        instance_id: a.into(),
         path: "/fixture/two words.apk".into(),
     });
+    assert_eq!(
+        install_path.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "/fixture/two words.apk"
+    );
+    assert_eq!(lib.snapshot()["selectedId"], b);
+    assert_ne!(lib.snapshot()["operation"]["instanceId"], a);
+    select(a);
+    assert_eq!(lib.snapshot()["operation"]["message"], "正在安装 APK…");
+    select(&b);
+    allow.send(()).unwrap();
     until(|| {
         lib.state
             .lock()
             .unwrap()
             .operations
-            .get(&a)
-            .is_some_and(|op| op["message"].as_str().is_some_and(|s| s.contains("APK")))
+            .get(a)
+            .is_some_and(|op| op["message"] == "APK 已安装并核实版本")
     });
     assert_eq!(lib.snapshot()["selectedId"], b);
     assert_ne!(lib.snapshot()["operation"]["instanceId"], a);
+    select(a);
+    assert_eq!(
+        lib.snapshot()["operation"]["message"],
+        "APK 已安装并核实版本"
+    );
     assert!(
         lib.perform(&json!({"kind":"install","apkPath":"/fixture/package.apk"}))
             .is_err()
@@ -63,26 +119,84 @@ fn picker_keeps_its_instance_when_selection_changes() {
 }
 
 #[test]
-fn background_close_and_quit_have_distinct_observable_outcomes() {
+fn same_package_windows_close_and_restore_on_the_original_instance() {
     let (lib, _) = library();
-    let id = create(&lib, "手机");
-    lib.perform(&json!({"kind":"start","instanceId":id}))
-        .unwrap();
-    until(|| lib.snapshot()["state"] == "ready");
-    let action = |kind: &str| {
+    let a = create(&lib, "手机 A");
+    let first = ready(&lib, &a);
+    let b = create(&lib, "手机 B");
+    let second = ready(&lib, &b);
+    let action = |kind: &str, id: &str| {
         lib.perform(&json!({"kind":kind,"instanceId":id,"package":"com.example.reader"}))
             .unwrap()
     };
-    action("launch");
-    action("launch");
-    assert_eq!(lib.snapshot()["facts"]["sessionCount"], 1);
-    action("backgroundApp");
-    assert_eq!(lib.snapshot()["running"][0]["windowOpen"], false);
-    assert_eq!(lib.snapshot()["facts"]["sessionCount"], 0);
-    action("focusApp");
+    action("launch", &a);
+    action("launch", &b);
+    action("focusApp", &a);
+    assert_eq!(first.handle.snapshot().facts.session_count, 1);
+    assert_eq!(second.handle.snapshot().facts.session_count, 1);
+
+    action("backgroundApp", &a);
+    assert_eq!(first.handle.snapshot().facts.session_count, 0);
+    assert_eq!(lib.snapshot()["selectedId"], b);
     assert_eq!(lib.snapshot()["running"][0]["windowOpen"], true);
-    action("quitApp");
-    assert!(lib.snapshot()["running"].as_array().unwrap().is_empty());
+    action("selectInstance", &a);
+    assert_eq!(lib.snapshot()["running"][0]["windowOpen"], false);
+    action("focusApp", &a);
+    action("selectInstance", &b);
+    lib.window_event(WindowEvent::QuitRequested {
+        key: WindowKey {
+            instance_id: a.clone(),
+            package: Some("com.example.reader".into()),
+        },
+    });
+    until(|| first.handle.snapshot().facts.session_count == 0);
+    assert_eq!(second.handle.snapshot().facts.session_count, 1);
+    assert_eq!(lib.snapshot()["running"][0]["instanceId"], b);
+    action("selectInstance", &a);
+    until(|| lib.snapshot()["running"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn running_list_waits_for_launcher_classification_and_keeps_cached_rows_on_error() {
+    let (lib, _) = library();
+    let id = create(&lib, "平板");
+    let mut state = lib.state.lock().unwrap();
+    let mut snapshot = state.instances[&id].handle.snapshot();
+    let apps = std::mem::take(&mut snapshot.apps);
+    let mut view = json!({});
+    snapshot.catalog_status = contract::CatalogStatus::Pending;
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], false);
+
+    state.tasks.insert(id.clone(), BTreeSet::new());
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], true);
+    assert_eq!(view["running"], json!([]));
+    state
+        .tasks
+        .get_mut(&id)
+        .unwrap()
+        .insert("com.example.reader".into());
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], false);
+    assert!(view["runningError"].is_null());
+
+    snapshot.apps = apps;
+    snapshot.catalog_status = contract::CatalogStatus::Ready;
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], true);
+    assert_eq!(view["running"][0]["package"], "com.example.reader");
+    snapshot.catalog_status = contract::CatalogStatus::Failed {
+        message: "缺少包索引".into(),
+    };
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["tasksLoaded"], false);
+    assert_eq!(view["runningError"], "应用列表读取失败 · 缺少包索引");
+    assert_eq!(view["running"][0]["package"], "com.example.reader");
+    state.task_errors.insert(id, "读取活动栈超时".into());
+    state.write_running(&mut view, &snapshot);
+    assert_eq!(view["runningError"], "读取活动栈超时");
+    assert_eq!(view["running"][0]["package"], "com.example.reader");
 }
 
 #[test]
@@ -430,4 +544,105 @@ fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
         .unwrap();
     assert!(matches!(recv(), WindowCommand::QuitFailed { .. }));
     assert_eq!(handle.snapshot().facts.session_count, 1);
+}
+
+#[test]
+fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
+    use std::{fs, time::SystemTime};
+    let token = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("windroid-workspace-{}-{token}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let layout = Layout { root: root.clone() };
+    let store = InstanceStore::new(layout.clone());
+    let spec = contract::Spec {
+        template: "compact-720".into(),
+        image: contract::Image {
+            api: 34,
+            tag: "google_apis_playstore".into(),
+            abi: "arm64-v8a".into(),
+        },
+        disk_bytes: 6 << 30,
+    };
+    let a = store.create("副屏", spec.clone()).unwrap();
+    let b = store
+        .create(
+            "主屏",
+            contract::Spec {
+                template: "phone-1080".into(),
+                disk_bytes: 8 << 30,
+                ..spec
+            },
+        )
+        .unwrap();
+    let (tx, _) = mpsc::channel();
+    let (_events, rx) = mpsc::channel();
+    let lib = Library::attach(HostChannel::new(), layout, false, tx, rx).unwrap();
+    until(|| lib.snapshot()["state"] == "stopped");
+    let snap = lib.snapshot();
+    let rows = snap["instances"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(snap["selectedId"], b.id.as_str());
+    let config = |id: &InstanceId| &rows.iter().find(|r| r["id"] == id.as_str()).unwrap()["config"];
+    assert_eq!(config(&a.id)["screenWidth"], 1280);
+    assert_eq!(config(&b.id)["screenWidth"], 1080);
+    assert_eq!(config(&a.id)["ramMiB"], 1536);
+    assert_eq!(config(&b.id)["cpuCores"], 2);
+    assert_eq!(config(&b.id)["diskBytes"], 8_u64 << 30);
+    assert_eq!(config(&a.id)["image"]["api"], 34);
+    assert_eq!(snap["storage"]["home"], json!(root));
+    let sdk = RuntimePaths::discover(&root).sdk;
+    assert_eq!(snap["storage"]["sdk"], json!(sdk));
+    assert_eq!(snap["storage"]["images"], json!(sdk.join("system-images")));
+    lib.shutdown();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_runtime_blocks_create_and_start_but_keeps_selection_available() {
+    let root =
+        std::env::temp_dir().join(format!("windroid-missing-runtime-{}", std::process::id()));
+    let (tx, _) = mpsc::channel();
+    let mut lib = Library::new(
+        HostChannel::new(),
+        Layout { root: root.clone() },
+        true,
+        tx,
+        false,
+    )
+    .unwrap();
+    Arc::get_mut(&mut lib).unwrap().runtime = Some(Provisioner::managed(&root));
+    assert_ne!(lib.snapshot()["preparation"]["phase"], "ready");
+    assert_eq!(lib.snapshot()["capabilities"]["create"], false);
+    assert!(
+        lib.perform(&json!({"kind":"createInstance", "name":"新实例"}))
+            .is_err()
+    );
+
+    let id = "existing";
+    let (handle, events) = device::spawn(
+        InstanceId::new(id),
+        id.into(),
+        device::FakeBackend::new(),
+        Default::default(),
+    );
+    assert!(matches!(
+        handle.send(Command::Create { spec: fake_spec() }),
+        Ack::Accepted { .. }
+    ));
+    lib.add(id.into(), handle, events, None);
+    lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
+        .unwrap();
+    let snap = lib.snapshot();
+    assert_eq!(snap["selectedId"], id);
+    assert_eq!(snap["state"], "stopped");
+    assert_eq!(snap["capabilities"]["start"], false);
+    assert_eq!(snap["capabilities"]["delete"], true);
+    assert!(
+        lib.perform(&json!({"kind":"start", "instanceId":id}))
+            .is_err()
+    );
 }

@@ -13,7 +13,7 @@ use device::{Events, Handle};
 use nsh_engine::{HostCall, HostChannel, JsonValue};
 use runtime::{
     Layout,
-    instances::{InstanceRecord, InstanceStore},
+    instances::{InstanceConfig, InstanceRecord, InstanceStore},
     provision::{Provisioner, RuntimePaths},
 };
 use serde_json::json;
@@ -49,6 +49,7 @@ struct Instance {
     name: String,
     handle: Handle,
     record: Option<InstanceRecord>,
+    config: Option<InstanceConfig>,
     lane: Lane,
 }
 
@@ -68,6 +69,42 @@ struct ViewState {
     /// 最近一次设备任务观测；未读取、读取失败与确实无任务分开表示。
     tasks: BTreeMap<String, BTreeSet<String>>,
     task_errors: BTreeMap<String, String>,
+}
+
+impl ViewState {
+    fn write_running(&self, out: &mut JsonValue, snap: &Snapshot) {
+        let id = snap.id.as_str();
+        let tasks = self.tasks.get(id);
+        out["running"] = snap
+            .apps
+            .iter()
+            .filter(|app| app.launcher)
+            .filter_map(|app| {
+                let package = app.package.as_str();
+                let window_open = self.open.contains(&(id.into(), Some(package.into())));
+                (window_open || tasks.is_some_and(|tasks| tasks.contains(package))).then(|| {
+                    json!({
+                        "instanceId": id, "package": package,
+                        "label": app.label.as_deref().unwrap_or(package), "windowOpen": window_open
+                    })
+                })
+            })
+            .collect();
+
+        // 任务栈非空时，要等 LAUNCHER 清单核实哪些包能恢复。两者的读取顺序不固定。
+        let needs_catalog = tasks.is_some_and(|tasks| !tasks.is_empty());
+        let catalog_error = match &snap.catalog_status {
+            contract::CatalogStatus::Failed { message } if needs_catalog => {
+                Some(format!("应用列表读取失败 · {message}"))
+            }
+            _ => None,
+        };
+        out["runningError"] = json!(self.task_errors.get(id).or(catalog_error.as_ref()));
+        out["tasksLoaded"] = json!(
+            tasks.is_some()
+                && (!needs_catalog || snap.catalog_status == contract::CatalogStatus::Ready)
+        );
+    }
 }
 
 pub struct Library {
@@ -199,6 +236,7 @@ impl Library {
             name,
             handle,
             lane: self.lane(),
+            config: record.as_ref().map(|r| r.config(&self.layout)),
             record,
         };
         {
@@ -343,9 +381,26 @@ impl Library {
             });
         let id = snap.id.to_string();
         let mut view = SnapshotView::of(snap.clone()).with_apps(&snap.apps, &snap.desktop);
+        // actor 判断设备状态，应用库再叠加同一份准备快照中的主机条件。
+        if preparation["phase"] != "ready" {
+            view.capabilities.create = false;
+            view.capabilities.start = false;
+        }
         self.groups.lock().unwrap().apply(&id, &mut view.groups);
         let mut out = crate::to_json(&view);
-        out["instances"]=state.instances.iter().map(|(id,i)|json!({"id":id,"name":i.name,"state":i.handle.snapshot().state,"frozen":state.frozen.contains(id)})).collect();
+        out["instances"] = state
+            .instances
+            .iter()
+            .map(|(id, instance)| {
+                let device = instance.handle.snapshot();
+                json!({
+                    "id": id, "name": instance.name, "state": device.state,
+                    "frozen": state.frozen.contains(id),
+                    "summary": crate::describe(device.state, device.phase, &device.facts),
+                    "config": instance.config, "observed": device.facts.allocation
+                })
+            })
+            .collect();
         out["selectedId"] = json!(state.selected);
         out["frozen"] = json!(state.frozen.contains(&id));
         out["operation"] = state
@@ -354,14 +409,15 @@ impl Library {
             .or_else(|| state.operations.get(""))
             .cloned()
             .unwrap_or_default();
-        out["running"] = snap.apps.iter().filter(|a|a.launcher).filter_map(|a| {
-            let package=a.package.as_str();
-            let window_open=state.open.contains(&(id.clone(),Some(package.into())));
-            (window_open || state.tasks.get(&id).is_some_and(|tasks|tasks.contains(package))).then(||json!({"instanceId":id,"package":package,"label":a.label.as_deref().unwrap_or(package),"windowOpen":window_open}))
-        }).collect();
-        out["runningError"] = json!(state.task_errors.get(&id));
-        out["tasksLoaded"] = json!(state.tasks.contains_key(&id));
+        state.write_running(&mut out, &snap);
         out["preparation"] = preparation;
+        if let Some(runtime) = &self.runtime {
+            let paths = runtime.paths();
+            out["storage"] = json!({
+                "home": self.layout.root, "sdk": paths.sdk,
+                "images": paths.sdk.join("system-images")
+            });
+        }
         out["recommendedTemplate"] = self.recommended_template.into();
         out
     }
