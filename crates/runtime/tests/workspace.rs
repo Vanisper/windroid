@@ -61,6 +61,7 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
         "uncommitted-transaction",
         "malformed-settings",
         "damaged-marker",
+        "bad-selection",
         "linked-lock",
         "linked-home",
     ] {
@@ -123,10 +124,17 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
                 r#"{"runtimeRoot":"/does-not-exist","imageRoot":null}"#,
             )
             .unwrap(),
+            "bad-selection" => {
+                fs::create_dir(home.join("instances")).unwrap();
+                fs::write(home.join("instances/.selected"), [0xff]).unwrap();
+            }
             "linked-lock" => symlink(external.join("keep"), home.join(".storage.lock")).unwrap(),
             "unreadable" => {
-                fs::set_permissions(home.join("workspace-format"), fs::Permissions::from_mode(0o0))
-                    .unwrap();
+                fs::set_permissions(
+                    home.join("workspace-format"),
+                    fs::Permissions::from_mode(0o0),
+                )
+                .unwrap();
                 if fs::File::open(home.join("workspace-format")).is_ok() {
                     continue;
                 }
@@ -145,4 +153,15 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
             assert_eq!(tree(&temp.0), before, "{case}");
         }
     }
+}
+
+#[test]
+fn missing_ancestor_cannot_redirect_initialization_into_an_old_workspace() {
+    let temp = support::Temp::create();
+    let old = temp.0.join("old");
+    fs::create_dir(&old).unwrap();
+    fs::write(old.join("storage-locations.json"), "{}").unwrap();
+    let before = tree(&temp.0);
+    assert!(workspace::open(&temp.0.join("missing/../old")).is_err());
+    assert_eq!(tree(&temp.0), before);
 }

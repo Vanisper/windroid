@@ -45,8 +45,12 @@ fn entries(path: &Path) -> io::Result<Vec<OsString>> {
 }
 
 pub fn inspect(home: &Path) -> io::Result<Workspace> {
-    if !home.is_absolute() {
-        return Err(unknown("工作区需要绝对路径"));
+    if !home.is_absolute()
+        || home
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(unknown("工作区需要不含 .. 的绝对路径"));
     }
     crate::storage::check_volume(home).map_err(unknown)?;
     match fs::symlink_metadata(home) {

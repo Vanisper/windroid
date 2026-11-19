@@ -350,7 +350,8 @@ pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
             )));
         }
     }
-    records_in(root).map(|_| ())
+    let records = records_in(root)?;
+    selected_in(root, &records).map(|_| ())
 }
 
 fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
@@ -405,9 +406,20 @@ fn read_record(root: &Path, id: &InstanceId) -> io::Result<InstanceRecord> {
 }
 
 fn selected_in(root: &Path, records: &[InstanceRecord]) -> io::Result<Option<InstanceId>> {
-    match fs::read_to_string(root.join(".selected")) {
-        Ok(id) => {
-            if let Some(record) = records.iter().find(|r| r.id.as_str() == id) {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root.join(".selected"))
+    {
+        Ok(file) => {
+            if !file.metadata()?.is_file() {
+                return Err(invalid("实例选择记录类型无效"));
+            }
+            let mut text = String::new();
+            file.take(81).read_to_string(&mut text)?;
+            let id = InstanceId::new(text);
+            valid_id(&id)?;
+            if let Some(record) = records.iter().find(|r| r.id == id) {
                 return Ok(Some(record.id.clone()));
             }
         }
