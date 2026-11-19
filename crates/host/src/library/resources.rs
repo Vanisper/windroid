@@ -5,6 +5,7 @@ use std::path::Path;
 
 fn demo_image() -> contract::Image {
     contract::Image {
+        revision: 14,
         api: 34,
         tag: "google_apis_playstore".into(),
         abi: "arm64-v8a".into(),
@@ -25,6 +26,7 @@ pub(super) fn image_available(preparation: &JsonValue, wanted: &contract::Image)
         rows.iter().any(|row| {
             let image = &row["image"];
             row["ready"] == true
+                && image["revision"] == wanted.revision
                 && image["api"] == wanted.api
                 && image["abi"] == abi
                 && image["tag"] == wanted.tag

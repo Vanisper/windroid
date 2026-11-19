@@ -187,7 +187,7 @@ fn command_roundtrips_through_json() {
         Command::Create {
             spec: Spec {
                 template: "phone-1080".into(),
-                image: Image { api: 34, tag: "google_apis_playstore".into(), abi: "arm64-v8a".into() },
+                image: Image { revision: 14, api: 34, tag: "google_apis_playstore".into(), abi: "arm64-v8a".into() },
                 disk_bytes: 8 << 30,
             },
         },

@@ -14,6 +14,9 @@ pub(super) fn validate(spec: &Spec) -> io::Result<()> {
             "数据分区至少需要 6 GiB，大小必须能用有符号 64 位字节数表示",
         ));
     }
+    if spec.image.revision == 0 {
+        return Err(invalid("系统镜像需要正整数修订号"));
+    }
     if spec.image.api == 0
         || spec.image.tag.is_empty()
         || spec.image.tag.len() > 80
@@ -52,7 +55,8 @@ fn abi(image: &Image) -> io::Result<(&'static str, &'static str)> {
 pub(crate) fn image_subdir(image: &Image) -> io::Result<PathBuf> {
     Ok(PathBuf::from(format!("android-{}", image.api))
         .join(&image.tag)
-        .join(abi(image)?.0))
+        .join(abi(image)?.0)
+        .join(format!("r{}", image.revision)))
 }
 
 /// 模拟器读取 AVD 时先查 image.sysdir.1。继承时保留 SDK 相对路径，独立目录用绝对路径。

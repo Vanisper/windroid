@@ -63,6 +63,7 @@ pub(super) const PLAY_TAG: &str = "google_apis_playstore";
 impl Artifact {
     pub fn image(self) -> Option<contract::Image> {
         self.image_spec.map(|spec| contract::Image {
+            revision: self.version.parse().expect("catalog image revision"),
             api: spec.api,
             tag: PLAY_TAG.into(),
             abi: IMAGE_ABI.into(),

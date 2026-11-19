@@ -275,6 +275,8 @@ pub struct Spec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Image {
+    /// 官方系统镜像包修订号，与 API 等字段共同标识不可变资源。
+    pub revision: u32,
     pub api: u32,
     pub tag: String,
     pub abi: String,

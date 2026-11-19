@@ -305,6 +305,7 @@ fn fake_spec() -> contract::Spec {
     contract::Spec {
         template: "compact-720".into(),
         image: contract::Image {
+            revision: 14,
             api: 34,
             tag: "test".into(),
             abi: "test".into(),
@@ -606,6 +607,7 @@ fn stored_spec() -> contract::Spec {
     contract::Spec {
         template: "compact-720".into(),
         image: contract::Image {
+            revision: 14,
             api: 34,
             tag: "google_apis_playstore".into(),
             abi: "arm64-v8a".into(),

@@ -313,6 +313,7 @@ fn a_stalled_boot_reports_the_missing_service() {
     let spec = Spec {
         template: "phone-1080".into(),
         image: Image {
+            revision: 14,
             api: 34,
             tag: "google_apis_playstore".into(),
             abi: "arm64-v8a".into(),

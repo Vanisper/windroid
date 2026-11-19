@@ -30,6 +30,7 @@ pub fn spec(template: &str) -> Spec {
     Spec {
         template: template.into(),
         image: Image {
+            revision: 14,
             api: 34,
             tag: "google_apis_playstore".into(),
             abi: "arm64".into(),

@@ -159,6 +159,7 @@ fn checks_related_leases_or_orphan_processes_and_declines_stale_previews() {
             contract::Spec {
                 template: "compact-720".into(),
                 image: contract::Image {
+                    revision: 14,
                     api: 34,
                     tag: "google_apis_playstore".into(),
                     abi: "arm64".into(),
