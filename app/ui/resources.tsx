@@ -80,7 +80,7 @@ export function ResourceHealth(props: { item: Component }) {
   }
   return <View style={{ gap: 5 }}>
     <Location path={props.item.location} />
-    <Detail id={"integrity-" + props.item.id} text={integrityLabel[props.item.integrity]} />
+    <Detail id={"integrity-" + props.item.id} text={integrityLabel[props.item.integrity] + (props.item.ready && !props.item.writable ? " · 只读位置" : "")} />
     {props.item.issue ? <Text role="alert" style={{ userSelect: "text", fontSize: 13, color: colors().bad }}>{props.item.issue}</Text> : null}
     {!props.item.ready && props.item.integrity !== "conflict" ? <Detail text={"需额外空间 · " + size(props.item.requiredBytes) +
       (props.item.availableBytes === null ? "    可用空间未知" : "    可用 · " + size(props.item.availableBytes))} /> : null}

@@ -535,7 +535,9 @@ fn image_writes_report_space_permissions_and_unknown_files_without_offering_over
     let mut unknown = image("unknown", 36, false);
     unknown["integrity"] = json!("conflict");
     unknown["issue"] = json!("包含未知文件 extra.img");
-    view["preparation"]["images"] = json!([full, readonly, unknown]);
+    let mut resident = image("resident", 33, true);
+    resident["writable"] = json!(false);
+    view["preparation"]["images"] = json!([full, readonly, unknown, resident]);
     let mut ui = Scripted::new(view, |_, _| unreachable!());
     wait(&mut ui.app, "id:library");
     press(&mut ui.app, "show-environment");
@@ -543,6 +545,9 @@ fn image_writes_report_space_permissions_and_unknown_files_without_offering_over
     wait(&mut ui.app, "id:image-full >> text:目标卷空间不足");
     wait(&mut ui.app, "id:image-ro >> text:目标目录不可写");
     wait(&mut ui.app, "id:image-unknown >> text:/extra.img/");
+    wait(&mut ui.app, "id:image-resident >> text:/只读位置/");
+    assert!(ui.app.screen().enabled("id:use-resident").unwrap());
+    assert!(ui.app.screen().enabled("id:verify-resident").unwrap());
     for id in ["full", "ro", "unknown"] {
         gone(&mut ui.app, &format!("id:download-{id}"));
         gone(&mut ui.app, &format!("id:repair-{id}"));
