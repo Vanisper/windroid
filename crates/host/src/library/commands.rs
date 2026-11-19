@@ -9,9 +9,10 @@ impl Library {
         let kind = data["kind"].as_str().ok_or_else(|| error("缺少操作名称"))?;
         match kind {
             "prepareRuntime" | "prepareImage" | "importImage" | "pausePreparation"
-            | "recheckRuntime" => {
+            | "verifyResource" | "repairResource" | "recheckRuntime" => {
                 return self.prepare(kind, data);
             }
+            "prepareCandidateImage" => return self.prepare_candidate_image(data),
             "applyStorage" => return self.apply_storage(data),
             "createInstance" => return self.create_instance(data),
             _ => {}
@@ -256,7 +257,7 @@ impl Library {
             if let Ack::Rejected { reason } = h.send(Command::Create { spec }) {
                 return Err(reason);
             }
-            self.add(name.into(), h, ev, None);
+            self.add(name.into(), h, ev, None, Default::default());
             id
         };
         self.select(&id);
@@ -400,9 +401,6 @@ impl Library {
     }
 
     fn open(&self, i: &Instance, snap: &Snapshot, app: Option<&AppEntry>) -> Result<(), Rejection> {
-        if let Some(record) = &i.record {
-            record.verify_device().map_err(error)?;
-        }
         let id = snap.id.to_string();
         let package = app.map(|a| a.package.to_string());
         let key = WindowKey {
@@ -410,19 +408,26 @@ impl Library {
             package: package.clone(),
         };
         let index = (id.clone(), package.clone());
-        let native_open = self.store.as_ref().map(|_| {
-            let paths = RuntimePaths::discover(&self.layout.root);
+        let native_open = if self.store.is_some() {
+            let resources = i
+                .active
+                .current()
+                .ok_or_else(|| error("模拟器运行会话已结束"))?;
+            if let Some(record) = &i.record {
+                record.verify_device(&resources.paths.adb).map_err(error)?;
+            }
             let title = app
                 .map(|a| a.label.as_deref().unwrap_or(a.package.as_str()))
                 .unwrap_or("设备视图");
-            WindowCommand::Open {
+            Some(WindowCommand::Open {
                 key: key.clone(),
                 title: format!("{title} · {}", i.name),
                 serial: snap.serial.clone(),
-                adb: paths.adb,
-                jar: paths.server_jar,
-            }
-        });
+                resources,
+            })
+        } else {
+            None
+        };
         let mut s = self.state.lock().unwrap();
         let state = i.handle.snapshot().state;
         if !state.accepts_stream() {

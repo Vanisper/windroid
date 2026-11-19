@@ -36,8 +36,7 @@ pub enum WindowCommand {
         key: WindowKey,
         title: String,
         serial: String,
-        adb: PathBuf,
-        jar: PathBuf,
+        resources: std::sync::Arc<runtime::SessionResources>,
     },
     Background {
         key: WindowKey,
@@ -436,6 +435,7 @@ fn begin_picker(panel: &NSOpenPanel, chosen: impl FnOnce(Option<PathBuf>) + 'sta
         }
     });
     panel.beginWithCompletionHandler(&reply);
+}
 
 /// 工作区拒绝与预放资源确认先于应用库及文件日志。提示只使用 AppKit。
 pub fn workspace_prompt(mtm: MainThreadMarker, title: &str, detail: &str, confirm: bool) -> bool {
@@ -451,5 +451,4 @@ pub fn workspace_prompt(mtm: MainThreadMarker, title: &str, detail: &str, confir
         alert.addButtonWithTitle(&NSString::from_str("取消"));
     }
     alert.runModal() == NSAlertFirstButtonReturn
-}
 }

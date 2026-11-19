@@ -3,7 +3,7 @@
 use super::*;
 use std::path::Path;
 
-fn demo_image() -> contract::Image {
+pub(super) fn demo_image() -> contract::Image {
     contract::Image {
         revision: 14,
         api: 34,
@@ -13,22 +13,13 @@ fn demo_image() -> contract::Image {
 }
 
 pub(super) fn image_available(preparation: &JsonValue, wanted: &contract::Image) -> bool {
-    // 开发者 SDK 可保留旧实例原有的其他镜像，启动时按记录校验实际路径。
-    if preparation["borrowed"] == true {
-        return true;
-    }
-    let abi = if wanted.abi == "arm64" {
-        "arm64-v8a"
-    } else {
-        &wanted.abi
-    };
     preparation["images"].as_array().is_some_and(|rows| {
         rows.iter().any(|row| {
             let image = &row["image"];
             row["ready"] == true
                 && image["revision"] == wanted.revision
                 && image["api"] == wanted.api
-                && image["abi"] == abi
+                && image["abi"] == wanted.abi
                 && image["tag"] == wanted.tag
         })
     })
@@ -65,11 +56,11 @@ impl Library {
             return p.lock().unwrap().preparation();
         }
         json!({
-            "phase":"ready", "componentsReady":true, "borrowed":false, "components":[],
+            "phase":"ready", "componentsReady":true, "components":[],
             "images":[{"id":"system-image","name":"Android 14 Google Play","version":"14",
-                "image":demo_image(),"ready":true,"borrowed":false,"location":"内存演示环境",
+                "image":demo_image(),"ready":true,"location":"内存演示环境","integrity":"verified","writable":false,"requiredBytes":0,"availableBytes":null,"issue":null,
                 "sizeBytes":0,"downloadedBytes":0,"source":"","license":"演示资源","licenseUrl":""}],
-            "currentComponent":null, "downloadedBytes":0, "totalBytes":0, "error":null
+            "currentComponent":null,"candidateTarget":null,"candidateDownloadedBytes":null, "downloadedBytes":0, "totalBytes":0, "error":null
         })
     }
 
@@ -92,8 +83,10 @@ impl Library {
                 .as_str()
                 .ok_or_else(|| error("请选择系统镜像版本"))
         };
-        if matches!(kind, "prepareRuntime" | "prepareImage" | "importImage")
-            && data["acceptedLicenses"] != true
+        if matches!(
+            kind,
+            "prepareRuntime" | "prepareImage" | "importImage" | "repairResource"
+        ) && data["acceptedLicenses"] != true
         {
             return Err(error("请先阅读并接受所选资源的许可"));
         }
@@ -106,6 +99,27 @@ impl Library {
                     .ok_or_else(|| error("请选择镜像 ZIP"))?;
                 p.import_image(image_id()?, path.into())
             }
+            "verifyResource" => p.verify(
+                data["resourceId"]
+                    .as_str()
+                    .ok_or_else(|| error("请选择要核验的版本"))?,
+            ),
+            "repairResource" => {
+                let id = data["resourceId"]
+                    .as_str()
+                    .ok_or_else(|| error("请选择要修复的版本"))?;
+                let snapshot = p.snapshot();
+                let row = snapshot
+                    .components
+                    .iter()
+                    .chain(&snapshot.images)
+                    .find(|r| r.id == id)
+                    .ok_or_else(|| error("版本已不在发布清单中"))?;
+                if data["confirmed"] != true || data["location"] != json!(row.location) {
+                    return Err(error("资源位置已变化或尚未确认，请重新确认此版本及路径"));
+                }
+                p.repair_at(id, &row.location)
+            }
             "pausePreparation" => p.pause(),
             _ => unreachable!("unknown resource action"),
         }
@@ -117,10 +131,21 @@ impl Library {
         let id = data["imageId"]
             .as_str()
             .ok_or_else(|| error("请选择创建实例使用的系统镜像"))?;
+        let requested: contract::Image = serde_json::from_value(data["image"].clone())
+            .map_err(|_| error("创建实例必须指定镜像 API、标签、ABI 和修订号 revision"))?;
+        let validate = |image: contract::Image| {
+            if image == requested {
+                Ok(image)
+            } else {
+                Err(error("所选镜像身份（含修订号）与发布清单不一致"))
+            }
+        };
         let Some(p) = &self.runtime else {
-            return (id == "system-image")
-                .then(demo_image)
-                .ok_or_else(|| error("演示环境中没有该镜像"));
+            return if id == "system-image" {
+                validate(demo_image())
+            } else {
+                Err(error("演示环境中没有该镜像"))
+            };
         };
         let row = p
             .lock()
@@ -134,6 +159,6 @@ impl Library {
         if !row.ready {
             return Err(error("请先完成所选镜像的下载或导入"));
         }
-        row.image.ok_or_else(|| error("镜像清单缺少实例规格"))
+        validate(row.image.ok_or_else(|| error("镜像清单缺少实例规格"))?)
     }
 }

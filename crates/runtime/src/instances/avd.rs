@@ -59,18 +59,19 @@ pub(crate) fn image_subdir(image: &Image) -> io::Result<PathBuf> {
         .join(format!("r{}", image.revision)))
 }
 
-/// 模拟器读取 AVD 时先查 image.sysdir.1。继承时保留 SDK 相对路径，独立目录用绝对路径。
-fn ini_image<'a>(image: &'a Path, sdk: &Path) -> io::Result<&'a str> {
+/// AVD 配置和 -sysdir 必须引用同一个绝对修订目录。
+fn ini_image(image: &Path) -> io::Result<&str> {
+    if !image.is_absolute() {
+        return Err(invalid("镜像目录需要绝对路径"));
+    }
     image
-        .strip_prefix(sdk)
-        .unwrap_or(image)
         .to_str()
         .filter(|path| !path.contains(['\n', '\r']))
         .ok_or_else(|| invalid("镜像目录不能表示为 Android AVD 配置路径"))
 }
 
-pub(super) fn sync_image(data: &Path, image: &Path, sdk: &Path) -> io::Result<()> {
-    let path = ini_image(image, sdk)?;
+pub(super) fn sync_image(data: &Path, image: &Path) -> io::Result<()> {
+    let path = ini_image(image)?;
     let key = "image.sysdir.1";
     let wanted = format!("{key}={path}/");
     let config = data.join("config.ini");
@@ -83,7 +84,7 @@ pub(super) fn sync_image(data: &Path, image: &Path, sdk: &Path) -> io::Result<()
     if found.next() == Some(wanted.as_str()) && found.next().is_none() {
         return Ok(());
     }
-    // 旧实例只更新镜像引用。保留硬件设置、私有数据与快照。
+    // 切换资源根时只更新镜像引用。保留硬件设置、私有数据与快照。
     let mut lines: Vec<_> = original.lines().filter(|line| !matches(line)).collect();
     lines.push(&wanted);
     let temp = data.join(format!(".config-{}", super::nonce()?));
@@ -146,7 +147,7 @@ pub(super) fn generate(
         height = height,
         density = density,
         ram = super::ram_mib(&spec.template),
-        image = ini_image(&image, &paths.sdk)?,
+        image = ini_image(&image)?,
         tag = spec.image.tag,
         play = spec.image.tag == "google_apis_playstore",
         size = spec.disk_bytes
@@ -159,7 +160,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_config_preserves_custom_hardware_and_private_disks_when_rebound() {
+    fn versioned_config_preserves_custom_hardware_and_private_disks_when_rebound() {
         let data =
             std::env::temp_dir().join(format!("windroid-avd-{}", super::super::nonce().unwrap()));
         fs::create_dir(&data).unwrap();
@@ -170,7 +171,7 @@ mod tests {
         fs::write(&config, prior).unwrap();
         let sdk = Path::new("/shared/sdk");
         let standalone = Path::new("/external/images/android-34/play/test-abi");
-        sync_image(&data, standalone, sdk).unwrap();
+        sync_image(&data, standalone).unwrap();
         let migrated = fs::read_to_string(&config).unwrap();
         assert_eq!(
             migrated
@@ -182,11 +183,11 @@ mod tests {
         for line in ["hw.cpu.ncore=6", "hw.ramSize=3072", "hw.gpu.mode=host"] {
             assert!(migrated.lines().any(|item| item == line));
         }
-        sync_image(&data, &sdk.join("system-images/restored"), sdk).unwrap();
+        sync_image(&data, &sdk.join("system-images/restored")).unwrap();
         assert!(
             fs::read_to_string(&config)
                 .unwrap()
-                .contains("image.sysdir.1=system-images/restored/\n")
+                .contains("image.sysdir.1=/shared/sdk/system-images/restored/\n")
         );
         assert_eq!(fs::read(&disk).unwrap(), b"private");
         fs::remove_dir_all(data).unwrap();

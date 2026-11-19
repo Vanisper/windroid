@@ -15,8 +15,10 @@ pub mod running;
 pub mod storage;
 pub mod workspace;
 
+use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use contract::{
@@ -78,11 +80,66 @@ fn clear_device(facts: &mut Facts) {
     facts.boot_completed = false;
 }
 
+/// 模拟器、短命令与窗口共享启动时解析出的绝对路径及版本读锁。
+#[derive(Debug)]
+pub struct SessionResources {
+    pub paths: RuntimePaths,
+    _leases: Vec<File>,
+}
+
+impl SessionResources {
+    pub fn device<'a>(&'a self, serial: &'a str) -> adb::Device<'a> {
+        adb::Device::new(&self.paths.adb, serial)
+    }
+}
+
+type ResourceResolver = fn(&Path, &contract::Image) -> io::Result<(RuntimePaths, Vec<File>)>;
+
+#[derive(Clone)]
+pub struct ActiveRuntime {
+    current: Arc<Mutex<Weak<SessionResources>>>,
+    resolve: ResourceResolver,
+}
+
+impl Default for ActiveRuntime {
+    fn default() -> Self {
+        Self::new(storage::instance_lease)
+    }
+}
+
+impl ActiveRuntime {
+    /// 集成测试可注入隔离工具。产品入口使用绑定工作区设置和官方清单的默认解析器。
+    pub fn new(resolve: ResourceResolver) -> Self {
+        Self {
+            current: Default::default(),
+            resolve,
+        }
+    }
+
+    pub fn acquire(
+        &self,
+        home: &std::path::Path,
+        image: &contract::Image,
+    ) -> io::Result<Arc<SessionResources>> {
+        let (paths, leases) = (self.resolve)(home, image)?;
+        let resources = Arc::new(SessionResources {
+            paths,
+            _leases: leases,
+        });
+        *self.current.lock().unwrap() = Arc::downgrade(&resources);
+        Ok(resources)
+    }
+
+    pub fn current(&self) -> Option<Arc<SessionResources>> {
+        self.current.lock().unwrap().upgrade()
+    }
+}
+
 pub struct EmulatorBackend {
     id: InstanceId,
     port: u16,
     store: InstanceStore,
-    paths: RuntimePaths,
+    active: ActiveRuntime,
     record: Option<InstanceRecord>,
     process: Option<OwnedEmulator>,
     next_probe: Option<Instant>,
@@ -96,7 +153,10 @@ pub struct EmulatorBackend {
 
 impl EmulatorBackend {
     pub fn new(id: InstanceId, layout: Layout, port: u16) -> Self {
-        let paths = RuntimePaths::discover(&layout.root);
+        Self::with_runtime(id, layout, port, ActiveRuntime::default())
+    }
+
+    pub fn with_runtime(id: InstanceId, layout: Layout, port: u16, active: ActiveRuntime) -> Self {
         let labels = labels::Labels::new(&layout.root, &id);
         let store = InstanceStore::new(layout);
         let record = store.get(&id).ok().filter(|r| r.port == port);
@@ -104,7 +164,7 @@ impl EmulatorBackend {
             id,
             port,
             store,
-            paths,
+            active,
             record,
             process: None,
             next_probe: None,
@@ -115,6 +175,10 @@ impl EmulatorBackend {
             apps_dirty: true,
             apps_retry_at: None,
         }
+    }
+
+    pub fn active_runtime(&self) -> ActiveRuntime {
+        self.active.clone()
     }
 
     pub fn serial(&self) -> String {
@@ -137,10 +201,12 @@ impl EmulatorBackend {
 
     fn refresh_catalog(&mut self) -> Result<(), String> {
         let serial = self.serial();
+        let resources = self.active.current().ok_or("模拟器已退出")?;
+        let device = adb::Device::new(&resources.paths.adb, &serial);
         // 完成同批读取后才发布。部分查询失败时保留上一次成功的目录和桌面状态。
         let result = (|| -> Result<_, String> {
-            let mut apps = catalog::snapshot(&serial)?;
-            let home = catalog::home_state(&serial)?;
+            let mut apps = catalog::snapshot(device)?;
+            let home = catalog::home_state(device)?;
             // 标签查询有整批时限，先处理桌面候选，再处理应用库中的其余包。
             let packages: Vec<_> = home
                 .candidates
@@ -152,7 +218,9 @@ impl EmulatorBackend {
                         .map(|app| app.package.to_string()),
                 )
                 .collect();
-            let mut labels = self.labels.resolve(&serial, &packages);
+            let mut labels = self
+                .labels
+                .resolve(device, &resources.paths.aapt, &packages);
             for app in &mut apps {
                 app.label = labels.get(app.package.as_str()).cloned();
             }
@@ -201,12 +269,7 @@ impl EmulatorBackend {
         if self.live()? {
             return Ok(());
         }
-        let resources = storage::resource_lease(self.store.home(), true, true)?;
-        self.paths = RuntimePaths::discover(self.store.home());
-        self.paths.claim_locations(self.store.home(), true, true)?;
-        self.labels = labels::Labels::new(self.store.home(), &self.id);
-        let process =
-            OwnedEmulator::start(&self.store, &self.id, self.port, &self.paths, resources)?;
+        let process = OwnedEmulator::start(&self.store, &self.id, self.port, &self.active)?;
         self.record = Some(process.record.clone());
         self.process = Some(process);
         self.reset_catalog();
@@ -238,9 +301,12 @@ impl EmulatorBackend {
         if !self.live().map_err(io_rejection)? {
             return Err(adb_rejection("该实例的模拟器进程已退出"));
         }
-        let record = &self.process.as_ref().unwrap().record;
-        record.verify_device().map_err(adb_rejection)?;
-        Ok(record.serial())
+        let process = self.process.as_ref().unwrap();
+        process
+            .record
+            .verify_device(&process.resources.paths.adb)
+            .map_err(adb_rejection)?;
+        Ok(process.record.serial())
     }
 
     fn device_command(&mut self, cmd: &Cmd) -> Result<(), Rejection> {
@@ -251,10 +317,12 @@ impl EmulatorBackend {
                 self.catalog_failed(detail);
             }
         })?;
+        let resources = self.process.as_ref().unwrap().resources.clone();
+        let device = adb::Device::new(&resources.paths.adb, &serial);
         match cmd {
             Cmd::RefreshApps => self.refresh_catalog().map_err(adb_rejection)?,
             Cmd::Install { apk_path } => {
-                match install::install(&serial, apk_path, &self.paths.aapt)
+                match install::install(device, apk_path, &resources.paths.aapt)
                     .map_err(adb_rejection)?
                 {
                     install::Outcome::Installed => self.apps_dirty = true,
@@ -268,7 +336,7 @@ impl EmulatorBackend {
                 }
             }
             Cmd::Uninstall { package, keep_data } => {
-                if !install::uninstall(&serial, package.as_str(), *keep_data)
+                if !install::uninstall(device, package.as_str(), *keep_data)
                     .map_err(adb_rejection)?
                 {
                     return Err(adb_rejection(format!("未能确认卸载 {package}")));
@@ -276,19 +344,19 @@ impl EmulatorBackend {
                 self.apps_dirty = true;
             }
             Cmd::SetDefaultHome { package } => {
-                if !catalog::set_default_home(&serial, package.as_str()).map_err(adb_rejection)? {
+                if !catalog::set_default_home(device, package.as_str()).map_err(adb_rejection)? {
                     return Err(adb_rejection(format!("未能将 {package} 设置为默认桌面")));
                 }
                 self.desktop.default = Some(package.clone());
                 self.apps_dirty = true;
             }
             Cmd::ForceStop { package } => {
-                running::force_stop(&serial, package.as_str()).map_err(adb_rejection)?
+                running::force_stop(device, package.as_str()).map_err(adb_rejection)?
             }
             Cmd::ClearData { package } => {
                 catalog::require_package(package.as_str()).map_err(adb_rejection)?;
                 let output =
-                    catalog::checked_shell(&serial, &format!("pm clear --user 0 {package}"))
+                    catalog::checked_shell(device, &format!("pm clear --user 0 {package}"))
                         .map_err(adb_rejection)?;
                 if output.stdout.trim() != "Success" {
                     return Err(adb_rejection(format!("未能确认已清除 {package} 的数据")));
@@ -296,7 +364,7 @@ impl EmulatorBackend {
                 self.apps_dirty = true;
             }
             Cmd::Launch { package } => {
-                if !catalog::launch(&serial, package.as_str()).map_err(adb_rejection)? {
+                if !catalog::launch(device, package.as_str()).map_err(adb_rejection)? {
                     return Err(Rejection::Error {
                         code: ErrorCode::PackageNotFound,
                         detail: format!("找不到可启动的 {package}"),
@@ -381,7 +449,10 @@ impl Backend for EmulatorBackend {
         let previously_ready = facts.services.ready();
         clear_device(facts);
         let serial = self.serial();
-        if let Ok(output) = adb::shell(&serial, HEALTH) {
+        if let Ok(output) = adb::shell(
+            adb::Device::new(&self.process.as_ref().unwrap().resources.paths.adb, &serial),
+            HEALTH,
+        ) {
             let mut lines = output.stdout.lines().map(str::trim);
             if output.code == Some(0) && lines.next() == self.record.as_ref().map(|r| r.avd_name())
             {

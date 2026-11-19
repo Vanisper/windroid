@@ -30,10 +30,15 @@ const INDEX: &str =
 
 struct Fixture {
     root: PathBuf,
+    adb: PathBuf,
     expected: Vec<Vec<String>>,
 }
 
 impl Fixture {
+    fn device(&self) -> adb::Device<'_> {
+        adb::Device::new(&self.adb, SERIAL)
+    }
+
     /// 工具根据调用顺序重放保存的两路输出；每个 argv 独立记录，可检测空格、选项及重复命令。
     fn returns(&mut self, args: &[&str], stdout: &str, stderr: &str, exit: u8) {
         let index = self.expected.len();
@@ -94,7 +99,7 @@ impl Fixture {
         );
     }
     fn install(&self) -> Outcome {
-        install::install(SERIAL, &self.apk(), &self.root.join("aapt")).unwrap()
+        install::install(self.device(), &self.apk(), &self.root.join("aapt")).unwrap()
     }
     fn verify(&self) {
         let count: usize = fs::read_to_string(self.root.join("next"))
@@ -113,6 +118,7 @@ impl Fixture {
 fn with_fixture(name: &str, run: impl FnOnce(&mut Fixture)) {
     if let Some(root) = env::var_os(FIXTURE) {
         let mut fixture = Fixture {
+            adb: PathBuf::from(&root).join("adb"),
             root: root.into(),
             expected: Vec::new(),
         };
@@ -144,8 +150,6 @@ exit "$code"
     let out = Command::new(env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env(FIXTURE, &dir)
-        .env_remove("WINDROID_SDK")
-        .env("WINDROID_ADB", dir.join("adb"))
         .output()
         .unwrap();
     fs::remove_dir_all(dir).unwrap();
@@ -160,7 +164,7 @@ exit "$code"
 // 标签测试允许两个设备的拉取同时进行，各自记录实际落盘路径。
 fn with_label_devices(name: &str, run: impl FnOnce(&Fixture)) {
     with_fixture(name, |d| {
-        let aapt = d.root.join("runtime/sdk/build-tools/34.0.0/aapt");
+        let aapt = d.root.join("aapt");
         fs::create_dir_all(aapt.parent().unwrap()).unwrap();
         fs::write(
             &aapt,
@@ -219,7 +223,11 @@ fn labels_recheck_version_path_and_instance_before_using_cache() {
             let packages = [PKG.to_owned()];
             let id = InstanceId::new("instance-a");
             let mut labels = Labels::new(&d.root, &id);
-            let read = |labels: &mut Labels| labels.resolve(SERIAL, &packages).remove(PKG);
+            let read = |labels: &mut Labels| {
+                labels
+                    .resolve(d.device(), &d.root.join("aapt"), &packages)
+                    .remove(PKG)
+            };
             let path = "/data/app/~~pin==/old==/base.apk";
             let next = "/data/app/~~pin==/new==/base.apk";
             label_package(d, SERIAL, path, 1, "首版:应用");
@@ -258,7 +266,11 @@ fn labels_isolate_simultaneous_pulls_and_discard_racing_updates() {
             use runtime::labels::Labels;
             let resolve = |serial: &str| {
                 Labels::new(&d.root, &InstanceId::new(serial))
-                    .resolve(serial, &[PKG.to_owned()])
+                    .resolve(
+                        adb::Device::new(&d.adb, serial),
+                        &d.root.join("aapt"),
+                        &[PKG.to_owned()],
+                    )
                     .remove(PKG)
             };
             let path = "/data/app/~~p==/base.apk";
@@ -402,13 +414,13 @@ fn uninstall_requires_a_valid_package_index() {
     with_fixture("uninstall_requires_a_valid_package_index", |d| {
         d.shell("pm uninstall -k dev.fixture.app", "Success");
         d.shell(PACKAGES, INDEX);
-        assert!(install::uninstall(SERIAL, PKG, true).is_err());
+        assert!(install::uninstall(d.device(), PKG, true).is_err());
         d.returns(&["adb", "-s", SERIAL, "uninstall", PKG], "Success", "", 0);
         d.shell(PACKAGES, &INDEX.replace(PKG, "dev.fixture.app2"));
-        assert_eq!(install::uninstall(SERIAL, PKG, false), Ok(true));
+        assert_eq!(install::uninstall(d.device(), PKG, false), Ok(true));
         d.returns(&["adb", "-s", SERIAL, "uninstall", PKG], "Success", "", 0);
         d.shell(PACKAGES, "package:android versionCode:34\nBAD PACKAGE LINE");
-        assert!(install::uninstall(SERIAL, PKG, false).is_err());
+        assert!(install::uninstall(d.device(), PKG, false).is_err());
         for (index, present) in [
             (INDEX.to_string(), true),
             (INDEX.replace(PKG, "dev.fixture.app2"), false),
@@ -420,7 +432,7 @@ fn uninstall_requires_a_valid_package_index() {
                 1,
             );
             d.shell(PACKAGES, &index);
-            let result = install::uninstall(SERIAL, PKG, false);
+            let result = install::uninstall(d.device(), PKG, false);
             if present {
                 assert!(result.is_err())
             } else {
@@ -436,9 +448,9 @@ fn home_is_confirmed_by_resolving_the_same_user() {
         let query = "cmd package query-activities --brief --user 0 -a android.intent.action.MAIN -c android.intent.category.HOME";
         let resolve = "cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c android.intent.category.HOME";
         let component = "dev.fixture.app/.Home$Entry";
-        assert!(catalog::set_default_home(SERIAL, "broken;package").is_err());
+        assert!(catalog::set_default_home(d.device(), "broken;package").is_err());
         d.shell(query, "1 activities found:\ndev.fixture.app2/.Home");
-        assert_eq!(catalog::set_default_home(SERIAL, PKG), Ok(false));
+        assert_eq!(catalog::set_default_home(d.device(), PKG), Ok(false));
         for actual in ["dev.fixture.app2/.Shell", component] {
             d.shell(
                 query,
@@ -449,7 +461,7 @@ fn home_is_confirmed_by_resolving_the_same_user() {
                 "Success",
             );
             d.shell(resolve, &format!("priority=0 preferredOrder=0\n{actual}"));
-            let r = catalog::set_default_home(SERIAL, PKG);
+            let r = catalog::set_default_home(d.device(), PKG);
             if actual == component {
                 assert_eq!(r, Ok(true))
             } else {
@@ -465,7 +477,7 @@ fn activities_distinguish_background_displays_cached_and_exiting_apps() {
         "activities_distinguish_background_displays_cached_and_exiting_apps",
         |d| {
             d.shell(ACTIVITIES, &format!("{EMPTY}  * Task{{aa #18 A=10001:dev.fixture.app U=0}}\n    * Hist  #0: ActivityRecord{{a u0 dev.fixture.app/.Main t18}}\n  mLastPausedActivity: ActivityRecord{{b u0 dev.cached/.Gone t9}}\n  * Task{{b #44 A=10001:dev.taskonly U=0}}\nDisplay #3 (activities from top to bottom):\n  topResumedActivity=ActivityRecord{{c u0 dev.fixture.app/.Notes t31}}\n    * Hist  #1: ActivityRecord{{c u0 dev.fixture.app/.Notes t31}}\n    * Hist  #0: ActivityRecord{{d u0 dev.fixture.app/.Main t31}}\n    * Hist  #2: ActivityRecord{{e u10 dev.other.user/.Main t4}}\n    * Hist  #3: ActivityRecord{{f u0 dev.exiting/.Main t5 f}}}}\n"));
-            let tasks = running::snapshot(SERIAL).unwrap();
+            let tasks = running::snapshot(d.device()).unwrap();
             assert_eq!(tasks.len(), 2);
             assert_eq!(
                 tasks
@@ -476,11 +488,11 @@ fn activities_distinguish_background_displays_cached_and_exiting_apps() {
             );
             d.returns(&["adb", "-s", SERIAL, "shell", ACTIVITIES], EMPTY, "", 0);
             assert!(
-                running::snapshot(SERIAL).is_err(),
+                running::snapshot(d.device()).is_err(),
                 "截断的输出无法证明任务已结束"
             );
             d.shell(ACTIVITIES, "Can't find service: activity");
-            assert!(running::snapshot(SERIAL).is_err());
+            assert!(running::snapshot(d.device()).is_err());
         },
     );
 }
@@ -491,7 +503,7 @@ fn launch_rechecks_the_resumed_package_on_display_zero() {
         let resolve = "cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p dev.fixture.app";
         let start = "am start -W --user 0 --display 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n 'dev.fixture.app/.Main'";
         d.shell(resolve, "No activity found");
-        assert_eq!(catalog::launch(SERIAL, PKG), Ok(false));
+        assert_eq!(catalog::launch(d.device(), PKG), Ok(false));
         for (display, resumed) in [(3, true), (0, false), (0, true)] {
             d.shell(
                 resolve,
@@ -511,7 +523,7 @@ fn launch_rechecks_the_resumed_package_on_display_zero() {
             }
             d.shell(ACTIVITIES, &state);
             assert_eq!(
-                catalog::launch(SERIAL, PKG).is_ok(),
+                catalog::launch(d.device(), PKG).is_ok(),
                 display == 0 && resumed
             );
         }
@@ -536,14 +548,14 @@ fn force_stop_verifies_package_active_tasks_and_recent_cards() {
                 d.shell("am stack remove 13", "");
                 d.shell(ACTIVITIES, EMPTY);
                 d.shell(RECENTS, if first { NO_RECENTS } else { OWN_RECENTS });
-                assert_eq!(running::force_stop(SERIAL, PKG).is_ok(), first);
+                assert_eq!(running::force_stop(d.device(), PKG).is_ok(), first);
             }
             d.shell("am force-stop --user 0 dev.fixture.app", "");
             d.shell(
                 "dumpsys package dev.fixture.app",
                 &state.replace("stopped=true", "stopped=false"),
             );
-            assert!(running::force_stop(SERIAL, PKG).is_err());
+            assert!(running::force_stop(d.device(), PKG).is_err());
         },
     );
 }
@@ -558,20 +570,20 @@ fn auto_exit_cleanup_spares_resumed_and_shared_tasks() {
             ACTIVITIES,
             &format!("{EMPTY}  * Hist  #0: ActivityRecord{{a u0 dev.other/.Foreign t13}}"),
         );
-        assert!(running::clear_inactive_recents(SERIAL, PKG).is_err());
+        assert!(running::clear_inactive_recents(d.device(), PKG).is_err());
         d.shell(
             ACTIVITIES,
             &format!("{EMPTY}  * Hist  #0: ActivityRecord{{a u0 dev.fixture.app/.Main t20}}"),
         );
-        assert!(running::clear_inactive_recents(SERIAL, PKG).is_err());
+        assert!(running::clear_inactive_recents(d.device(), PKG).is_err());
         d.shell(ACTIVITIES, EMPTY);
         d.shell(
             RECENTS,
             &OWN_RECENTS.replace("taskId=13 rootTaskId=13", "taskId=8 rootTaskId=13"),
         );
-        assert!(running::clear_inactive_recents(SERIAL, PKG).is_err());
+        assert!(running::clear_inactive_recents(d.device(), PKG).is_err());
         d.shell(ACTIVITIES, EMPTY);
         d.shell(RECENTS, "unrecognised response");
-        assert!(running::clear_inactive_recents(SERIAL, PKG).is_err());
+        assert!(running::clear_inactive_recents(d.device(), PKG).is_err());
     });
 }

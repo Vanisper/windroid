@@ -85,9 +85,12 @@ impl InstanceRecord {
 
     /// Android Studio 使用的只读 AVD 身份属性。serial 只是会被重用的传输地址。
     /// https://android.googlesource.com/platform/tools/base/+/HEAD/adblib/src/com/android/adblib/DevicePropertyNames.kt
-    pub fn verify_device(&self) -> io::Result<()> {
+    pub fn verify_device(&self, program: &Path) -> io::Result<()> {
         let serial = self.serial();
-        let output = adb::shell(&serial, "getprop ro.boot.qemu.avd_name")?;
+        let output = adb::shell(
+            adb::Device::new(program, &serial),
+            "getprop ro.boot.qemu.avd_name",
+        )?;
         if output.code != Some(0) {
             let detail = output.stderr.lines().next().unwrap_or("adb 未返回诊断");
             return Err(io::Error::new(
@@ -135,15 +138,14 @@ impl InstanceStore {
         Ok((root, lock))
     }
 
-    /// 老版本启动的模拟器或宿主异常退出后留下的进程仍可能占用资源。
-    pub(crate) fn ensure_stopped(&self) -> io::Result<()> {
-        let (root, _lock) = self.locked()?;
-        for record in records_in(&root)? {
-            let dir = root.join(record.id.as_str());
-            let _lease = acquire_run_lock(&dir)?;
-            process::ensure_previous_exit(&dir)?;
+    pub(crate) fn list_readonly(&self) -> io::Result<Vec<InstanceRecord>> {
+        let root = self.layout.root.join("instances");
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => records_in(&root),
+            Ok(_) => Err(invalid("实例注册目录类型异常")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     pub fn list(&self) -> io::Result<Vec<InstanceRecord>> {
@@ -181,6 +183,7 @@ impl InstanceStore {
         let avd_name = format!("wd-{}", nonce()?);
         let id = at.map_or_else(|| InstanceId::new(&avd_name), |(id, _)| id.clone());
         valid_id(&id)?;
+        let _resources = crate::storage::resource_lease(self.home(), true, true)?;
         let (root, _lock) = self.locked()?;
         let final_dir = root.join(id.as_str());
         if final_dir.try_exists()? {
@@ -316,9 +319,6 @@ fn lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
-    let mut records = Vec::new();
-    let mut used = BTreeSet::new();
 pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -345,6 +345,9 @@ pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
     records_in(root).map(|_| ())
 }
 
+fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
+    let mut records = Vec::new();
+    let mut used = BTreeSet::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() || entry.file_name().as_encoded_bytes().starts_with(b".") {

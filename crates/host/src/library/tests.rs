@@ -17,7 +17,7 @@ fn library() -> (Arc<Library>, mpsc::Receiver<WindowCommand>) {
 }
 use std::path::PathBuf;
 fn create(lib: &Arc<Library>, name: &str) -> String {
-    lib.perform(&json!({"kind":"createInstance","imageId":"system-image","name":name,"template":"compact-720"}))
+    lib.perform(&json!({"kind":"createInstance","imageId":"system-image","image":lib.preparation()["images"][0]["image"],"name":name,"template":"compact-720"}))
         .unwrap();
     lib.snapshot()["selectedId"].as_str().unwrap().into()
 }
@@ -38,6 +38,14 @@ fn creation_requires_an_explicit_available_image() {
                 .is_err()
         );
     }
+    let mut image = lib.preparation()["images"][0]["image"].clone();
+    image.as_object_mut().unwrap().remove("revision");
+    let request = |image: &JsonValue| json!({"kind":"createInstance","name":"手机","imageId":"system-image","image":image});
+    assert!(
+        matches!(lib.perform(&request(&image)),Err(Rejection::Error{detail,..}) if detail.contains("revision"))
+    );
+    image["revision"] = json!(15);
+    assert!(lib.perform(&request(&image)).is_err());
     assert_eq!(lib.snapshot()["instances"], json!([]));
     create(&lib, "A");
     create(&lib, "B");
@@ -80,7 +88,13 @@ fn picker_keeps_its_instance_when_selection_changes() {
         },
         Default::default(),
     );
-    lib.add("平板".into(), handle.clone(), events, None);
+    lib.add(
+        "平板".into(),
+        handle.clone(),
+        events,
+        None,
+        Default::default(),
+    );
     assert!(matches!(
         handle.send(Command::Create { spec: fake_spec() }),
         Ack::Accepted { .. }
@@ -215,82 +229,19 @@ fn running_list_waits_for_launcher_classification_and_keeps_cached_rows_on_error
 }
 
 #[test]
-fn old_group_files_do_not_change_sources_or_block_reopening() {
-    use std::fs;
+fn old_group_files_block_initialization_and_are_preserved() {
     let layout = temporary_workspace();
     let path = layout.root.join("groups.json");
-    let store = InstanceStore::new(layout.clone());
-    let record = store.create("已有实例", stored_spec()).unwrap();
-    let id = record.id.as_str();
-    let old = serde_json::to_vec_pretty(&json!({(id): {
-        "names": {"group-1": "书架"},
-        "membership": {"com.example.reader": "group-1", "com.example.launcher": "group-1"},
-        "serial": 1
-    }}))
-    .unwrap();
-    for previous in [None, Some(old.as_slice()), Some(b"{damaged".as_slice())] {
-        if let Some(bytes) = previous {
-            fs::write(&path, bytes).unwrap();
-        }
-        let (tx, windows) = mpsc::channel();
-        let (_events, rx) = mpsc::channel();
-        let lib = Library::attach(HostChannel::new(), layout.clone(), false, tx, rx).unwrap();
-        assert_eq!(lib.snapshot()["selectedId"], id);
-
-        // 保留真实工作区的挂载和命令路由，用已知 LAUNCHER 清单代替启动模拟器。
-        let (handle, events) = device::spawn(
-            record.id.clone(),
-            record.serial(),
-            device::FakeBackend::new(),
-            Default::default(),
-        );
-        assert!(matches!(
-            handle.send(Command::Create { spec: fake_spec() }),
-            Ack::Accepted { .. }
-        ));
-        assert!(matches!(handle.send(Command::Start), Ack::Accepted { .. }));
-        until(|| handle.snapshot().state == State::Ready);
-        lib.add(record.name.clone(), handle, events, None);
-        let snap = lib.snapshot();
-        let sections = snap["groups"].as_array().unwrap();
-        assert_eq!(sections.len(), 2);
-        for (group, package) in [
-            ("installed", "com.example.reader"),
-            ("system", "com.example.launcher"),
-        ] {
-            let section = sections
-                .iter()
-                .find(|section| section["id"] == group)
-                .unwrap();
-            assert_eq!(section["count"], 1);
-            assert_eq!(section["apps"][0]["package"], package);
-            lib.perform(&json!({"kind": "launch", "instanceId": id, "package": package}))
-                .unwrap();
-            let command = windows.recv_timeout(Duration::from_secs(1)).unwrap();
-            let WindowCommand::Open { key, serial, .. } = command else {
-                panic!("应收到打开应用窗口的命令：{command:?}")
-            };
-            assert_eq!(key.instance_id, id);
-            assert_eq!(key.package.as_deref(), Some(package));
-            assert_eq!(serial, record.serial());
-            lib.window_event(WindowEvent::Opened { key: key.clone() });
-            lib.window_event(WindowEvent::FirstFrame { key });
-        }
-        assert_eq!(lib.snapshot()["facts"]["sessionCount"], 2);
-        for kind in ["createGroup", "moveApp", "deleteGroup"] {
-            let request = json!({"kind": kind, "instanceId": id, "groupId": "group-1",
-                "name": "新分组", "package": "com.example.reader"});
-            assert!(
-                matches!(lib.perform(&request), Err(Rejection::Error { detail, .. }) if detail.contains("无法识别的操作"))
-            );
-        }
-        lib.shutdown();
-        match previous {
-            Some(bytes) => assert_eq!(fs::read(&path).unwrap(), bytes),
-            None => assert!(!path.try_exists().unwrap()),
-        }
+    for bytes in [b"{}".as_slice(), b"{damaged"] {
+        std::fs::write(&path, bytes).unwrap();
+        let (tx, _) = mpsc::channel();
+        let (_, rx) = mpsc::channel();
+        assert!(Library::attach(HostChannel::new(), layout.clone(), false, tx, rx).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!layout.root.join("preferences").exists());
+        assert!(!layout.root.join("instances").exists());
     }
-    fs::remove_dir_all(layout.root).unwrap();
+    std::fs::remove_dir_all(layout.root).unwrap();
 }
 
 fn ready(lib: &Arc<Library>, id: &str) -> Instance {
@@ -472,7 +423,7 @@ fn refusing_a_stop_preserves_live_windows_and_running_tasks() {
         RejectStop(device::FakeBackend::new()),
         Default::default(),
     );
-    lib.add(id.into(), handle, events, None);
+    lib.add(id.into(), handle, events, None, Default::default());
     let spec = fake_spec();
     let i = lib.state.lock().unwrap().instances[id].clone();
     assert!(matches!(
@@ -500,19 +451,20 @@ fn refusing_a_stop_preserves_live_windows_and_running_tasks() {
 fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
     let id = "window-protocol";
     let (tx, commands) = mpsc::channel();
-    let layout = Layout {
-        root: PathBuf::default(),
-    };
+    let layout = temporary_workspace();
+    let active =
+        runtime::ActiveRuntime::new(|home, _| Ok((RuntimePaths::discover(home), Vec::new())));
+    let image = resources::demo_image();
+    let lease = active.acquire(&layout.root, &image).unwrap();
     let mut lib = Library::new(HostChannel::new(), layout.clone(), true, tx, false);
-    // 只切换原生窗口消息路径。设备使用内存后端，测试端逐条送回窗口事件。
-    Arc::get_mut(&mut lib).unwrap().store = Some(InstanceStore::new(layout));
+    Arc::get_mut(&mut lib).unwrap().store = Some(InstanceStore::new(layout.clone()));
     let (handle, events) = device::spawn(
         InstanceId::new(id),
         id.into(),
         device::FakeBackend::new(),
         Default::default(),
     );
-    lib.add(id.into(), handle.clone(), events, None);
+    lib.add(id.into(), handle.clone(), events, None, active);
     assert!(matches!(
         handle.send(Command::Create { spec: fake_spec() }),
         Ack::Accepted { .. }
@@ -589,6 +541,9 @@ fn fast_reopen_survives_previous_close_and_the_next_stop_batch() {
         .unwrap();
     assert!(matches!(recv(), WindowCommand::QuitFailed { .. }));
     assert_eq!(handle.snapshot().facts.session_count, 1);
+    drop(lease);
+    lib.shutdown();
+    std::fs::remove_dir_all(layout.root).unwrap();
 }
 
 fn temporary_workspace() -> Layout {
@@ -620,6 +575,7 @@ fn stored_spec() -> contract::Spec {
 fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
     let layout = temporary_workspace();
     let root = layout.root.clone();
+    runtime::workspace::open(&root).unwrap();
     let store = InstanceStore::new(layout.clone());
     let spec = stored_spec();
     let a = store.create("副屏", spec.clone()).unwrap();
@@ -649,9 +605,11 @@ fn reopened_workspace_reports_each_instances_saved_config_and_storage_paths() {
     assert_eq!(config(&b.id)["diskBytes"], 8_u64 << 30);
     assert_eq!(config(&a.id)["image"]["api"], 34);
     assert_eq!(snap["storage"]["home"], json!(root));
-    let sdk = RuntimePaths::discover(&root).sdk;
-    assert_eq!(snap["storage"]["sdk"], json!(sdk));
-    assert_eq!(snap["storage"]["images"], json!(sdk.join("system-images")));
+    assert_eq!(snap["storage"]["runtimeRoot"], json!(root.join("runtime")));
+    assert_eq!(
+        snap["storage"]["imageRoot"],
+        json!(root.join("system-images"))
+    );
     lib.shutdown();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -687,7 +645,7 @@ fn missing_runtime_blocks_create_and_start_but_keeps_selection_available() {
         handle.send(Command::Create { spec: fake_spec() }),
         Ack::Accepted { .. }
     ));
-    lib.add(id.into(), handle, events, None);
+    lib.add(id.into(), handle, events, None, Default::default());
     lib.perform(&json!({"kind":"selectInstance","instanceId":id}))
         .unwrap();
     let snap = lib.snapshot();

@@ -90,16 +90,19 @@ impl Library {
                 let observed = i.handle.snapshot();
                 if let Some(record) = &i.record
                     && observed.state.accepts_stream()
+                    && let Some(resources) = i.active.current()
                 {
+                    let serial = record.serial();
+                    let device = resources.device(&serial);
                     let result = record
-                        .verify_device()
+                        .verify_device(&resources.paths.adb)
                         .map_err(|e| e.to_string())
-                        .and_then(|_| runtime::running::snapshot(&record.serial()));
+                        .and_then(|_| runtime::running::snapshot(device));
                     for package in lib.observe_tasks(&id, observed.seq, result) {
                         if i.handle.snapshot().seq == observed.seq
-                            && record.verify_device().is_ok()
+                            && record.verify_device(&resources.paths.adb).is_ok()
                             && let Err(reason) =
-                                runtime::running::clear_inactive_recents(&record.serial(), &package)
+                                runtime::running::clear_inactive_recents(device, &package)
                         {
                             lib.note(Some(&id), true, reason);
                         }

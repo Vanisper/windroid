@@ -152,13 +152,11 @@ impl Manager {
                 key,
                 title,
                 serial,
-                adb,
-                jar,
+                resources,
             } => {
                 let source = Source {
-                    adb,
+                    resources,
                     serial,
-                    jar,
                     package: key.package.clone(),
                 };
                 self.open(mtm, Request { key, title, source });

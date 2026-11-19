@@ -15,8 +15,8 @@ pub struct AppTask {
 
 /// 最近记录可以在 Activity 结束后保留，进程也可能仍在缓存中。
 /// 列表仅包含活动栈里有 ActivityRecord 的包，包括在后台等待恢复的活动。
-pub fn snapshot(serial: &str) -> Result<Vec<AppTask>, String> {
-    let out = checked_shell(serial, "dumpsys activity activities")?;
+pub fn snapshot(device: adb::Device<'_>) -> Result<Vec<AppTask>, String> {
+    let out = checked_shell(device, "dumpsys activity activities")?;
     parse_activities(&out.stdout)
 }
 
@@ -238,31 +238,31 @@ fn parse_recents(dump: &str, package: &str) -> Result<BTreeSet<u32>, String> {
     Ok(ids)
 }
 
-fn recent_ids(serial: &str, package: &str) -> Result<BTreeSet<u32>, String> {
+fn recent_ids(device: adb::Device<'_>, package: &str) -> Result<BTreeSet<u32>, String> {
     parse_recents(
-        &checked_shell(serial, &format!("dumpsys activity -p {package} recents"))?.stdout,
+        &checked_shell(device, &format!("dumpsys activity -p {package} recents"))?.stdout,
         package,
     )
 }
 
-fn ensure_inactive(serial: &str, package: &str) -> Result<(), String> {
-    if snapshot(serial)?.iter().any(|task| task.package == package) {
+fn ensure_inactive(device: adb::Device<'_>, package: &str) -> Result<(), String> {
+    if snapshot(device)?.iter().any(|task| task.package == package) {
         return Err(format!("{package} 仍有活动任务"));
     }
     Ok(())
 }
 
 /// 清理自退应用的任务卡片。重新核对任务归属及活动栈，应用恢复时中止清理。
-pub fn clear_inactive_recents(serial: &str, package: &str) -> Result<(), String> {
+pub fn clear_inactive_recents(device: adb::Device<'_>, package: &str) -> Result<(), String> {
     require_package(package)?;
-    ensure_inactive(serial, package)?;
-    let ids = recent_ids(serial, package)?;
+    ensure_inactive(device, package)?;
+    let ids = recent_ids(device, package)?;
     if ids.is_empty() {
         return Ok(());
     }
     for id in ids {
-        if recent_ids(serial, package)?.contains(&id) {
-            let active = snapshot(serial)?;
+        if recent_ids(device, package)?.contains(&id) {
+            let active = snapshot(device)?;
             if active
                 .iter()
                 .any(|task| task.package == package || task.task_id == id)
@@ -272,25 +272,25 @@ pub fn clear_inactive_recents(serial: &str, package: &str) -> Result<(), String>
             // API 34 的 runRootTaskRemove 使用 IActivityTaskManager.removeTask(taskId)，
             // 既覆盖已脱离显示的最近任务，也随设备的 AIDL 版本选择正确调用。
             // https://android.googlesource.com/platform/frameworks/base/+/android-14.0.0_r75/services/core/java/com/android/server/am/ActivityManagerShellCommand.java
-            checked_shell(serial, &format!("am stack remove {id}"))?;
+            checked_shell(device, &format!("am stack remove {id}"))?;
         }
     }
-    ensure_inactive(serial, package)?;
-    if !recent_ids(serial, package)?.is_empty() {
+    ensure_inactive(device, package)?;
+    if !recent_ids(device, package)?.is_empty() {
         return Err(format!("{package} 仍有最近任务"));
     }
     Ok(())
 }
 
 /// 强停后确认包管理器的 stopped 标志，并清理用户 0 仍残留的任务。
-pub fn force_stop(serial: &str, package: &str) -> Result<(), String> {
+pub fn force_stop(device: adb::Device<'_>, package: &str) -> Result<(), String> {
     require_package(package)?;
-    checked_shell(serial, &format!("am force-stop --user 0 {package}"))?;
-    let out = checked_shell(serial, &format!("dumpsys package {package}"))?;
+    checked_shell(device, &format!("am force-stop --user 0 {package}"))?;
+    let out = checked_shell(device, &format!("dumpsys package {package}"))?;
     if !stopped(&out.stdout, package) {
         return Err(format!("包管理器未确认 {package} 已停止"));
     }
-    clear_inactive_recents(serial, package)
+    clear_inactive_recents(device, package)
 }
 
 fn stopped(dump: &str, package: &str) -> bool {

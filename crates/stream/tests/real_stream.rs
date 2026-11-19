@@ -1,5 +1,5 @@
 //! 在显式指定的测试实例上同时建立设备与应用会话。由主线协调执行。
-//! WINDROID_SERIAL 必填，WINDROID_SERVER_JAR 指向准备好的 5.0.1 JAR。
+//! WINDROID_SERIAL 必填，WINDROID_TEST_ADB 与 WINDROID_TEST_SERVER_JAR 指向显式工具与准备好的 5.0.1 JAR。
 //! 可设置 WINDROID_STREAM_PACKAGE 选择测试 APK，默认 com.android.settings。
 
 #![cfg(target_os = "macos")]
@@ -15,13 +15,9 @@ use stream::{DisplayTarget, Frame, InputEvent, VideoSession};
 #[ignore = "需要显式指定的私有测试模拟器与已安装应用"]
 fn our_client_decodes_real_frames() {
     let serial = env::var("WINDROID_SERIAL").expect("指定主线协调的测试 serial");
-    let adb = adb::program().expect("准备好的 adb");
-    let jar = env::var_os("WINDROID_SERVER_JAR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("WINDROID_HOME").map(|p| PathBuf::from(p).join("runtime/scrcpy-server.jar"))
-        })
-        .expect("指定 WINDROID_SERVER_JAR 或私有 WINDROID_HOME");
+    let adb = PathBuf::from(env::var_os("WINDROID_TEST_ADB").expect("指定测试用 adb"));
+    let jar =
+        PathBuf::from(env::var_os("WINDROID_TEST_SERVER_JAR").expect("指定测试用 scrcpy-server"));
     let package =
         env::var("WINDROID_STREAM_PACKAGE").unwrap_or_else(|_| "com.android.settings".into());
     let device = VideoSession::start(&adb, &serial, &jar, DisplayTarget::Device).unwrap();

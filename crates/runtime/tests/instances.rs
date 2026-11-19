@@ -34,6 +34,7 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
     let a = store.create("  工作 A  ", spec("compact-720")).unwrap();
     let mut wide = spec("tv-4k");
     wide.disk_bytes = 9 << 30;
+    wide.image.revision = 15;
     let b = store.create("工作 B", wide.clone()).unwrap();
     assert_eq!(a.name, "工作 A");
     assert_ne!(a.id, b.id);
@@ -66,6 +67,12 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
             format!("hw.ramSize={}", ram_mib(template)),
             format!("disk.dataPartition.size={}", record.spec.disk_bytes),
             format!("AvdId={}", record.avd_name()),
+            format!(
+                "image.sysdir.1={}/system-images/android-34/google_apis_playstore/{}/r{}/",
+                root.0.display(),
+                record.spec.image.abi,
+                record.spec.image.revision
+            ),
         ] {
             assert!(config.lines().any(|l| l == expected), "缺少 {expected}");
         }
@@ -169,10 +176,12 @@ fn bounded_device_backend_checks_ports_process_identity_and_services() {
     const ROOT: &str = "WINDROID_BACKEND_TEST_DIR";
     let Some(path) = std::env::var_os(ROOT) else {
         let dir = Temp::create();
-        let sdk = dir.0.join("explicit SDK");
-        let image = sdk
-            .join("system-images/android-34/google_apis_playstore")
-            .join(concat!("arm64", "-v8a"));
+        let paths = runtime::provision::RuntimePaths::discover(&dir.0);
+        let image = paths
+            .images
+            .join("android-34/google_apis_playstore")
+            .join(concat!("arm64", "-v8a"))
+            .join("r14");
         fs::create_dir_all(&image).unwrap();
         for part in [
             "system.img",
@@ -184,7 +193,7 @@ fn bounded_device_backend_checks_ports_process_identity_and_services() {
             fs::write(image.join(part), part).unwrap();
         }
         executable(
-            &sdk.join("emulator/emulator"),
+            &paths.emulator,
             r#"#!/bin/sh
 printf '%s\n' "$@" > "$WINDROID_BACKEND_TEST_DIR/args"
 printf '%s' "$ANDROID_AVD_HOME" > "$WINDROID_BACKEND_TEST_DIR/avd_home"
@@ -201,10 +210,13 @@ trap save TERM
 while :; do sleep 60; done
 "#,
         );
-        let adb = sdk.join("platform-tools/adb");
+        fs::create_dir_all(paths.aapt.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.server_jar.parent().unwrap()).unwrap();
+        let adb = paths.adb;
         executable(
             &adb,
             r#"#!/bin/sh
+if [ "$1" = version ]; then echo "Android Debug Bridge version 1.0.41"; exit; fi
 printf '%s\n' "$4" >> "$WINDROID_BACKEND_TEST_DIR/calls"
 case "$4" in
   'getprop ro.boot.qemu.avd_name') cat "$WINDROID_BACKEND_TEST_DIR/identity" ;;
@@ -221,12 +233,26 @@ case "$4" in
 esac
 "#,
         );
+        let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let service_port = socket.local_addr().unwrap().port().to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for connection in socket.incoming() {
+                let mut stream = connection.unwrap();
+                let mut cmd = [0; 16];
+                stream.read_exact(&mut cmd).unwrap();
+                assert_eq!(&cmd, b"000chost:version");
+                stream.write_all(b"OKAY00040029").unwrap();
+            }
+        });
         let result = ChildCommand::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env(ROOT, &dir.0)
             .env("WINDROID_HOME", &dir.0)
-            .env("WINDROID_SDK", &sdk)
-            .env("WINDROID_ADB", &adb)
+            .env("ANDROID_ADB_SERVER_PORT", service_port)
+            .env_remove("ADB_SERVER_SOCKET")
+            .env("WINDROID_SDK", "/unrelated/sdk")
+            .env("WINDROID_ADB", "/unrelated/adb")
             .env("WINDROID_AVD", "someone-elses-avd")
             .status()
             .unwrap();
@@ -237,7 +263,10 @@ esac
     let layout = Layout { root: root.clone() };
     let store = InstanceStore::new(layout.clone());
     let a = store.create("工作 A", spec("compact-720")).unwrap();
-    let mut backend = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
+    let fixture = runtime::ActiveRuntime::new(|home, _| {
+        Ok((runtime::provision::RuntimePaths::discover(home), Vec::new()))
+    });
+    let mut backend = EmulatorBackend::with_runtime(a.id.clone(), layout.clone(), a.port, fixture);
     let mut facts = Facts::default();
     backend.observe(&mut facts);
     assert_eq!(State::of(&facts), State::Stopped);
@@ -286,7 +315,10 @@ esac
     .unwrap();
     backend.observe(&mut facts);
     assert!(facts.process_alive && !facts.adb_visible && !facts.services.ready());
-    assert!(a.verify_device().is_err());
+    assert!(
+        a.verify_device(&runtime::provision::RuntimePaths::discover(&root).adb)
+            .is_err()
+    );
     assert!(
         backend
             .exec(

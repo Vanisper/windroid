@@ -3,14 +3,16 @@ use std::path::Path;
 use std::{fs, io};
 
 use super::{InstanceRecord, InstanceStore, data_dir, image_subdir, invalid};
-use crate::provision::RuntimePaths;
+use crate::SessionResources;
 use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
@@ -45,7 +47,7 @@ pub(crate) struct OwnedEmulator {
     launched: SystemTime,
     pid_file: PathBuf,
     _lease: File,
-    _resources: Vec<File>,
+    pub resources: Arc<SessionResources>,
     pub record: InstanceRecord,
 }
 
@@ -54,16 +56,11 @@ impl OwnedEmulator {
         store: &InstanceStore,
         id: &InstanceId,
         port: u16,
-        paths: &RuntimePaths,
-        resources: Vec<File>,
+        active: &crate::ActiveRuntime,
     ) -> io::Result<Self> {
         let (record, dir, lease) = store.lease(id, port)?;
-        let sdk = paths.sdk.canonicalize().map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("Android SDK {}：{e}", paths.sdk.display()),
-            )
-        })?;
+        let resources = active.acquire(store.home(), &record.spec.image)?;
+        let paths = &resources.paths;
         let image = paths.images.join(image_subdir(&record.spec.image)?);
         for part in ["system.img", "vendor.img", "ramdisk.img", "kernel-ranchu"] {
             if !image.join(part).is_file() {
@@ -95,7 +92,8 @@ impl OwnedEmulator {
                 )));
             }
         }
-        super::avd::sync_image(&data, &image, &paths.sdk)?;
+        adb::ensure_server(&paths.adb)?;
+        super::avd::sync_image(&data, &image)?;
         let log = OpenOptions::new()
             .create(true)
             .write(true)
@@ -104,10 +102,24 @@ impl OwnedEmulator {
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir.join("emulator.log"))?;
         let mut cmd = Command::new(&paths.emulator);
-        // 共享只读 SDK 和 adb server 的授权上下文。AVD 搜索、快照和数据盘显式指向实例目录。
+        // AVD 搜索、快照和数据盘显式指向实例目录。
         // https://developer.android.com/studio/run/emulator-commandline#data-filedir
-        cmd.env("ANDROID_HOME", &sdk)
-            .env("ANDROID_SDK_ROOT", &sdk)
+        // Emulator 自身也会从 PATH 枚举 adb。为它提供同一版本的工具和宿主基础命令。
+        let adb_dir = paths
+            .adb
+            .parent()
+            .ok_or_else(|| invalid("adb 缺少版本目录"))?;
+        let search = std::env::join_paths([
+            adb_dir,
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+            Path::new("/usr/sbin"),
+            Path::new("/sbin"),
+        ])
+        .map_err(|e| invalid(e.to_string()))?;
+        cmd.env("PATH", search)
+            .env_remove("ANDROID_HOME")
+            .env_remove("ANDROID_SDK_ROOT")
             .env("ANDROID_EMULATOR_HOME", &dir)
             .env("ANDROID_AVD_HOME", dir.join("avd"))
             .arg("-avd")
@@ -121,11 +133,24 @@ impl OwnedEmulator {
             .arg("-data")
             .arg(data.join("userdata-qemu.img"))
             .args(["-no-window", "-no-audio", "-no-boot-anim", "-gpu"])
-            .arg(std::env::var_os("WINDROID_GPU").unwrap_or_else(|| "host".into()))
+            .arg("host")
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        // 版本锁随 QEMU 子进程继续有效，包括宿主异常退出后模拟器仍在运行的情形。
+        // 在 fork 后仅修改子进程自己的 fd 标志。其他子进程沿用 CLOEXEC 默认值。
+        let version_fds: Vec<_> = resources._leases.iter().map(AsRawFd::as_raw_fd).collect();
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in &version_fds {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         super::quick_boot::clear(&dir)?;
         let pid_file = dir.join("active.pid");
         let mut pid = File::create_new(&pid_file)?;
@@ -145,7 +170,7 @@ impl OwnedEmulator {
             launched,
             pid_file,
             _lease: lease,
-            _resources: resources,
+            resources,
             record,
         };
         // 先构造 RAII owner，写入 PID 失败也能回收刚启动的进程组。

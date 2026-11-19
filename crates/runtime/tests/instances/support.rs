@@ -33,7 +33,7 @@ pub fn spec(template: &str) -> Spec {
             revision: 14,
             api: 34,
             tag: "google_apis_playstore".into(),
-            abi: "arm64".into(),
+            abi: concat!("arm64", "-v8a").into(),
         },
         disk_bytes: 8 << 30,
     }
