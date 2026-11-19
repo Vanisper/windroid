@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windroid_locations::StorageLocations;
 
+#[path = "versioned_packages/volume_repair.rs"]
+mod volume_repair;
+
 fn env_dir(key: &str) -> PathBuf {
     std::env::var_os(key).map(PathBuf::from).expect(key)
 }
