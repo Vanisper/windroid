@@ -439,22 +439,6 @@ impl Library {
         if let Some(runtime) = &self.runtime {
             out["storage"] = runtime.lock().unwrap().locations(&self.layout.root);
         }
-        out["templateRamMiB"] = [
-            "phone-1080",
-            "compact-720",
-            "tablet-1200",
-            "tv-1080",
-            "tv-4k",
-        ]
-        .into_iter()
-        .map(|template| {
-            (
-                template.to_owned(),
-                json!(runtime::instances::ram_mib(template)),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>()
-        .into();
         out["recommendedTemplate"] = self.recommended_template.into();
         out
     }
