@@ -314,6 +314,15 @@ impl Actor {
             facts.boot_stalled = false;
         }
         if let Err(reason) = backend.exec(cmd, &mut facts) {
+            // 重启先替换预检，旧进程退出后再按当下余量复核。后一步拒绝时，
+            // 已完成的停止仍须发布，让原窗口关闭，也让用户可以直接重试启动。
+            if matches!(cmd, Command::Restart { .. })
+                && self.facts.process_alive && !facts.process_alive && facts.stop_requested
+            {
+                self.boot = None;
+                self.facts = facts;
+                self.observe(backend);
+            }
             return Ack::Rejected { reason };
         }
         self.facts = facts;

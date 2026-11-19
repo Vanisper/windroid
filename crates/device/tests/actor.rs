@@ -696,3 +696,38 @@ fn session_count_updates_publish_only_current_instance_facts() {
     assert!(!h.set_session_count(1).is_accepted());
     assert!(h.set_session_count(0).is_accepted());
 }
+
+#[test]
+fn restart_publishes_only_a_stop_that_really_completed() {
+    struct RefusedRestart(FakeBackend);
+    impl Backend for RefusedRestart {
+        fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if let Command::Restart { cold } = cmd {
+                if *cold {
+                    self.0.exec(&Command::Stop, facts)?;
+                    facts.stop_requested = true;
+                }
+                return Err(Rejection::Error {
+                    code: contract::ErrorCode::Other, detail: "额度不足".into(),
+                });
+            }
+            self.0.exec(cmd, facts)
+        }
+        fn abort(&mut self, facts: &mut Facts) { self.0.abort(facts) }
+        fn observe(&mut self, facts: &mut Facts) { self.0.observe(facts) }
+    }
+    let (handle, events) = spawn_test(id(), RefusedRestart(FakeBackend::new()), Timeouts::default());
+    let spec = Spec {
+        template: "phone-1080".into(),
+        image: Image { revision: 14, api: 34, tag: "play".into(), abi: "arm64".into() },
+        disk_bytes: 8 << 30,
+    };
+    assert!(handle.send(Command::Create { spec }).is_accepted());
+    assert!(handle.send(Command::Start).is_accepted());
+    until_state(&events, State::Ready, Duration::from_secs(5)).unwrap();
+    assert!(!handle.send(Command::Restart { cold: false }).is_accepted());
+    assert_eq!(handle.snapshot().state, State::Ready);
+    assert!(!handle.send(Command::Restart { cold: true }).is_accepted());
+    assert_eq!(handle.snapshot().state, State::Stopped);
+    assert!(handle.send(Command::Start).is_accepted());
+}
