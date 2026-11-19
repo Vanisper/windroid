@@ -12,6 +12,7 @@ pub mod instances;
 pub mod labels;
 pub mod provision;
 pub mod running;
+pub mod storage;
 
 use std::io;
 use std::path::PathBuf;
@@ -199,7 +200,12 @@ impl EmulatorBackend {
         if self.live()? {
             return Ok(());
         }
-        let process = OwnedEmulator::start(&self.store, &self.id, self.port, &self.paths)?;
+        let resources = storage::resource_lease(self.store.home(), true, true)?;
+        self.paths = RuntimePaths::discover(self.store.home());
+        self.paths.claim_locations(self.store.home(), true, true)?;
+        self.labels = labels::Labels::new(self.store.home(), &self.id);
+        let process =
+            OwnedEmulator::start(&self.store, &self.id, self.port, &self.paths, resources)?;
         self.record = Some(process.record.clone());
         self.process = Some(process);
         self.reset_catalog();

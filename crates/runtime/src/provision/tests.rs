@@ -637,3 +637,80 @@ fn failed_transfer_reopens_without_network_and_retries_only_on_request() {
     assert_eq!(*http.ranges.lock().unwrap(), [0, 32_768]);
     assert_eq!(fs::read(&reopened.paths().server_jar).unwrap(), bytes);
 }
+
+#[test]
+fn independent_image_move_preserves_the_active_component_download() {
+    let temp = Temp::new();
+    let home = temp.0.join("home");
+    let bytes = vec![0x74; 131_072];
+    let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let pkg = fixture(
+        &bytes,
+        format!("http://{}/jar", socket.local_addr().unwrap()),
+    );
+    let (release, wait) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let payload = &bytes;
+        scope.spawn(move || {
+            let (mut conn, _) = socket.accept().unwrap();
+            let mut req = BufReader::new(&mut conn);
+            loop {
+                let mut line = String::new();
+                req.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .unwrap();
+            conn.write_all(&payload[..32_768]).unwrap();
+            wait.recv_timeout(Duration::from_secs(10)).unwrap();
+            conn.write_all(&payload[32_768..]).unwrap();
+        });
+        let p = controller(&home, pkg);
+        p.start().unwrap();
+        let part = partial(&p.owner.worker.stage, pkg);
+        wait_for(|| fs::metadata(&part).is_ok_and(|m| m.len() > 0));
+        let settings = crate::storage::StorageLocations {
+            runtime_root: home.join("runtime"),
+            image_root: Some(temp.0.join("detached")),
+        };
+        let preview = crate::storage::preview(&home, &settings).unwrap();
+        crate::storage::apply(&home, &preview).unwrap();
+        p.refresh_locations();
+        assert_eq!(p.snapshot().phase, "downloading");
+        release.send(()).unwrap();
+        let result = settled(&p);
+        assert_eq!(result.phase, "ready", "{:?}", result.error);
+        assert_eq!(fs::read(p.paths().server_jar).unwrap(), bytes);
+    });
+}
+
+#[test]
+fn foreign_single_file_survives_conflict_and_the_verified_prefix_can_be_retried() {
+    let t = Temp::new();
+    let p = fixture(b"official", "https://example.invalid".into());
+    let part = stage(&t.0, p, b"official");
+    let provision = controller(&t.0, p);
+    let dest = provision.paths().server_jar.clone();
+    fs::create_dir_all(dest.parent().unwrap().join(".windroid-install-server")).unwrap();
+    fs::write(&dest, b"other application").unwrap();
+    provision.start().unwrap();
+    assert!(settled(&provision).error.unwrap().contains("非受管文件"));
+    assert_eq!(fs::read(&dest).unwrap(), b"other application");
+    assert!(part.is_file());
+    fs::remove_file(&dest).unwrap();
+    provision.start().unwrap();
+    assert!(settled(&provision).components_ready);
+
+    // 原地截断已安装的受管文件可通过重试修复。
+    fs::write(&dest, b"bad").unwrap();
+    stage(&t.0, p, b"official");
+    provision.start().unwrap();
+    assert!(settled(&provision).components_ready);
+    assert_eq!(fs::read(dest).unwrap(), b"official");
+}

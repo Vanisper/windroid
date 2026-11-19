@@ -104,7 +104,7 @@ const SUPPORTED: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 const UNSUPPORTED: &str = "当前运行时包适用于 Apple 芯片的 Mac";
 
 impl Provisioner {
-    /// 读取配置一次，后续设备操作与自检始终使用同一布局。
+    /// 开发者覆盖在打开工作区时确定，受管目录在下载和重扫时重新读取。
     pub fn new(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
         let paths = RuntimePaths::discover(&home);
@@ -144,8 +144,8 @@ impl Provisioner {
         }
     }
 
-    pub fn paths(&self) -> &RuntimePaths {
-        &self.owner.worker.paths
+    pub fn paths(&self) -> RuntimePaths {
+        self.owner.worker.paths.current(&self.owner.worker.home)
     }
 
     pub fn snapshot(&self) -> Preparation {
@@ -235,6 +235,15 @@ impl Provisioner {
         if first_missing.is_none() {
             return Ok(());
         }
+        // 用户启动后即占住所选资源，覆盖从确认到后台真正开始写入的间隔。
+        let components = packages.iter().any(|pkg| pkg.image_spec.is_none());
+        let images = packages.iter().any(|pkg| pkg.image_spec.is_some());
+        let leases = crate::storage::resource_lease(&shared.home, components, images)
+            .map_err(|e| e.to_string())?;
+        let paths = shared.paths.current(&shared.home);
+        paths
+            .claim_locations(&shared.home, components, images)
+            .map_err(|e| e.to_string())?;
         state.snapshot.current_component = first_missing;
         shared.cancel.store(false, Ordering::Release);
         state.snapshot.error = None;
@@ -247,7 +256,10 @@ impl Provisioner {
         let worker = Arc::clone(shared);
         if let Err(e) = std::thread::Builder::new()
             .name("windroid-provision".into())
-            .spawn(move || worker.run(&packages, source.as_deref()))
+            .spawn(move || {
+                let _leases = leases;
+                worker.run(&packages, source.as_deref(), &paths);
+            })
         {
             state.active = false;
             state.snapshot.phase = "failed";
@@ -264,6 +276,31 @@ impl Provisioner {
             shared.request_pause();
         }
         Ok(())
+    }
+
+    /// 未占用目录可在另一类下载期间迁移。保留活动作业及其进度，仅更新目录与就绪状态。
+    pub fn refresh_locations(&self) {
+        let shared = &self.owner.worker;
+        let mut state = shared.state.lock().unwrap();
+        let mut fresh = shared.scan();
+        if state.active {
+            let current = &state.snapshot;
+            fresh.phase = current.phase;
+            fresh.current_component = current.current_component;
+            for row in fresh.rows_mut() {
+                if Some(row.id) == current.current_component
+                    && let Some(old) = current
+                        .components
+                        .iter()
+                        .chain(&current.images)
+                        .find(|c| c.id == row.id)
+                {
+                    row.downloaded_bytes = old.downloaded_bytes;
+                }
+            }
+            fresh.downloaded_bytes = fresh.components.iter().map(|c| c.downloaded_bytes).sum();
+        }
+        state.snapshot = fresh;
     }
 
     pub fn recheck(&self) -> Result<(), String> {
@@ -374,7 +411,7 @@ impl Shared {
         scan(
             &self.home,
             &self.stage,
-            &self.paths,
+            &self.paths.current(&self.home),
             self.catalog,
             self.supported,
         )
@@ -414,8 +451,8 @@ impl Shared {
         state.snapshot.current_component = Some(pkg.id);
     }
 
-    fn run(&self, packages: &[Artifact], source: Option<&Path>) {
-        let result = self.prepare(packages, source);
+    fn run(&self, packages: &[Artifact], source: Option<&Path>, paths: &RuntimePaths) {
+        let result = self.prepare(packages, source, paths);
         let mut state = self.state.lock().unwrap();
         let current = state.snapshot.current_component;
         let mut snap = self.scan();
@@ -440,7 +477,12 @@ impl Shared {
         state.snapshot = snap;
     }
 
-    fn prepare(&self, packages: &[Artifact], source: Option<&Path>) -> io::Result<()> {
+    fn prepare(
+        &self,
+        packages: &[Artifact],
+        source: Option<&Path>,
+        paths: &RuntimePaths,
+    ) -> io::Result<()> {
         self.check_pause()?;
         directory(&self.home, &self.stage, true)?;
         let lock_path = self.stage.join("prepare.lock");
@@ -456,8 +498,8 @@ impl Shared {
         })?;
         for &pkg in packages {
             self.check_pause()?;
-            if let Err(e) = installed(&self.home, &self.paths, pkg) {
-                if self.paths.read_only(pkg.kind) {
+            if let Err(e) = installed(&self.home, paths, pkg) {
+                if paths.read_only(pkg.kind) {
                     return Err(e);
                 }
                 let part = partial(&self.stage, pkg);
@@ -473,10 +515,16 @@ impl Shared {
                 self.phase(pkg, "verifying");
                 let result = check_file(&input, pkg, || self.check_pause()).and_then(|()| {
                     self.phase(pkg, "installing");
+                    // 长时间下载期间外置卷可能被弹出。发布前再次核实挂载点和目录归属。
+                    paths.check_configuration(
+                        &self.home,
+                        pkg.image_spec.is_none(),
+                        pkg.image_spec.is_some(),
+                    )?;
                     archive::install(
-                        self.paths.installation_root(pkg),
+                        paths.installation_root(pkg),
                         &input,
-                        &self.paths.destination(pkg),
+                        &paths.destination(pkg),
                         pkg,
                         || self.check_pause(),
                     )
@@ -498,7 +546,7 @@ impl Shared {
                 if part.try_exists()? {
                     fs::remove_file(&part)?;
                 }
-                installed(&self.home, &self.paths, pkg)
+                installed(&self.home, paths, pkg)
                     .map_err(|e| invalid(format!("{} 安装自检失败：{e}", pkg.name)))?;
             }
             self.progress(pkg, pkg.bytes);

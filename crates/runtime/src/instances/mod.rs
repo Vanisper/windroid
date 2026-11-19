@@ -122,6 +122,10 @@ impl InstanceStore {
         Self { layout }
     }
 
+    pub(crate) fn home(&self) -> &Path {
+        &self.layout.root
+    }
+
     fn locked(&self) -> io::Result<(PathBuf, File)> {
         private_dir(&self.layout.root)?;
         let root = self.layout.root.canonicalize()?.join("instances");
@@ -129,6 +133,17 @@ impl InstanceStore {
         let lock = lock_file(&root.join(".registry.lock"))?;
         lock.lock()?;
         Ok((root, lock))
+    }
+
+    /// 老版本启动的模拟器或宿主异常退出后留下的进程仍可能占用资源。
+    pub(crate) fn ensure_stopped(&self) -> io::Result<()> {
+        let (root, _lock) = self.locked()?;
+        for record in records_in(&root)? {
+            let dir = root.join(record.id.as_str());
+            let _lease = acquire_run_lock(&dir)?;
+            process::ensure_previous_exit(&dir)?;
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> io::Result<Vec<InstanceRecord>> {
@@ -201,7 +216,8 @@ impl InstanceStore {
         let stage = root.join(format!(".new-{}", record.avd_name));
         fs::DirBuilder::new().mode(0o700).create(&stage)?;
         let result = (|| {
-            avd::generate(&stage, &final_dir, &record)?;
+            let paths = crate::provision::RuntimePaths::discover(&self.layout.root);
+            avd::generate(&stage, &final_dir, &record, &paths)?;
             let mut manifest = File::create_new(stage.join(MANIFEST))?;
             serde_json::to_writer_pretty(&mut manifest, &record)?;
             manifest.sync_all()?;

@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::catalog::Artifact;
@@ -120,22 +120,63 @@ fn workspace(parent: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
     let stage = parent.join(format!(".windroid-install-{}", pkg.id));
     let owner = stage.join("owner");
     const MARKER: &str = "windroid-package-install-v1\n";
-    match fs::create_dir(&stage) {
-        Ok(()) => fs::write(&owner, MARKER)?,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            if !fs::symlink_metadata(&stage)?.is_dir() || small_text(&owner)? != MARKER {
-                return Err(invalid(format!(
-                    "安装暂存位置已被其他文件占用：{}",
-                    stage.display()
-                )));
-            }
+    if let Err(e) = fs::create_dir(&stage)
+        && (e.kind() != io::ErrorKind::AlreadyExists || !fs::symlink_metadata(&stage)?.is_dir())
+    {
+        return Err(e);
+    }
+    // 支持上次恰好在创建目录和写标记之间退出；只认领空目录。
+    let empty = fs::read_dir(&stage)?.next().is_none();
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(empty)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&owner)?;
+    lock.try_lock()
+        .map_err(|e| io::Error::other(format!("组件正在其他工作区安装：{e}")))?;
+    let marker = small_text(&owner)?;
+    if marker.is_empty()
+        && fs::read_dir(&stage)?.all(|e| e.is_ok_and(|f| f.path() == owner))
+        && lock.metadata()?.nlink() == 1
+    {
+        lock.write_all(MARKER.as_bytes())?;
+    } else if marker != MARKER {
+        return Err(invalid(format!(
+            "安装暂存位置已被其他文件占用：{}",
+            stage.display()
+        )));
+    }
+    Ok((stage, lock))
+}
+
+fn publish_file(stage: &Path, scratch: &Path, dest: &Path) -> io::Result<()> {
+    let identity = |meta: &fs::Metadata| format!("{}:{}\n", meta.dev(), meta.ino());
+    let published = stage.join("published");
+    match fs::symlink_metadata(dest) {
+        Ok(meta)
+            if meta.is_file() && small_text(&published).is_ok_and(|id| id == identity(&meta)) =>
+        {
+            fs::rename(scratch, dest)?;
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "目标已有非受管文件，请移走该文件或另选存储位置：{}",
+                    dest.display()
+                ),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            crate::storage::rename_exclusive(scratch, dest)?;
         }
         Err(e) => return Err(e),
     }
-    let lock = File::open(owner)?;
-    lock.try_lock()
-        .map_err(|e| io::Error::other(format!("组件正在其他工作区安装：{e}")))?;
-    Ok((stage, lock))
+    let temp = stage.join("published.new");
+    remove_owned(&temp)?;
+    File::create_new(&temp)?.write_all(identity(&fs::metadata(dest)?).as_bytes())?;
+    fs::rename(temp, published)
 }
 
 pub(super) fn install(
@@ -173,8 +214,7 @@ pub(super) fn install(
                     .open(&scratch)?,
             )?;
             validate_payload(&scratch, pkg)?;
-            fs::rename(&scratch, dest)?;
-            return Ok(());
+            return publish_file(&stage, &scratch, dest);
         }
         fs::create_dir(&scratch)?;
         unpack(input, &scratch, pkg, &check)?;
@@ -184,11 +224,13 @@ pub(super) fn install(
         remove_owned(&backup)?;
         let had_old = match fs::symlink_metadata(dest) {
             Ok(m) if m.is_dir() => {
-                if !dest.join(RECEIPT).is_file() {
-                    return Err(invalid(format!(
-                        "目标已有非受管目录，请另选存储位置：{}",
-                        dest.display()
-                    )));
+                if !small_text(&dest.join(RECEIPT))
+                    .is_ok_and(|r| r.starts_with(&format!("windroid-v1 {} ", pkg.id)))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("目标已有非受管目录，请另选存储位置：{}", dest.display()),
+                    ));
                 }
                 fs::rename(dest, &backup)?;
                 true
@@ -197,9 +239,9 @@ pub(super) fn install(
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
         };
-        if let Err(e) = fs::rename(&scratch, dest) {
-            if had_old {
-                fs::rename(&backup, dest)?;
+        if let Err(e) = crate::storage::rename_exclusive(&scratch, dest) {
+            if had_old && !dest.try_exists()? {
+                crate::storage::rename_exclusive(&backup, dest)?;
             }
             return Err(e);
         }

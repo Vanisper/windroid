@@ -26,6 +26,38 @@ pub struct RuntimePaths {
     config_error: Option<String>,
 }
 
+pub(crate) struct ManagedPackage {
+    pub(crate) path: PathBuf,
+    artifact: Artifact,
+}
+
+impl ManagedPackage {
+    pub(crate) fn receipt(&self) -> Option<String> {
+        self.artifact.prefix.map(|_| receipt(self.artifact))
+    }
+
+    pub(crate) fn owned(&self) -> io::Result<bool> {
+        let result = if let Some(expected) = self.receipt() {
+            small_text(&self.path.join(RECEIPT)).map(|found| found == expected)
+        } else {
+            validate_payload(&self.path, self.artifact).map(|_| true)
+        };
+        match result {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::InvalidData
+                ) =>
+            {
+                Ok(false)
+            }
+            result => result,
+        }
+    }
+}
+
 impl RuntimePaths {
     pub fn discover(home: &Path) -> Self {
         Self::resolve(home, |key| std::env::var_os(key))
@@ -97,7 +129,28 @@ impl RuntimePaths {
     }
 
     /// 迁移可能已由另一进程完成。持有资源锁后再确认一次，避免写回旧目录。
-    pub(crate) fn check_configuration(&self, home: &Path) -> io::Result<()> {
+    pub(super) fn current(&self, home: &Path) -> Self {
+        if self.borrowed {
+            return self.clone();
+        }
+        let mut paths = Self::managed(home);
+        if self.adb_override {
+            paths.adb.clone_from(&self.adb);
+            paths.adb_override = true;
+        }
+        if self.jar_override {
+            paths.server_jar.clone_from(&self.server_jar);
+            paths.jar_override = true;
+        }
+        paths
+    }
+
+    pub(crate) fn check_configuration(
+        &self,
+        home: &Path,
+        components: bool,
+        images: bool,
+    ) -> io::Result<()> {
         if self.borrowed {
             return Ok(());
         }
@@ -105,8 +158,29 @@ impl RuntimePaths {
             return Err(invalid(message));
         }
         let current = StorageLocations::load(home)?;
-        if self.runtime_root != current.runtime_root || self.images != current.images() {
+        if components && !crate::storage::same_location(&self.runtime_root, &current.runtime_root)
+            || images && !crate::storage::same_location(&self.images, &current.images())
+        {
             return Err(invalid("存储位置已更改，请重新检查运行环境"));
+        }
+        crate::storage::check_locations(home, &current, components, images, false)
+    }
+
+    pub(crate) fn claim_locations(
+        &self,
+        home: &Path,
+        components: bool,
+        images: bool,
+    ) -> io::Result<()> {
+        self.check_configuration(home, components, images)?;
+        if !self.borrowed {
+            crate::storage::check_locations(
+                home,
+                &StorageLocations::load(home)?,
+                components,
+                images,
+                true,
+            )?;
         }
         Ok(())
     }
@@ -144,6 +218,17 @@ impl RuntimePaths {
         } else {
             &self.runtime_root
         }
+    }
+
+    pub(crate) fn managed_packages(config: &StorageLocations) -> Vec<ManagedPackage> {
+        let paths = Self::for_locations(config);
+        super::catalog::CATALOG
+            .iter()
+            .map(|pkg| ManagedPackage {
+                path: paths.destination(*pkg),
+                artifact: *pkg,
+            })
+            .collect()
     }
 
     pub(super) fn destination(&self, pkg: Artifact) -> PathBuf {
@@ -229,7 +314,7 @@ pub(super) fn small_text(path: &Path) -> io::Result<String> {
 }
 
 pub(super) fn installed(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> io::Result<()> {
-    paths.check_configuration(home)?;
+    paths.check_configuration(home, pkg.kind != Kind::Image, pkg.kind == Kind::Image)?;
     let dest = paths.destination(pkg);
     if paths.read_only(pkg.kind) {
         // 只读检查显式选中的链接目标。单独指定 adb 时可以使用开发者自己的可执行文件。
