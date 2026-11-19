@@ -7,6 +7,28 @@ use std::{io, process::Command};
 
 const GIB: u64 = 1 << 30;
 
+// 版本清单限定 darwin-aarch64 构建。该启动器选择 type=virt，Darwin 的默认 GIC 为 v2。
+// https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android-qemu2-glue/main.cpp#2740
+// https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/hw/arm/virt.c#1766
+struct EmulatorMachine {
+    version: &'static str,
+    build: &'static str,
+    argument_max_cores: u32,
+    machine_max_cores: u32,
+    machine_max_ram_mib: u32,
+}
+
+const MANAGED_MACHINE: EmulatorMachine = EmulatorMachine {
+    version: "37.2.13",
+    build: "16740729",
+    // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android/android-emu/android/main-common.c#2157
+    argument_max_cores: 64,
+    // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/include/hw/intc/arm_gic_common.h#32
+    machine_max_cores: 8,
+    // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/hw/arm/virt.c#125
+    machine_max_ram_mib: 31 * 1024,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum GraphicsMode {
@@ -180,14 +202,13 @@ impl SpecLimits {
                 "运行此镜像至少需要双核 Mac 和可用的 Hypervisor 核心",
             ));
         }
-        // 此机型规格只在核对 37.2.13/16740729 Apple Silicon ARM virt + GICv2 后使用。
-        // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/hw/arm/virt.c#1367
-        // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android/android-emu/android/main-common.c#2157
-        let max_cpu_cores = [64, 8, host.logical_cores, host.hv_max_vcpus]
-            .into_iter()
-            .min()
-            .unwrap();
-        let max_ram_mib = (host.physical_mib / 2).min(31 * 1024) as u32;
+        let max_cpu_cores = MANAGED_MACHINE
+            .argument_max_cores
+            .min(MANAGED_MACHINE.machine_max_cores)
+            .min(host.logical_cores)
+            .min(host.hv_max_vcpus);
+        let max_ram_mib =
+            (host.physical_mib / 2).min(u64::from(MANAGED_MACHINE.machine_max_ram_mib)) as u32;
         // 按 propertyFile_getAvdFlavor 的优先顺序和 main-common.c 的 CDD 分支计算。
         // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android/emu/avd/src/android/avd/util.c#236
         // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android/android-emu/android/main-common.c#1266
@@ -262,8 +283,8 @@ pub(super) fn product_name(paths: &RuntimePaths, image: &Image) -> io::Result<St
         .ok_or_else(|| invalid("模拟器目录无效"))?;
     let properties = hardware::read_ini(&emulator_dir.join("source.properties"), None)
         .map_err(|e| invalid(format!("无法读取受管 Emulator 版本：{e}")))?;
-    if hardware::field(&properties, "Pkg.Revision")? != Some("37.2.13")
-        || hardware::field(&properties, "Pkg.BuildId")? != Some("16740729")
+    if hardware::field(&properties, "Pkg.Revision")? != Some(MANAGED_MACHINE.version)
+        || hardware::field(&properties, "Pkg.BuildId")? != Some(MANAGED_MACHINE.build)
         || image.abi != concat!("arm64", "-v8a")
     {
         return Err(invalid("此 Emulator 版本、构建或机型缺少已验证的硬件限值"));
