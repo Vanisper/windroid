@@ -218,7 +218,7 @@ pub(super) fn regular(path: &Path) -> io::Result<fs::Metadata> {
     Ok(m)
 }
 
-fn small_text(path: &Path) -> io::Result<String> {
+pub(super) fn small_text(path: &Path) -> io::Result<String> {
     regular(path)?;
     let mut s = String::new();
     File::open(path)?.take(16_385).read_to_string(&mut s)?;

@@ -5,6 +5,7 @@
 mod archive;
 mod catalog;
 mod download;
+mod import;
 mod integrity;
 mod metadata;
 mod paths;
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 
 use catalog::{Artifact, CATALOG};
-use integrity::{check_digest, invalid};
+use integrity::{check_file, invalid};
 pub use paths::RuntimePaths;
 use paths::{directory, installed};
 
@@ -161,11 +162,25 @@ impl Provisioner {
             .copied()
             .filter(|p| p.image_spec.is_none())
             .collect();
-        self.launch(packages)
+        self.launch(packages, None)
     }
 
     pub fn start_image(&self, id: &str) -> Result<(), String> {
-        self.launch(vec![self.image_package(id)?])
+        self.launch(vec![self.image_package(id)?], None)
+    }
+
+    /// 可能读取数 GB；宿主在后台执行预览，确认前不创建或安装任何资源。
+    pub fn inspect_image_zip(&self, path: &Path) -> Result<Component, String> {
+        let pkg = import::inspect(path, self.owner.worker.catalog).map_err(|e| e.to_string())?;
+        self.snapshot()
+            .images
+            .into_iter()
+            .find(|row| row.id == pkg.id)
+            .ok_or_else(|| "镜像不在当前清单中".into())
+    }
+
+    pub fn import_image(&self, id: &str, path: PathBuf) -> Result<(), String> {
+        self.launch(vec![self.image_package(id)?], Some(path))
     }
 
     fn image_package(&self, id: &str) -> Result<Artifact, String> {
@@ -178,7 +193,7 @@ impl Provisioner {
             .ok_or_else(|| "镜像不在当前官方清单中".into())
     }
 
-    fn launch(&self, packages: Vec<Artifact>) -> Result<(), String> {
+    fn launch(&self, packages: Vec<Artifact>, source: Option<PathBuf>) -> Result<(), String> {
         let shared = &self.owner.worker;
         let mut state = shared.state.lock().unwrap();
         if state.active {
@@ -223,12 +238,16 @@ impl Provisioner {
         state.snapshot.current_component = first_missing;
         shared.cancel.store(false, Ordering::Release);
         state.snapshot.error = None;
-        state.snapshot.phase = "downloading";
+        state.snapshot.phase = if source.is_some() {
+            "verifying"
+        } else {
+            "downloading"
+        };
         state.active = true;
         let worker = Arc::clone(shared);
         if let Err(e) = std::thread::Builder::new()
             .name("windroid-provision".into())
-            .spawn(move || worker.run(&packages))
+            .spawn(move || worker.run(&packages, source.as_deref()))
         {
             state.active = false;
             state.snapshot.phase = "failed";
@@ -395,8 +414,8 @@ impl Shared {
         state.snapshot.current_component = Some(pkg.id);
     }
 
-    fn run(&self, packages: &[Artifact]) {
-        let result = self.prepare(packages);
+    fn run(&self, packages: &[Artifact], source: Option<&Path>) {
+        let result = self.prepare(packages, source);
         let mut state = self.state.lock().unwrap();
         let current = state.snapshot.current_component;
         let mut snap = self.scan();
@@ -421,7 +440,7 @@ impl Shared {
         state.snapshot = snap;
     }
 
-    fn prepare(&self, packages: &[Artifact]) -> io::Result<()> {
+    fn prepare(&self, packages: &[Artifact], source: Option<&Path>) -> io::Result<()> {
         self.check_pause()?;
         directory(&self.home, &self.stage, true)?;
         let lock_path = self.stage.join("prepare.lock");
@@ -442,32 +461,42 @@ impl Shared {
                     return Err(e);
                 }
                 let part = partial(&self.stage, pkg);
-                self.phase(pkg, "downloading");
-                download::fetch(self, pkg, &part)?;
-                self.progress(pkg, pkg.bytes);
+                let input = if let Some(source) = source {
+                    self.phase(pkg, "verifying");
+                    import::capture(self, source, pkg)?
+                } else {
+                    self.phase(pkg, "downloading");
+                    download::fetch(self, pkg, &part)?;
+                    self.progress(pkg, pkg.bytes);
+                    fs::File::open(&part)?
+                };
                 self.phase(pkg, "verifying");
-                if let Err(e) = check_digest(&part, pkg, || self.check_pause()) {
-                    if e.kind() == ErrorKind::InvalidData {
-                        fs::remove_file(&part)?;
-                    }
-                    return Err(e);
+                let result = check_file(&input, pkg, || self.check_pause()).and_then(|()| {
+                    self.phase(pkg, "installing");
+                    archive::install(
+                        self.paths.installation_root(pkg),
+                        &input,
+                        &self.paths.destination(pkg),
+                        pkg,
+                        || self.check_pause(),
+                    )
+                });
+                // 导入失败应保留同版本此前下载的前缀；安装成功后即可释放它。
+                if source.is_none()
+                    && result.as_ref().is_err_and(|e| {
+                        matches!(
+                            e.kind(),
+                            ErrorKind::InvalidData
+                                | ErrorKind::InvalidInput
+                                | ErrorKind::Unsupported
+                        )
+                    })
+                {
+                    fs::remove_file(&part)?;
                 }
-                self.phase(pkg, "installing");
-                if let Err(e) = archive::install(
-                    &self.home,
-                    &self.stage,
-                    &part,
-                    &self.paths.destination(pkg),
-                    pkg,
-                    || self.check_pause(),
-                ) {
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::InvalidData | ErrorKind::InvalidInput | ErrorKind::Unsupported
-                    ) {
-                        fs::remove_file(&part)?;
-                    }
-                    return Err(e);
+                result?;
+                if part.try_exists()? {
+                    fs::remove_file(&part)?;
                 }
                 installed(&self.home, &self.paths, pkg)
                     .map_err(|e| invalid(format!("{} 安装自检失败：{e}", pkg.name)))?;

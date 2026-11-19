@@ -63,3 +63,59 @@ fn explicitly_borrowed_sdk_passes_the_same_layout_and_jar_checks() {
     provision.start().unwrap();
     assert!(!home.exists());
 }
+
+/// 使用从清单 URL 单独取得的真实 ZIP。三个镜像都安装在隔离的可配置目录。
+#[test]
+#[ignore = "set WINDROID_TEST_IMAGE_ARCHIVES to a directory containing all official image ZIPs"]
+fn verifies_and_imports_each_official_image_into_the_same_library() {
+    use std::{
+        fs, thread,
+        time::{Duration, Instant},
+    };
+    let archives = PathBuf::from(
+        std::env::var_os("WINDROID_TEST_IMAGE_ARCHIVES").expect("set WINDROID_TEST_IMAGE_ARCHIVES"),
+    );
+    let root =
+        std::env::temp_dir().join(format!("windroid-official-import-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let home = root.join("home");
+    fs::create_dir(&home).unwrap();
+    let locations = windroid_locations::StorageLocations {
+        runtime_root: root.join("tools"),
+        image_root: Some(root.join("images")),
+    };
+    fs::write(
+        home.join(windroid_locations::SETTINGS),
+        serde_json::to_vec(&locations).unwrap(),
+    )
+    .unwrap();
+    let p = Provisioner::managed(&home);
+    for row in p.snapshot().images {
+        let archive = archives.join(row.source.rsplit('/').next().unwrap());
+        let preview = p.inspect_image_zip(&archive).unwrap();
+        assert_eq!(preview.id, row.id);
+        assert!(!preview.ready && !preview.location.exists());
+        p.import_image(row.id, archive).unwrap();
+        let start = Instant::now();
+        loop {
+            let snap = p.snapshot();
+            assert!(snap.error.is_none(), "{:?}", snap.error);
+            if snap.images.iter().any(|c| c.id == row.id && c.ready) {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(240));
+            thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("{} r{} → {}", row.name, row.version, row.location.display());
+    }
+    let p = Provisioner::managed(&home);
+    assert!(
+        p.snapshot()
+            .images
+            .iter()
+            .all(|c| c.ready && c.location.starts_with(root.join("images")))
+    );
+    assert!(!p.snapshot().components_ready);
+    assert!(!home.join("instances").exists());
+    fs::remove_dir_all(root).unwrap();
+}

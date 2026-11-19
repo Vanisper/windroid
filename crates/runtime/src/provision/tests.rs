@@ -73,6 +73,13 @@ fn settled(p: &Provisioner) -> Preparation {
 
 /// 有效回包发送 Content-Length 和 Content-Range。挂起的首包一直等到暂停关闭连接，
 /// 测试无需用外部网络速度猜测暂停时机。
+#[derive(Clone, Copy)]
+enum FirstResponse {
+    Complete,
+    Stall,
+    Disconnect,
+}
+
 struct Http {
     url: String,
     ranges: Arc<Mutex<Vec<usize>>>,
@@ -80,7 +87,7 @@ struct Http {
     handle: Option<thread::JoinHandle<()>>,
 }
 impl Http {
-    fn new(body: Vec<u8>, stall_first: bool, ignore_range: bool) -> Self {
+    fn new(body: Vec<u8>, first: FirstResponse, ignore_range: bool) -> Self {
         let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = socket.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -128,8 +135,11 @@ impl Http {
                     body.len() - start
                 )
                 .unwrap();
-                if stall_first && reqs.lock().unwrap().len() == 1 {
+                if reqs.lock().unwrap().len() == 1 && !matches!(first, FirstResponse::Complete) {
                     stream.write_all(&body[start..start + 32_768]).unwrap();
+                    if matches!(first, FirstResponse::Disconnect) {
+                        continue;
+                    }
                     stream
                         .set_read_timeout(Some(Duration::from_secs(8)))
                         .unwrap();
@@ -220,7 +230,7 @@ fn empty_overrides_use_private_paths_and_explicit_binaries_are_read_only() {
 fn pause_restart_and_resume_from_exact_prefix() {
     let temp = Temp::new();
     let bytes: Vec<_> = (0..131_072).map(|i| (i % 251) as u8).collect();
-    let http = Http::new(bytes.clone(), true, false);
+    let http = Http::new(bytes.clone(), FirstResponse::Stall, false);
     let pkg = fixture(&bytes, http.url.clone());
     let p = controller(&temp.0, pkg);
     let part = partial(&p.owner.worker.stage, pkg);
@@ -293,7 +303,7 @@ fn stage(home: &Path, pkg: Artifact, bytes: &[u8]) -> PathBuf {
 fn ignored_range_restarts_once_without_concatenating_bodies() {
     let t = Temp::new();
     let bytes = vec![17; 65536];
-    let http = Http::new(bytes.clone(), false, true);
+    let http = Http::new(bytes.clone(), FirstResponse::Complete, true);
     let pkg = fixture(&bytes, http.url.clone());
     stage(&t.0, pkg, &bytes[..8192]);
     let p = controller(&t.0, pkg);
@@ -490,6 +500,20 @@ fn staging_links_and_borrowed_mode_cannot_write_external_files() {
 }
 
 #[test]
+fn a_second_publisher_reuses_the_verified_destination() {
+    use std::os::unix::fs::MetadataExt;
+    let home = Temp::new();
+    let pkg = fixture(b"server", "https://example.invalid".into());
+    let input = stage(&home.0, pkg, b"server");
+    let dest = home.0.join("runtime").join("scrcpy-server.jar");
+    let file = fs::File::open(input).unwrap();
+    archive::install(&home.0, &file, &dest, pkg, || Ok(())).unwrap();
+    let first = fs::metadata(&dest).unwrap().ino();
+    archive::install(&home.0, &file, &dest, pkg, || Ok(())).unwrap();
+    assert_eq!(fs::metadata(dest).unwrap().ino(), first);
+}
+
+#[test]
 fn preparing_components_leaves_image_consent_and_partial_untouched() {
     let temp = Temp::new();
     let core = fixture(b"core", "https://example.invalid".into());
@@ -508,4 +532,108 @@ fn preparing_components_leaves_image_consent_and_partial_untouched() {
     assert_eq!(snap.images[0].downloaded_bytes, 6);
     assert_eq!(fs::read(image_part).unwrap(), b"paused");
     assert!(p.start_image("unlisted").is_err());
+}
+
+#[test]
+fn publishes_verified_archives_in_configured_resource_directory() {
+    let home = Temp::new();
+    let resources = Temp::new();
+    let settings = windroid_locations::StorageLocations {
+        runtime_root: resources.0.join("shared"),
+        image_root: None,
+    };
+    fs::write(
+        home.0.join(windroid_locations::SETTINGS),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    let (pkg, bytes) = zip_fixture(&[
+        (
+            "platform-tools/source.properties",
+            b"Pkg.Revision=1\n",
+            0o644,
+        ),
+        ("platform-tools/adb", b"fixture", 0o755),
+    ]);
+    stage(&home.0, pkg, &bytes);
+    let p = controller(&home.0, pkg);
+    p.start().unwrap();
+    let snap = settled(&p);
+    assert!(snap.components_ready, "{:?}", snap.error);
+    assert_eq!(
+        p.paths().adb,
+        settings.runtime_root.join("sdk/platform-tools/adb")
+    );
+    assert!(!home.0.join("runtime").exists());
+}
+
+#[test]
+fn import_checks_the_confirmed_copy_and_preserves_the_download_prefix_after_failure() {
+    let home = Temp::new();
+    let original = Temp::new();
+    let zip = original.0.join("user-chosen.zip");
+    let image = *CATALOG.iter().find(|p| p.id == "system-image").unwrap();
+    let (mut pkg, bytes) = zip_fixture(&[(
+        "arm64-v8a/source.properties",
+        b"Pkg.Revision=14\nPkg.Dependencies=emulator#34.2.16\nAndroidVersion.ApiLevel=34\nSystemImage.Abi=arm64-v8a\nSystemImage.TagId=google_apis_playstore\nAddon.VendorId=google",
+        0o644,
+    )]);
+    pkg = Artifact {
+        essentials: &[],
+        kind: Kind::Image,
+        id: image.id,
+        version: image.version,
+        prefix: image.prefix,
+        image_spec: image.image_spec,
+        ..pkg
+    };
+    let p = controller(&home.0, pkg);
+    fs::write(&zip, &bytes[..50]).unwrap();
+    assert!(p.inspect_image_zip(&zip).unwrap_err().contains("大小"));
+    fs::write(&zip, &bytes).unwrap();
+    let preview = p.inspect_image_zip(&zip).unwrap();
+    assert_eq!(preview.image.unwrap().api, 34);
+    assert!(!preview.ready && !preview.location.exists());
+    assert!(!home.0.join("staging").exists());
+    let prefix = stage(&home.0, pkg, &bytes[..50]);
+
+    let mut changed = bytes.clone();
+    changed[0] ^= 1;
+    fs::write(&zip, &changed).unwrap();
+    assert!(p.inspect_image_zip(&zip).unwrap_err().contains("校验和"));
+    p.import_image(pkg.id, zip.clone()).unwrap();
+    assert!(settled(&p).error.unwrap().contains("校验和"));
+    assert!(!preview.location.exists());
+    assert_eq!(fs::read(&prefix).unwrap(), bytes[..50]);
+
+    fs::write(&zip, &bytes).unwrap();
+    p.import_image(pkg.id, zip.clone()).unwrap();
+    let snap = settled(&p);
+    assert!(snap.images[0].ready, "{:?}", snap.error);
+    assert!(!home.0.join("instances").exists());
+    assert_eq!(fs::read(zip).unwrap(), bytes);
+    assert!(!prefix.exists());
+}
+
+#[test]
+fn failed_transfer_reopens_without_network_and_retries_only_on_request() {
+    let home = Temp::new();
+    let bytes = vec![72; 131_072];
+    let http = Http::new(bytes.clone(), FirstResponse::Disconnect, false);
+    let pkg = fixture(&bytes, http.url.clone());
+    let p = controller(&home.0, pkg);
+    p.start().unwrap();
+    let failed = settled(&p);
+    assert_eq!(failed.phase, "failed");
+    assert!(failed.error.unwrap().contains("下载失败"));
+    assert_eq!(failed.downloaded_bytes, 32_768);
+    drop(p);
+
+    let reopened = controller(&home.0, pkg);
+    assert_eq!(reopened.snapshot().phase, "paused");
+    assert_eq!(*http.ranges.lock().unwrap(), [0]);
+    reopened.start().unwrap();
+    assert!(settled(&reopened).components_ready);
+    assert_eq!(*http.ranges.lock().unwrap(), [0, 32_768]);
+    assert_eq!(fs::read(&reopened.paths().server_jar).unwrap(), bytes);
 }

@@ -1,11 +1,11 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::catalog::Artifact;
 use super::integrity::invalid;
-use super::paths::{RECEIPT, directory, receipt, validate_payload};
+use super::paths::{RECEIPT, directory, receipt, small_text, validate_payload};
 
 // 固定包的目录均为 ASCII。逐段检查原始名字，避免解包器静默「修正」路径。
 fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
@@ -35,12 +35,12 @@ fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
 }
 
 fn unpack(
-    path: &Path,
+    file: &File,
     scratch: &Path,
     pkg: Artifact,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut archive = zip::ZipArchive::new(File::open(path)?)?;
+    let mut archive = zip::ZipArchive::new(file)?;
     if archive.len() > 4096 {
         return Err(invalid("ZIP 条目数超限"));
     }
@@ -105,7 +105,7 @@ fn unpack(
     Ok(())
 }
 
-/// 只清理私有 staging 下从固定组件 ID 构造的保留位置，拒绝跟随链接。
+/// 只清理已核对所有权的安装暂存区内的工作文件。
 fn remove_owned(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() => fs::remove_dir_all(path),
@@ -115,33 +115,81 @@ fn remove_owned(path: &Path) -> io::Result<()> {
     }
 }
 
+/// 解压与改名都在目标卷完成。独立工作区复用同一组件目录时也要串行发布。
+fn workspace(parent: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
+    let stage = parent.join(format!(".windroid-install-{}", pkg.id));
+    let owner = stage.join("owner");
+    const MARKER: &str = "windroid-package-install-v1\n";
+    match fs::create_dir(&stage) {
+        Ok(()) => fs::write(&owner, MARKER)?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(&stage)?.is_dir() || small_text(&owner)? != MARKER {
+                return Err(invalid(format!(
+                    "安装暂存位置已被其他文件占用：{}",
+                    stage.display()
+                )));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    let lock = File::open(owner)?;
+    lock.try_lock()
+        .map_err(|e| io::Error::other(format!("组件正在其他工作区安装：{e}")))?;
+    Ok((stage, lock))
+}
+
 pub(super) fn install(
-    home: &Path,
-    stage: &Path,
-    part: &Path,
+    root: &Path,
+    mut input: &File,
     dest: &Path,
     pkg: Artifact,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
-    let scratch = stage.join(format!("{}.unpack", pkg.id));
-    let backup = stage.join(format!("{}.previous", pkg.id));
+    input.rewind()?;
     let parent = dest.parent().ok_or_else(|| invalid("组件目标缺少父目录"))?;
-    directory(home, parent, true)?;
-    if pkg.prefix.is_none() {
-        check()?;
-        // JAR 是单文件，rename 直接原子替换。调用方已完成长度与 SHA-256 校验。
-        return fs::rename(part, dest);
+    directory(root, parent, true)?;
+    let (stage, _lock) = workspace(parent, pkg)?;
+    // 同一目标可能已由另一工作区在下载期间安装。保留已在使用的完整文件。
+    if (pkg.prefix.is_none() || small_text(&dest.join(RECEIPT)).is_ok_and(|r| r == receipt(pkg)))
+        && validate_payload(dest, pkg).is_ok()
+    {
+        return Ok(());
+    }
+    let scratch = stage.join("unpack");
+    let backup = stage.join("previous");
+    // 上次在两次 rename 间退出。先恢复旧版本，再尝试发布本次产物。
+    if fs::symlink_metadata(&backup).is_ok() && !dest.try_exists()? {
+        fs::rename(&backup, dest)?;
     }
     remove_owned(&scratch)?;
-    fs::create_dir(&scratch)?;
     let result = (|| {
-        unpack(part, &scratch, pkg, &check)?;
+        if pkg.prefix.is_none() {
+            check()?;
+            io::copy(
+                &mut input,
+                &mut OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&scratch)?,
+            )?;
+            validate_payload(&scratch, pkg)?;
+            fs::rename(&scratch, dest)?;
+            return Ok(());
+        }
+        fs::create_dir(&scratch)?;
+        unpack(input, &scratch, pkg, &check)?;
         validate_payload(&scratch, pkg)?;
         fs::write(scratch.join(RECEIPT), receipt(pkg))?;
         check()?;
         remove_owned(&backup)?;
         let had_old = match fs::symlink_metadata(dest) {
             Ok(m) if m.is_dir() => {
+                if !dest.join(RECEIPT).is_file() {
+                    return Err(invalid(format!(
+                        "目标已有非受管目录，请另选存储位置：{}",
+                        dest.display()
+                    )));
+                }
                 fs::rename(dest, &backup)?;
                 true
             }
@@ -155,8 +203,7 @@ pub(super) fn install(
             }
             return Err(e);
         }
-        remove_owned(&backup)?;
-        fs::remove_file(part)
+        remove_owned(&backup)
     })();
     if result.is_err() {
         remove_owned(&scratch)?;

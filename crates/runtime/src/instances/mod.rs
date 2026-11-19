@@ -454,7 +454,7 @@ fn check_space(root: &Path, bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn nonce() -> io::Result<String> {
+pub(crate) fn nonce() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
