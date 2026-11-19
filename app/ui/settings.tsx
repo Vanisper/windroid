@@ -1,7 +1,7 @@
 import { cleanup, host, Scroll, signal, Text, View } from "nsh";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
-import { openGuide } from "./model";
+import { openGuide, settingsTab } from "./model";
 import { Storage } from "./storage";
 
 const choices = { ask: "每次询问", background: "保留后台", quit: "完全退出" };
@@ -13,7 +13,7 @@ const tabs = [
   { id: "storage", name: "存储位置" },
   { id: "logs", name: "应用日志" },
 ] as const;
-const selectedTab = signal<typeof tabs[number]["id"]>("window");
+
 
 function WindowSettingsPanel() {
   const action = signal<CloseAction | null>(null);
@@ -65,16 +65,16 @@ export function Settings() {
     <View role="tablist" accessibilityLabel="设置分类" style={row}>
       <Each of={tabs} key={tab => tab.id}>{tab =>
         <View testID={"settings-" + tab().id} role="tab" accessibilityLabel={tab().name}
-          accessibilityState={{ selected: selectedTab() === tab().id }} onPress={() => selectedTab.set(tab().id)}
+          accessibilityState={{ selected: settingsTab() === tab().id }} onPress={() => settingsTab.set(tab().id)}
           style={{ paddingVertical: 7, paddingHorizontal: 12, borderRadius: 6,
-            backgroundColor: selectedTab() === tab().id ? colors().selected : colors().canvas }}
+            backgroundColor: settingsTab() === tab().id ? colors().selected : colors().canvas }}
           focusVisibleStyle={{ backgroundColor: colors().wash }}>
           <Text style={{ fontWeight: 600, fontSize: 13, color: colors().ink }}>{tab().name}</Text>
         </View>
       }</Each>
     </View>
     <Scroll testID="workspace-scroll" style={{ flex: 1, minHeight: 0 }}>
-    {selectedTab() === "window" ? <WindowSettingsPanel /> : selectedTab() === "storage" ? <Storage /> : <View style={card()}>
+    {settingsTab() === "window" ? <WindowSettingsPanel /> : settingsTab() === "storage" ? <Storage /> : <View style={card()}>
       <Heading text="应用日志" /><Detail text="Windroid 当前将运行记录写到标准错误。按启动记录浏览历史将在后续版本提供。" />
     </View>}
     </Scroll>

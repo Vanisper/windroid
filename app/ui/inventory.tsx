@@ -1,7 +1,7 @@
 import { computed, signal, Text, View, windowSize } from "nsh";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
 import { DeviceControls } from "./library";
-import { activeTransfer, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
+import { activeTransfer, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -24,7 +24,8 @@ function NextAction() {
   const label = computed(() => imageTransfer() ? "查看镜像进度" : activeTransfer() ? "查看准备进度" :
     environmentReady() ? "创建实例" : "查看运行环境");
   const next = () => {
-    if (imageTransfer()) openEnvironment("images");
+    if (imageTransfer() && preparation()?.candidateTarget) openStorage();
+    else if (imageTransfer()) openEnvironment("images");
     else if (environmentReady()) startCreation();
     else openEnvironment("components");
   };

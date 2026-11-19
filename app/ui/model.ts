@@ -38,6 +38,7 @@ export interface Component {
 }
 export interface Preparation {
   phase: "missing" | "downloading" | "verifying" | "installing" | "paused" | "failed" | "ready";
+  candidateTarget: string | null; candidateDownloadedBytes: number | null;
   componentsReady: boolean; components: Component[]; images: Component[]; downloadedBytes: number; totalBytes: number;
   currentComponent: string | null; error: string | null; borrowed: boolean;
 }
@@ -71,7 +72,7 @@ export interface Snapshot {
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
   instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string; templateRamMiB?: Record<string, number>;
   showWelcome?: boolean;
-  storage?: { home: string; sdk: string; runtimeRoot: string; images: string; imagesInherited: boolean; borrowed: boolean; error?: string | null };
+  storage?: { home: string; runtimeRoot: string; imageRoot: string; defaultRuntimeRoot: string; defaultImageRoot: string; cleanupNotes: string[]; error?: string | null };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 
@@ -80,6 +81,7 @@ type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
   | { kind: "createInstance"; name: string; template: string; imageId: string; image: ImageIdentity }
   | { kind: "applyStorage"; plan: { previewId: number } }
+  | { kind: "prepareCandidateImage"; previewId: number; resourceId: string; acceptedLicenses: true }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
   | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
@@ -121,6 +123,11 @@ export const guideOrigin = signal<GuideOrigin>("instances");
 export function openGuide(origin: GuideOrigin) {
   guideOrigin.set(origin);
   navigate("guide");
+}
+export const settingsTab = signal<"window" | "storage" | "logs">("window");
+export function openStorage() {
+  settingsTab.set("storage");
+  navigate("settings");
 }
 export const environmentTab = signal<"components" | "images">("components");
 export function openEnvironment(tab: "components" | "images") {

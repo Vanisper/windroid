@@ -700,14 +700,28 @@ fn creation_reply_does_not_redirect_a_new_guide_session() {
     wait(&mut ui.app, "id:guide-begin");
 }
 
+fn storage(runtime: &str, images: &str) -> Value {
+    json!({"home":"/home", "runtimeRoot":runtime, "imageRoot":images,
+        "defaultRuntimeRoot":"/home/runtime", "defaultImageRoot":"/home/system-images"})
+}
+
+fn storage_plan(change: &Value, id: usize) -> Value {
+    json!({"previewId":id, "mode":change["mode"],"cleanup":change["cleanup"],
+        "runtimeRoot":change["runtimeRoot"],"imageRoot":change["imageRoot"], "versions":[],
+        "requiredBytes":0,"availableBytes":null,"affectedInstances":[],"blockers":[]})
+}
+
 #[test]
-fn storage_changes_preview_each_file_and_recheck_occupancy_before_applying() {
+fn storage_reviews_each_version_and_cleanup_choice_then_restores_each_root_independently() {
     let mut view = ready_view();
-    view["storage"] = json!({"home":"/home","runtimeRoot":"/old","sdk":"/old/sdk","images":"/old/sdk/system-images","imagesInherited":true,"borrowed":false});
+    view["storage"] = storage("/old", "/initial-images");
     let mut ui = Scripted::new(view, |cmd, v| {
-        assert_eq!(cmd, &json!({"kind":"applyStorage","plan":{"previewId":2}}));
-        v["storage"]["imagesInherited"] = json!(false);
-        v["storage"]["images"] = json!("/images");
+        assert_eq!(cmd["kind"], "applyStorage");
+        match cmd["plan"]["previewId"].as_u64().unwrap() {
+            4 => v["storage"]["imageRoot"] = json!("/images"),
+            7 => v["storage"]["runtimeRoot"] = json!("/home/runtime"),
+            id => panic!("无法识别此次确认的预览 {id}"),
+        }
         json!({"status":"accepted"})
     });
     ui.channel.handle("windroid.pickResource", |call| {
@@ -717,44 +731,116 @@ fn storage_changes_preview_each_file_and_recheck_occupancy_before_applying() {
     let count = std::sync::atomic::AtomicUsize::new(0);
     ui.channel.handle("windroid.previewStorage", move |call| {
         let id = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        assert_eq!(call.data()["runtimeRoot"], "/old");
-        assert_eq!(
-            call.data()["expected"],
-            json!({"runtimeRoot":"/old","imageRoot":if id == 3 {json!("/images")} else {Value::Null}})
-        );
-        assert_eq!(call.data()["imageRoot"], if id == 3 { Value::Null } else { json!("/images") });
-        let files: Vec<_> = (0..9).map(|n| json!({"source":format!("/old/file{n}"),"target":format!("/images/file{n}"),"bytes":20})).collect();
-        let image_root = call.data()["imageRoot"].clone();
-        call.resolve(json!({"previewId":id,"runtimeRoot":"/old","imageRoot":image_root, "files":files,
-            "blockers":if id == 1 {vec!["请先停止「工作机」"]} else {vec![]}}));
+        let change = call.data();
+        assert_eq!(change["expected"], json!({"runtimeRoot":"/old","imageRoot":if id >= 5 {"/images"} else {"/initial-images"}}));
+        assert_eq!(change["runtimeRoot"], if id >= 6 {"/home/runtime"} else {"/old"});
+        assert_eq!(change["imageRoot"], if id == 5 {"/home/system-images"} else {"/images"});
+        assert_eq!(change["mode"], match id {2..=4=>"migrate",7=>"future",_=>"use"});
+        assert_eq!(change["cleanup"], id == 4);
+        let mut plan = storage_plan(change, id);
+        if id <= 4 {
+            plan["versions"] = json!((0..9).map(|n| json!({"id":format!("r{n}"),"name":format!("版本 {n}"),"source":format!("/old/r{n}"),"target":format!("/images/r{n}"),"bytes":1024,
+                "status":if id==1 {"missing"} else {"copy"}, "cleanup":id==4,"downloadable":false,"detail":""})).collect::<Vec<_>>());
+            plan["affectedInstances"] = json!(["工作机 · API 34 · r14"]);
+            plan["requiredBytes"] = json!(9216); plan["availableBytes"] = json!(1048576);
+            plan["blockers"] = match id { 1=>json!(["目标缺少工作机使用的 r14"]),2=>json!(["请先停止「工作机」"]),_=>json!([]) };
+        }
+        call.resolve(plan);
     });
     wait(&mut ui.app, "id:library");
     press(&mut ui.app, "show-settings");
     press(&mut ui.app, "settings-storage");
     press(&mut ui.app, "choose-image-directory");
-    wait(&mut ui.app, "text:请先停止「工作机」");
+    wait(&mut ui.app, "text:目标缺少工作机使用的 r14");
     assert!(!ui.app.screen().enabled("id:storage-apply").unwrap());
+    press(&mut ui.app, "storage-mode-migrate");
+    wait(&mut ui.app, "text:请先停止「工作机」");
     press(&mut ui.app, "storage-next");
-    wait(&mut ui.app, "text:/file8$/");
+    wait(&mut ui.app, "text:版本 8");
     press(&mut ui.app, "storage-see-instances");
     wait(&mut ui.app, "id:inventory");
     press(&mut ui.app, "show-settings");
-    wait(&mut ui.app, "id:storage-preview");
-    gone(&mut ui.app, "text:请先停止「工作机」");
+    wait(&mut ui.app, "text:切换后保留源版本。");
+    press(&mut ui.app, "storage-toggle-cleanup");
+    wait(&mut ui.app, "text:迁移并清理已确认源版本");
+    wait(
+        &mut ui.app,
+        "id:storage-version-r0 >> text:切换成功后，复核并清理此源版本。",
+    );
     assert!(ui.commands.lock().unwrap().is_empty());
     press(&mut ui.app, "storage-apply");
-    wait(&mut ui.app, "text:单独存放");
-    press(&mut ui.app, "inherit-image-directory");
+    wait(&mut ui.app, "id:reset-image-directory");
+    press(&mut ui.app, "reset-image-directory");
     wait(&mut ui.app, "id:storage-preview");
     press(&mut ui.app, "cancel-storage");
-    wait(&mut ui.app, "text:单独存放");
+    press(&mut ui.app, "reset-runtime-directory");
+    wait(&mut ui.app, "id:storage-preview");
+    press(&mut ui.app, "storage-mode-future");
+    wait(&mut ui.app, "text:确认下载位置");
+    press(&mut ui.app, "storage-apply");
+    wait(&mut ui.app, "id:choose-runtime-directory");
+    gone(&mut ui.app, "id:reset-runtime-directory");
+    assert_eq!(ui.commands.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn candidate_download_preserves_the_bound_root_until_the_next_preview_is_confirmed() {
+    let mut view = ready_view();
+    view["storage"] = storage("/tools", "/original");
+    let mut ui = Scripted::new(view, |cmd, v| {
+        assert_eq!(
+            cmd,
+            &json!({"kind":"prepareCandidateImage","resourceId":"r34","previewId":1,"acceptedLicenses":true})
+        );
+        let p = &mut v["preparation"];
+        p["currentComponent"] = json!("r34");
+        p["phase"] = json!("downloading");
+        p["candidateTarget"] = json!("/target/r14");
+        p["candidateDownloadedBytes"] = json!(524288);
+        json!({"status":"accepted"})
+    });
+    ui.channel.handle("windroid.pickResource", |call| {
+        call.resolve(json!("/target"))
+    });
+    let first = std::sync::atomic::AtomicBool::new(true);
+    ui.channel.handle("windroid.previewStorage", move |call| {
+        let missing = first.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let mut plan = storage_plan(call.data(), if missing { 1 } else { 2 });
+        plan["versions"] = json!([{"id":"r34", "name":"Android 14 · r14", "source":"/original/r14", "target":"/target/r14",
+            "status":if missing {"missing"} else {"reuse"}, "bytes":1048576, "downloadable":missing, "cleanup":false, "detail":""}]);
+        plan["blockers"] = if missing {json!(["目标缺少 r14"])} else {json!([])};
+        call.resolve(plan);
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-settings");
+    press(&mut ui.app, "settings-storage");
+    press(&mut ui.app, "choose-image-directory");
+    wait(&mut ui.app, "id:download-candidate-r34");
+    assert!(ui.commands.lock().unwrap().is_empty());
+    press(&mut ui.app, "download-candidate-r34");
+    wait(&mut ui.app, "text:512 KiB / 1.0 MiB");
+    ui.update(|v| {
+        let p = &mut v["preparation"];
+        p["phase"] = json!("ready");
+        p["candidateTarget"] = Value::Null;
+        p["currentComponent"] = Value::Null;
+    });
+    gone(&mut ui.app, "id:pause-candidate");
+    assert!(!ui.app.screen().enabled("id:storage-apply").unwrap());
+    press(&mut ui.app, "storage-recheck");
+    wait(&mut ui.app, "text:可原地复用");
+    assert!(ui.app.screen().enabled("id:storage-apply").unwrap());
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    assert_eq!(
+        ui.state.lock().unwrap()["storage"]["imageRoot"],
+        "/original"
+    );
 }
 
 #[test]
 fn preview_from_an_old_workspace_view_cannot_restore_another_roots_location() {
     let mut view = ready_view();
-    view["storage"] = json!({"home":"/home","runtimeRoot":"/old","sdk":"/old/sdk","images":"/old/sdk/system-images","imagesInherited":true,"borrowed":false});
+    view["storage"] = storage("/old", "/local");
     let mut ui = Scripted::new(view, |_, _| unreachable!());
     ui.channel.handle("windroid.pickResource", |call| {
         call.resolve(json!("/images"))
@@ -763,12 +849,13 @@ fn preview_from_an_old_workspace_view_cannot_restore_another_roots_location() {
     let first = std::sync::atomic::AtomicBool::new(true);
     ui.channel.handle("windroid.previewStorage", move |call| {
         if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            assert_eq!(call.data()["expected"], json!({"runtimeRoot":"/old","imageRoot":null}));
-            state.lock().unwrap()["storage"] = json!({"home":"/home","runtimeRoot":"/fresh","sdk":"/fresh/sdk","images":"/fresh/sdk/system-images","imagesInherited":true,"borrowed":false});
+            assert_eq!(call.data()["expected"], json!({"runtimeRoot":"/old","imageRoot":"/local"}));
+            state.lock().unwrap()["storage"] = storage("/fresh","/local");
             call.reject("原存储位置已改变");
         } else {
-            assert_eq!(call.data(), &json!({"runtimeRoot":"/fresh","imageRoot":"/images","expected":{"runtimeRoot":"/fresh","imageRoot":null}}));
-            call.resolve(json!({"runtimeRoot":"/fresh","imageRoot":"/images","files":[],"blockers":[],"previewId":2}));
+            assert_eq!(call.data(), &json!({"runtimeRoot":"/fresh","imageRoot":"/images","expected":{"runtimeRoot":"/fresh","imageRoot":"/local"}, "mode":"use","cleanup":false}));
+            let plan = storage_plan(call.data(), 2);
+            call.resolve(plan);
         }
     });
     wait(&mut ui.app, "id:library");
@@ -1328,7 +1415,7 @@ fn window_settings_share_the_native_close_choice() {
 fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
     let mut view = ready_view();
     let root = "/Volumes/Studio External Drive/开发与测试/Windroid/运行资源".to_string();
-    let long_path = format!("{root}/sdk/system-images/android-35/google_apis_playstore/arm64-v8a");
+    let long_path = format!("{root}/system-images/android-35/google_apis_playstore/arm64-v8a/r9");
     view["preparation"]["images"] = json!([
         image("r33", 33, false),
         image("r35", 35, false),
@@ -1337,15 +1424,16 @@ fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
     ]);
     view["preparation"]["images"][3]["borrowed"] = json!(true);
     view["preparation"]["images"][1]["location"] = json!(long_path);
-    view["storage"] = json!({"home":"/tmp/home","runtimeRoot":root,"sdk":format!("{root}/sdk"),
-        "images":long_path,"imagesInherited":false,"borrowed":false});
+    view["storage"] = storage(&root, &long_path);
     let mut ui = Scripted::new(view, |_, _| unreachable!());
     ui.channel
         .handle("windroid.pickResource", |call| call.resolve(json!("/new")));
     ui.channel.handle("windroid.previewStorage", move |call| {
-        let files: Vec<_> = (0..16).map(|i| json!({"source":format!("{long_path}/source-{i}.img"),
-            "target":format!("/Volumes/Another External Volume/Relocated Images/android-35/google_apis_playstore/arm64-v8a/source-{i}.img"),"bytes":2048})).collect();
-        call.resolve(json!({"runtimeRoot":"/new","imageRoot":null,"previewId":1,"blockers":[],"files":files}));
+        let mut plan = storage_plan(call.data(),1);
+        plan["versions"] = json!((0..16).map(|i| json!({"id":format!("id-{i}"),"name":format!("版本 {i}"), "source":format!("{long_path}/r{i}"),
+            "target":format!("/Volumes/Another External Volume/Relocated Images/android-35/google_apis_playstore/arm64-v8a/r{i}"),"bytes":2048,
+            "cleanup":false,"downloadable":false,"status":"reuse","detail":""})).collect::<Vec<_>>());
+        call.resolve(plan);
     });
     ui.app
         .set_viewport(Size::new(Points(420.0), Points(520.0)))
