@@ -1,6 +1,7 @@
 //! AppKit 独占窗口注册表。工作线程上报的每条消息携带打开代次，旧流的迟到
 //! 回调不能影响同键的新窗口。后台恢复在旧显示完成迁移和回收后才新建显示。
 
+mod pickers;
 mod registry;
 mod state;
 
@@ -18,6 +19,7 @@ use nsh_platform_macos::objc2::rc::Retained;
 use nsh_platform_macos::objc2_app_kit::NSOpenPanel;
 
 use crate::streaming::{Notice, Source, Worker};
+use pickers::ApkPickers;
 use registry::{MAX_APP_WINDOWS, Registry, Route};
 use state::{ActivityWatch, Preferences, QuitState};
 
@@ -51,7 +53,7 @@ struct Manager {
     preferences: Preferences,
     channel: HostChannel,
     events: Sender<WindowEvent>,
-    picker: Option<Retained<NSOpenPanel>>,
+    pickers: ApkPickers<Retained<NSOpenPanel>>,
     _termination: Option<Retained<surface::TerminationDelegate>>,
 }
 
@@ -99,7 +101,7 @@ pub fn install(
             preferences: Preferences::load(&home),
             channel,
             events,
-            picker: None,
+            pickers: ApkPickers::new(),
             _termination: surface::TerminationDelegate::install(mtm),
         });
     });
@@ -461,18 +463,19 @@ impl Manager {
     }
 
     fn pick(&mut self, mtm: MainThreadMarker, instance_id: String, instance_name: &str) {
-        if let Some(panel) = &self.picker {
-            panel.makeKeyAndOrderFront(None);
-            return;
-        }
-        self.picker = Some(surface::pick_apk(mtm, instance_name, move |path| {
-            let instance_id = instance_id.clone();
-            post(move |manager, _mtm| {
-                manager.picker = None;
-                if let Some(path) = path {
-                    manager.send(WindowEvent::ApkPicked { instance_id, path });
-                }
-            });
-        }));
+        self.pickers.show(
+            instance_id,
+            |target| {
+                surface::pick_apk(mtm, instance_name, move |path| {
+                    let target = target.clone();
+                    post(move |manager, _| {
+                        if let Some(event) = manager.pickers.finish(target, path) {
+                            manager.send(event);
+                        }
+                    });
+                })
+            },
+            |panel| panel.makeKeyAndOrderFront(None),
+        );
     }
 }
