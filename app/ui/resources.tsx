@@ -1,4 +1,4 @@
-import { computed, openUrl, Scroll, signal, Text, View, windowSize } from "nsh";
+import { computed, effect, openUrl, Scroll, signal, Text, View, windowSize } from "nsh";
 import { Dialog } from "nsh/base";
 import { Button, card, colors, Detail, Heading, row } from "./controls";
 import { activeTransfer, busy, report, send, type Component, type Integrity } from "./model";
@@ -67,16 +67,31 @@ export function writeIssue(item: Component): string {
 }
 
 export function ResourceHealth(props: { item: Component }) {
-  const reviewed = signal<string | null>(null);
+  const reviewed = signal<{ id: string; location: string; token: string } | null>(null);
+  const changed = signal(false);
   const locked = computed(() => busy() || activeTransfer());
-  const repairable = computed(() => props.item.integrity === "damaged");
-  const confirming = computed(() => repairable() && reviewed() === props.item.location);
+  const damaged = computed(() => props.item.integrity === "damaged");
+  const confirming = computed(() => {
+    const r = reviewed();
+    return !!r && damaged() && r.id === props.item.id && r.location === props.item.location && r.token === props.item.repairToken;
+  });
   const reason = computed(() => writeIssue(props.item));
+  // 换盘、换目录或修复状态变化时，旧确认失效；即使原资源随后接回也必须重新查看。
+  effect(() => {
+    if (reviewed() && !confirming()) { reviewed.set(null); changed.set(true); }
+  });
+  function review() {
+    const item = props.item;
+    if (!damaged() || !item.repairToken || locked() || reason()) return;
+    changed.set(false);
+    reviewed.set({ id: item.id, location: item.location, token: item.repairToken });
+  }
   function repair() {
-    if (locked() || !confirming() || reason()) return;
+    const original = reviewed();
+    if (!original || locked() || !confirming() || reason()) return;
     reviewed.set(null);
-    void send({ kind: "repairResource", resourceId: props.item.id, location: props.item.location,
-      acceptedLicenses: true, confirmed: true }, "重新安装 " + props.item.name);
+    void send({ kind: "repairResource", resourceId: original.id, location: original.location,
+      repairToken: original.token, acceptedLicenses: true, confirmed: true }, "重新安装 " + props.item.name);
   }
   return <View style={{ gap: 5 }}>
     <Location path={props.item.location} />
@@ -85,13 +100,15 @@ export function ResourceHealth(props: { item: Component }) {
     {!props.item.ready && props.item.integrity !== "conflict" ? <Detail text={"需额外空间 · " + size(props.item.requiredBytes) +
       (props.item.availableBytes === null ? "    可用空间未知" : "    可用 · " + size(props.item.availableBytes))} /> : null}
     {!props.item.ready && reason() ? <Detail text={reason()} /> : null}
+    {damaged() && !props.item.repairToken ? <Detail text="尚未确认目标卷及目录身份，请重新检查。" /> :
+      damaged() && changed() ? <Detail text="目标卷或版本状态已变化，请重新确认。" /> : null}
     <View style={row}>
       <LicenseLink item={props.item} />
       {props.item.integrity !== "missing" ? <Button id={"verify-" + props.item.id} label="完整核验" disabled={locked()}
         accessibilityLabel={"完整核验 " + props.item.name + " " + props.item.version}
         press={() => send({ kind: "verifyResource", resourceId: props.item.id }, "完整核验 " + props.item.name)} /> : null}
-      {repairable() && !confirming() ? <Button id={"repair-" + props.item.id} label="重新安装此版本…" danger
-        disabled={locked() || !!reason()} press={() => reviewed.set(props.item.location)} /> : null}
+      {damaged() && !confirming() ? <Button id={"repair-" + props.item.id} label="重新安装此版本…" danger
+        disabled={locked() || !!reason() || !props.item.repairToken} press={review} /> : null}
     </View>
     {confirming() ? <View testID={"repair-review-" + props.item.id} style={{ padding: 10, borderRadius: 8, gap: 6, backgroundColor: colors().warnBg }}>
       <Heading text={"重新安装 " + props.item.name + " · " + props.item.version} />

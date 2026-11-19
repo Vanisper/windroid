@@ -383,7 +383,7 @@ impl Scripted {
 fn image(id: &str, api: u32, ready: bool) -> Value {
     json!({"id":id, "name":format!("Android API {api}"), "version":"14", "source":"https://example.org/image.zip",
         "license":"镜像许可", "licenseUrl":"https://example.org/terms", "licenseText":"镜像许可条款", "sizeBytes":1048576,
-        "ready":ready, "location":"/tmp/images", "integrity":if ready {"quick"} else {"missing"},
+        "ready":ready, "location":"/tmp/images","repairToken":null, "integrity":if ready {"quick"} else {"missing"},
         "writable":true,"requiredBytes":if ready {0} else {3145728},"availableBytes":1073741824, "downloadedBytes":0, "issue":null,
         "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a","revision":14},"minEmulator":"34.0.0"})
 }
@@ -402,7 +402,7 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
     view["selectedId"] = Value::Null;
     view["preparation"] = json!({"phase":"missing","components":[{"id":"image","name":"系统镜像","version":"34","source":"https://example.org/image.zip",
         "license":"镜像许可","licenseUrl":"https://example.org/terms","licenseText":"镜像完整许可正文","sizeBytes":1048576,"ready":false,
-        "location":"/tmp/runtime","integrity":"missing","writable":true,"requiredBytes":3145728,"availableBytes":1073741824}],
+        "location":"/tmp/runtime","integrity":"missing","repairToken":null,"writable":true,"requiredBytes":3145728,"availableBytes":1073741824}],
         "currentComponent":null,"downloadedBytes":0,"totalBytes":1048576,"candidateTarget":null,"candidateDownloadedBytes":null,"error":null});
     let mut ui = Scripted::new(view, |cmd, view| {
         let p = &mut view["preparation"];
@@ -490,6 +490,7 @@ fn full_verification_then_repair_requires_consent_for_the_reviewed_version_and_l
                 preparation["phase"] = json!("failed");
                 let target = &mut preparation["components"][0];
                 target["integrity"] = json!("damaged");
+                target["repairToken"] = json!("original-volume-and-tree");
                 target["issue"] = json!("aapt 文件内容 SHA-256 不符");
                 target["ready"] = json!(false);
             }
@@ -497,9 +498,10 @@ fn full_verification_then_repair_requires_consent_for_the_reviewed_version_and_l
                 assert_eq!(
                     cmd,
                     &json!({"kind":"repairResource","resourceId":"tool",
-                    "location":"/Volumes/Windroid/build-tools/34.0.0","confirmed":true,"acceptedLicenses":true})
+                    "location":"/Volumes/Windroid/build-tools/34.0.0","repairToken":"replacement-volume-and-tree","confirmed":true,"acceptedLicenses":true})
                 );
                 preparation["components"][0]["integrity"] = json!("verified");
+                preparation["components"][0]["repairToken"] = Value::Null;
                 preparation["components"][0]["ready"] = json!(true);
                 preparation["components"][0]["issue"] = Value::Null;
                 preparation["componentsReady"] = json!(true);
@@ -518,6 +520,40 @@ fn full_verification_then_repair_requires_consent_for_the_reviewed_version_and_l
     press(&mut ui.app, "repair-tool");
     wait(&mut ui.app, "id:repair-review-tool >> text:/Volumes/");
     press(&mut ui.app, "cancel-repair-tool");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    press(&mut ui.app, "repair-tool");
+    // 同一挂载点直接换成第二个非空版本身份，也会撤销已经展开的确认。
+    ui.update(|s| {
+        s["preparation"]["components"][0]["repairToken"] = json!("replacement-volume-and-tree");
+    });
+    wait(&mut ui.app, "text:/目标卷或版本状态已变化/");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    press(&mut ui.app, "repair-tool");
+    ui.update(|s| {
+        s["preparation"]["components"][0]["repairToken"] = Value::Null;
+    });
+    wait(&mut ui.app, "text:/尚未确认目标卷及目录身份/");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    assert!(!ui.app.screen().enabled("id:repair-tool").unwrap());
+    ui.update(|s| {
+        s["preparation"]["components"][0]["repairToken"] = json!("replacement-volume-and-tree");
+    });
+    wait(&mut ui.app, "text:/目标卷或版本状态已变化/");
+    press(&mut ui.app, "repair-tool");
+    ui.update(|s| s["preparation"]["components"][0]["location"] = json!("/other/34.0.0"));
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    ui.update(|s| {
+        s["preparation"]["components"][0]["location"] =
+            json!("/Volumes/Windroid/build-tools/34.0.0")
+    });
+    wait(&mut ui.app, "text:/Volumes/");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    press(&mut ui.app, "repair-tool");
+    ui.update(|s| s["preparation"]["components"][0]["integrity"] = json!("conflict"));
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    ui.update(|s| s["preparation"]["components"][0]["integrity"] = json!("damaged"));
+    wait(&mut ui.app, "id:repair-tool");
+    gone(&mut ui.app, "id:confirm-repair-tool");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
     press(&mut ui.app, "repair-tool");
     press(&mut ui.app, "confirm-repair-tool");
@@ -715,7 +751,7 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     view["preparation"]["componentsReady"] = json!(false);
     view["preparation"]["phase"] = json!("missing");
     view["preparation"]["components"] = json!([{"id":"emulator","name":"Android Emulator","version":"37",
-        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"integrity":"missing","requiredBytes":3072,"writable":true,"availableBytes":65536}]);
+        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"integrity":"missing","repairToken":null,"requiredBytes":3072,"writable":true,"availableBytes":65536}]);
     let mut ui = Scripted::new(view, |cmd, v| {
         assert_eq!(
             cmd,
@@ -877,11 +913,78 @@ fn storage_reviews_each_version_and_cleanup_choice_then_restores_each_root_indep
     assert_eq!(ui.commands.lock().unwrap().len(), 2);
 }
 
+fn temporary_ui_dir(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "windroid-ui-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+fn real_resource_ui(home: &std::path::Path) -> (Headless, Arc<host::Library>) {
+    let config = config();
+    let (windows, _) = mpsc::channel();
+    let (_events, receiver) = mpsc::channel();
+    let library = host::Library::attach(
+        config.host.clone(),
+        runtime::Layout { root: home.into() },
+        false,
+        windows,
+        receiver,
+    )
+    .unwrap();
+    (render(config), library)
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replacing_the_directory_after_review_rejects_a_real_host_repair_without_writing() {
+    let temp = temporary_ui_dir("repair");
+    let home = temp.join("workspace");
+    runtime::workspace::open(&home).unwrap();
+    let version = home.join("runtime/scrcpy-server/5.0.1");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("scrcpy-server.jar"), b"first copy").unwrap();
+    let (mut app, library) = real_resource_ui(&home);
+    wait(&mut app, "id:show-environment");
+    press(&mut app, "show-environment");
+    press(&mut app, "repair-scrcpy-server");
+    wait(&mut app, "id:confirm-repair-scrcpy-server");
+    let previous = temp.join("saved-original");
+    std::fs::rename(&version, &previous).unwrap();
+    std::fs::create_dir(&version).unwrap();
+    std::fs::write(version.join("scrcpy-server.jar"), b"other copy").unwrap();
+    // 没有向界面发送刷新事件，确认携带的是先前看到的对象。
+    press(&mut app, "confirm-repair-scrcpy-server");
+    wait(&mut app, "text:/重新确认/");
+    gone(&mut app, "id:pending");
+    assert_eq!(
+        std::fs::read(version.join("scrcpy-server.jar")).unwrap(),
+        b"other copy"
+    );
+    assert_eq!(
+        std::fs::read(previous.join("scrcpy-server.jar")).unwrap(),
+        b"first copy"
+    );
+    assert_eq!(
+        std::fs::read_dir(version.parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+    library.shutdown();
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
 #[test]
 fn restoring_a_default_through_another_spelling_uses_the_real_host_directory_identity() {
     use runtime::storage::{StorageLocations, SwitchMode, apply, preview_switch};
-    let temp = std::env::temp_dir().join(format!("windroid-ui-root-{}", std::process::id()));
-    std::fs::create_dir(&temp).unwrap();
+    let temp = temporary_ui_dir("default-root");
     let physical = temp.join("physical");
     std::fs::create_dir(&physical).unwrap();
     std::os::unix::fs::symlink(&physical, temp.join("alias")).unwrap();
@@ -896,18 +999,7 @@ fn restoring_a_default_through_another_spelling_uses_the_real_host_directory_ide
         &preview_switch(&home, &target, SwitchMode::Future, false).unwrap(),
     )
     .unwrap();
-    let config = config();
-    let (windows, _) = mpsc::channel();
-    let (_events, receiver) = mpsc::channel();
-    let library = host::Library::attach(
-        config.host.clone(),
-        runtime::Layout { root: home.clone() },
-        false,
-        windows,
-        receiver,
-    )
-    .unwrap();
-    let mut app = render(config);
+    let (mut app, library) = real_resource_ui(&home);
     wait(&mut app, "id:show-settings");
     press(&mut app, "show-settings");
     press(&mut app, "settings-storage");

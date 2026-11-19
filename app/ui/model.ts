@@ -34,7 +34,7 @@ export type Integrity = "missing" | "quick" | "verified" | "damaged" | "conflict
 export interface Component {
   id: string; name: string; version: string; source: string; sizeBytes: number; ready: boolean;
   license: string; licenseUrl: string; licenseText?: string;
-  location: string; downloadedBytes: number; integrity: Integrity; issue: string | null;
+  location: string; downloadedBytes: number; integrity: Integrity; repairToken: string | null; issue: string | null;
   writable: boolean; requiredBytes: number; availableBytes: number | null;
   image: InstanceConfig["image"] | null; minEmulator: string | null;
 }
@@ -86,7 +86,7 @@ type Command =
   | { kind: "prepareCandidateImage"; previewId: number; resourceId: string; acceptedLicenses: true }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
   | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
-  | { kind: "repairResource"; resourceId: string; location: string; acceptedLicenses: true; confirmed: true }
+  | { kind: "repairResource"; resourceId: string; location: string; repairToken: string; acceptedLicenses: true; confirmed: true }
   | { kind: "verifyResource"; resourceId: string }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
   | { kind: "pausePreparation" | "recheckRuntime" }

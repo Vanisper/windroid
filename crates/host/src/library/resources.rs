@@ -58,7 +58,7 @@ impl Library {
         json!({
             "phase":"ready", "componentsReady":true, "components":[],
             "images":[{"id":"system-image","name":"Android 14 Google Play","version":"14",
-                "image":demo_image(),"ready":true,"location":"内存演示环境","integrity":"verified","writable":false,"requiredBytes":0,"availableBytes":null,"issue":null,
+                "image":demo_image(),"ready":true,"location":"内存演示环境","integrity":"verified","repairToken":null,"writable":false,"requiredBytes":0,"availableBytes":null,"issue":null,
                 "sizeBytes":0,"downloadedBytes":0,"source":"","license":"演示资源","licenseUrl":""}],
             "currentComponent":null,"candidateTarget":null,"candidateDownloadedBytes":null, "downloadedBytes":0, "totalBytes":0, "error":null
         })
@@ -118,7 +118,14 @@ impl Library {
                 if data["confirmed"] != true || data["location"] != json!(row.location) {
                     return Err(error("资源位置已变化或尚未确认，请重新确认此版本及路径"));
                 }
-                p.repair_at(id, &row.location)
+                let token = data["repairToken"]
+                    .as_str()
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| error("请重新检查并确认要修复的版本"))?;
+                if row.integrity != "damaged" || row.repair_token.as_deref() != Some(token) {
+                    return Err(error("目标卷或版本状态已变化，请重新确认"));
+                }
+                p.repair_confirmed(id, &row.location, token)
             }
             "pausePreparation" => p.pause(),
             _ => unreachable!("unknown resource action"),
