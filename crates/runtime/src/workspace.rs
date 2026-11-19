@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const FORMAT: &str = "workspace-format";
 const VERSION: &[u8] = b"windroid-workspace-v2\n";
@@ -57,6 +57,39 @@ fn entries(path: &Path) -> io::Result<Vec<OsString>> {
     fs::read_dir(path)?
         .map(|entry| entry.map(|e| e.file_name()))
         .collect()
+}
+
+fn entry_type(path: &Path) -> io::Result<Option<fs::FileType>> {
+    match fs::symlink_metadata(path) {
+        Ok(info) => Ok(Some(info.file_type())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 旧版可把工作区的 system-images 选为镜像根。只探测旧发布清单的三个 ABI 目录，
+/// 不跟随层级链接，不打开镜像、扫描修订内容或访问设置引用的外部目录。
+fn legacy_image_item(root: &Path) -> io::Result<Option<PathBuf>> {
+    let marker = root.join(".windroid-workspace");
+    if entry_type(&marker)?.is_some() {
+        return Ok(Some(marker));
+    }
+    'package: for api in ["android-33", "android-34", "android-35"] {
+        let mut dir = root.to_owned();
+        for name in [api, "google_apis_playstore", "arm64-v8a"] {
+            dir.push(name);
+            if !entry_type(&dir)?.is_some_and(|kind| kind.is_dir()) {
+                continue 'package;
+            }
+        }
+        for name in ["source.properties", "system.img"] {
+            let path = dir.join(name);
+            if entry_type(&path)?.is_some_and(|kind| kind.is_file()) {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn inspect(home: &Path) -> io::Result<Workspace> {
@@ -140,10 +173,18 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
     if value != VERSION {
         return Err(unknown("工作区版本记录损坏或不受支持"));
     }
-    for dir in ["logs", "system-images"] {
-        if has(dir) {
-            plain(&home.join(dir), true).map_err(unknown)?;
+    if has("system-images") {
+        let root = home.join("system-images");
+        plain(&root, true).map_err(unknown)?;
+        if let Some(path) = legacy_image_item(&root).map_err(unknown)? {
+            return Err(unknown(format!(
+                "新格式工作区内存在旧镜像布局：{}",
+                path.display()
+            )));
         }
+    }
+    if has("logs") {
+        plain(&home.join("logs"), true).map_err(unknown)?;
     }
     access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
     for name in ["instances", "preferences", "cache", "storage-cleanup-v2"] {

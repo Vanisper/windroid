@@ -165,3 +165,77 @@ fn missing_ancestor_cannot_redirect_initialization_into_an_old_workspace() {
     assert!(workspace::open(&temp.0.join("missing/../old")).is_err());
     assert_eq!(tree(&temp.0), before);
 }
+
+#[test]
+fn current_marker_with_an_unversioned_image_is_rejected_without_writes() {
+    let temp = support::Temp::create();
+    let home = temp.0.join("home");
+    workspace::open(&home).unwrap();
+    let root = home.join("system-images");
+    let spec = support::spec("compact-720");
+    for (api, filename) in [
+        (33, "system.img"),
+        (34, "source.properties"),
+        (35, "system.img"),
+    ] {
+        let parent = root
+            .join(format!("android-{api}"))
+            .join(&spec.image.tag)
+            .join(&spec.image.abi);
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(filename);
+        fs::write(&path, b"preserve old payload").unwrap();
+        let before = tree(&temp.0);
+        let problem = workspace::open(&home).unwrap_err().to_string();
+        assert!(
+            problem.contains("无法确认工作区格式") && problem.contains(filename),
+            "{problem}"
+        );
+        assert_eq!(tree(&temp.0), before);
+        fs::remove_file(path).unwrap();
+    }
+    fs::write(root.join(".windroid-workspace"), b"previous owner").unwrap();
+    let before = tree(&temp.0);
+    assert!(
+        workspace::open(&home)
+            .unwrap_err()
+            .to_string()
+            .contains(".windroid-workspace")
+    );
+    assert_eq!(tree(&temp.0), before);
+}
+
+#[test]
+fn mixed_image_check_stays_inside_default_legacy_package_directories() {
+    let temp = support::Temp::create();
+    let home = temp.0.join("home");
+    workspace::open(&home).unwrap();
+    let image = support::spec("compact-720").image;
+    let abi = Path::new(&image.tag).join(&image.abi);
+    let root = home.join("system-images");
+    let parent = root.join("android-34").join(&abi);
+    fs::create_dir_all(parent.join("r14")).unwrap();
+    fs::write(parent.join("r14/system.img"), b"revision payload").unwrap();
+    fs::write(parent.join("readme"), b"user note").unwrap();
+    let external = temp.0.join("manual-images");
+    let target = external.join("android-33").join(&abi);
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        target.join("source.properties"),
+        b"unrelated manual package",
+    )
+    .unwrap();
+    symlink(external.join("android-33"), root.join("android-33")).unwrap();
+    let config = windroid_locations::StorageLocations {
+        image_root: external,
+        ..windroid_locations::StorageLocations::defaults(&home)
+    };
+    fs::write(
+        home.join(windroid_locations::SETTINGS),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let before = tree(&temp.0);
+    assert_eq!(workspace::inspect(&home).unwrap(), Workspace::Current);
+    assert_eq!(tree(&temp.0), before);
+}
