@@ -20,7 +20,6 @@ use serde_json::json;
 
 use crate::{
     SnapshotView,
-    groups::Groups,
     names,
     surface::{WindowCommand, WindowEvent, WindowKey},
 };
@@ -115,10 +114,8 @@ pub struct Library {
     channel: HostChannel,
     windows: mpsc::Sender<WindowCommand>,
     state: Mutex<ViewState>,
-    groups: Mutex<Groups>,
     sequence: AtomicU64,
     starting: Mutex<()>,
-    group_writer: Mutex<()>,
     stopping: AtomicBool,
     /// 只有测试挂载的单实例允许省略路由键。
     fixture: bool,
@@ -133,7 +130,7 @@ impl Library {
         windows: mpsc::Sender<WindowCommand>,
         events: mpsc::Receiver<WindowEvent>,
     ) -> Result<Arc<Self>, String> {
-        let library = Self::new(channel, layout, fake, windows, false)?;
+        let library = Self::new(channel, layout, fake, windows, false);
         if let Some(store) = &library.store {
             for record in store.list().map_err(|e| e.to_string())? {
                 library.add_record(record);
@@ -167,14 +164,9 @@ impl Library {
         fake: bool,
         windows: mpsc::Sender<WindowCommand>,
         fixture: bool,
-    ) -> Result<Arc<Self>, String> {
-        let groups = if fake {
-            Groups::default()
-        } else {
-            Groups::load(&layout.root).map_err(|e| format!("读取应用分组失败：{e}"))?
-        };
+    ) -> Arc<Self> {
         let physical_mib = runtime::instances::physical_memory_mib().unwrap_or(8192);
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             recommended_template: if physical_mib <= 8192 {
                 "compact-720"
             } else {
@@ -185,14 +177,12 @@ impl Library {
             layout,
             channel,
             windows,
-            groups: Mutex::new(groups),
             state: Mutex::default(),
             sequence: AtomicU64::new(0),
             starting: Mutex::new(()),
-            group_writer: Mutex::new(()),
             stopping: AtomicBool::new(false),
             fixture,
-        }))
+        })
     }
 
     pub(crate) fn fixture(channel: HostChannel, handle: Handle, events: Events) -> Arc<Self> {
@@ -205,8 +195,7 @@ impl Library {
             true,
             windows,
             true,
-        )
-        .unwrap();
+        );
         let id = handle.id().to_string();
         library.add(id.clone(), handle, events, None);
         library.state.lock().unwrap().selected = Some(id);
@@ -386,7 +375,6 @@ impl Library {
             view.capabilities.create = false;
             view.capabilities.start = false;
         }
-        self.groups.lock().unwrap().apply(&id, &mut view.groups);
         let mut out = crate::to_json(&view);
         out["instances"] = state
             .instances

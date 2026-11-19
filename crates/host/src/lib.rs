@@ -19,7 +19,6 @@ use device::Handle;
 use nsh_engine::{HostChannel, JsonValue};
 
 pub mod actions;
-mod groups;
 mod library;
 pub use library::Library;
 pub mod surface;
@@ -161,7 +160,7 @@ pub struct SnapshotView {
     pub stuck_at: Option<&'static str>,
     /// 当前可执行的操作。界面按钮的禁用以此为准，不自己判断状态。
     pub capabilities: contract::Capabilities,
-    /// 应用库分组。界面直接渲染，不自己判断归属。
+    /// 按 Android 包来源划分的应用目录，省略没有成员的类别。
     pub groups: Vec<GroupView>,
     /// 桌面状态（哪些能当桌面、当前是谁）。界面用它在卡片上标记。
     ///
@@ -179,10 +178,7 @@ pub struct DesktopView {
     pub candidate_labels: BTreeMap<String, String>,
 }
 
-/// 一个应用分组。
-///
-/// 分组规则留在宿主：它依赖 AppEntry 的三个判定（系统/能否启动/能否作桌面），
-/// 界面复制这套判断必然漂移。
+/// 应用目录中的一个来源类别。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupView {

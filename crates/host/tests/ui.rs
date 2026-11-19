@@ -171,51 +171,41 @@ fn windows_follow_the_instance_through_background_restore_and_quit() {
 }
 
 #[test]
-fn custom_group_membership_is_local_and_deleting_a_group_restores_its_apps() {
+fn launchable_packages_open_from_both_source_sections() {
     let mut ui = LibraryUi::new();
-    let first = ui.create();
+    let instance = ui.create();
     ui.start();
     let app = &mut ui.app;
-    press(app, "show-groups");
-    press(app, "new-group");
-    app.type_text("id:group-name", "工作").unwrap();
-    press(app, "save-group");
-    wait(app, "text:这个分组还没有应用");
-    gone(app, "id:pending");
-    press(app, "group-all");
-    app.right_click("id:app-com.example.reader").unwrap();
-    choose(app, "移至工作");
-    gone(app, "id:pending");
-    press(app, "group-group-1");
-    wait(app, "id:section-installed >> id:app-com.example.reader");
-    gone(app, "id:section-system");
-
-    // 默认展示按包来源归类，旧分组的成员仍在正确的来源区，宿主保留自建关系。
-    press(app, "show-groups");
-    wait(app, "id:section-installed >> id:app-com.example.reader");
-    wait(app, "id:section-system >> id:app-com.example.launcher");
-    let groups = ui.library.snapshot()["groups"].as_array().unwrap().clone();
+    for (source, package, actions) in [
+        ("installed", READER, vec!["打开", "结束进程", "清除数据"]),
+        ("system", "com.example.launcher", vec!["打开"]),
+    ] {
+        let tile = format!("id:section-{source} >> id:app-{package}");
+        wait(app, &tile);
+        assert_eq!(app.screen().count(&format!("id:app-{package}")).unwrap(), 1);
+        assert!(app.screen().enabled(&tile).unwrap());
+        app.right_click(&tile).unwrap();
+        let labels: Vec<_> = app
+            .menu()
+            .unwrap()
+            .into_iter()
+            .map(|action| action.label)
+            .collect();
+        assert_eq!(labels, actions);
+        choose(app, "打开");
+        gone(app, "id:pending");
+    }
+    gone(app, "role:button[分组]");
+    press(app, "panel-tasks");
+    wait(app, "id:focus-com.example.reader");
+    wait(app, "id:focus-com.example.launcher");
+    let snapshot = ui.library.snapshot();
+    let tasks = snapshot["running"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
     assert!(
-        groups
+        tasks
             .iter()
-            .any(|g| g["name"] == "工作" && g["apps"][0]["package"] == READER)
-    );
-    press(app, "new-instance");
-    ui.create();
-    press(&mut ui.app, "show-groups");
-    gone(&mut ui.app, "text:工作");
-    press(&mut ui.app, &format!("instance-{first}"));
-    wait(&mut ui.app, "id:app-com.example.reader");
-    gone(&mut ui.app, "id:pending");
-    press(&mut ui.app, "show-groups");
-    press(&mut ui.app, "group-group-1");
-    press(&mut ui.app, "delete-group");
-    wait(&mut ui.app, "text:删除「工作」分组？");
-    press(&mut ui.app, "confirm-action");
-    gone(&mut ui.app, "id:group-group-1");
-    wait(
-        &mut ui.app,
-        "id:section-installed >> id:app-com.example.reader",
+            .all(|task| task["instanceId"] == instance && task["windowOpen"] == true)
     );
 }
 

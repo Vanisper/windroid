@@ -21,7 +21,7 @@ export interface Action {
   label: string; enabled: boolean; reason: string | null; destructive: boolean;
 }
 export interface AppItem { package: string; label: string; system: boolean; launchable: boolean; actions: Action[] }
-export interface Group { id: string; name: string; count: number; apps: AppItem[] }
+interface AppSection { id: "installed" | "system"; name: string; count: number; apps: AppItem[] }
 export interface RunningApp { instanceId: string; package: string; label: string; windowOpen: boolean }
 export interface Component {
   id: string; name: string; version: string; source: string; sizeBytes: number; ready: boolean;
@@ -58,7 +58,7 @@ export interface Snapshot {
   id: string; state: DeviceState; summary: string; stuckAt: string | null;
   capabilities: Record<Capability, boolean>; facts: { adbVisible: boolean; services: { activity: boolean; package: boolean; window: boolean } };
   catalogStatus?: { kind: "pending" | "ready" | "failed"; message?: string };
-  groups: Group[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
+  groups: AppSection[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
   instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string;
   storage?: { home: string; sdk: string; images: string };
@@ -69,9 +69,6 @@ type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "r
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
   | { kind: "createInstance"; name: string; template: string }
-  | { kind: "createGroup"; instanceId: string; name: string }
-  | { kind: "deleteGroup"; instanceId: string; groupId: string }
-  | { kind: "moveApp"; instanceId: string; package: string; groupId: string }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
   | { kind: "pausePreparation" | "recheckRuntime" }
   | { kind: DeviceCommand; instanceId: string }
