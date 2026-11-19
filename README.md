@@ -50,7 +50,7 @@ Rust 负责实例进程、每实例的设备状态、scrcpy 5.0.1 协议和 macO
 
 四个共享模块已在 Linux ARM64 容器中通过 `npm test`。从 macOS 运行 `npm run check` 并指定目标，也已通过 Linux x86_64 和 Windows x86_64（MSVC）的交叉编译检查。GitHub Actions 工作流为 Linux、Windows 和 macOS 配置了同一条 `npm test` 命令。adb 进程与协议回环的集成用例使用 Unix 夹具，像素解码用例使用 macOS VideoToolbox。[核心测试工作流](.github/workflows/core.yml)
 
-macOS 上的工作区测试覆盖实例状态、APK 安装、双显示协议、VideoToolbox 像素解码、窗口回收和应用库交互。需要真实模拟器的用例单独运行。实测记录包含[私有实例的冷启动与快照恢复](docs/实测/01-运行环境域.md)、[主屏与应用窗口的尺寸和输入](docs/实测/03-流域.md)，以及[从应用库安装、切换桌面和关窗](docs/实测/04-呈现域.md)。
+macOS 上的工作区测试覆盖实例状态、APK 安装、双显示协议、VideoToolbox 像素解码、窗口回收和应用库交互。需要真实模拟器的用例单独运行。[工作区保护与版本启动](docs/实测/06-工作区保护与版本启动.md)记录原生首次打开、双窗口及跨卷迁移的复现方法。其他实测包含[私有实例的冷启动与快照恢复](docs/实测/01-运行环境域.md)、[主屏与应用窗口的尺寸和输入](docs/实测/03-流域.md)，以及[从应用库安装、切换桌面和关窗](docs/实测/04-呈现域.md)。
 
 - [产品形态与交互](docs/产品/01-产品形态与交互.md)
 - macOS 桌面设计：[可交互原型](output/design/Windroid-Prototype.html)可下载后用浏览器打开，从「原型导览」选择场景；[可编辑设计稿](output/design/Windroid-macOS.pen)保留各状态的布局。原生客户端的使用方式见上文。
