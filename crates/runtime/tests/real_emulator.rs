@@ -318,7 +318,7 @@ fn resource_limits_use_each_installed_revision_and_its_final_display() {
 }
 
 #[test]
-#[ignore = "使用全新 WINDROID_HOME、受管运行组件与 Android 14 镜像开机两次"]
+#[ignore = "使用全新 WINDROID_HOME、受管运行组件与 Android 14 镜像验证冷重启与改配后开机"]
 fn stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot() {
     use runtime::instances::{GraphicsMode, Hardware};
     if isolated(
@@ -371,6 +371,22 @@ fn stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot() {
         &record,
         "echo retained > /data/local/tmp/windroid-hardware",
     );
+    let retained = "cat /data/local/tmp/windroid-hardware";
+    assert_eq!(guest(&backend, &record, retained), "retained");
+    guest::start_and_wait(
+        &layout,
+        &record,
+        &mut backend,
+        &mut facts,
+        Command::Restart { cold: true },
+    );
+    assert_eq!(guest(&backend, &record, retained), "retained");
+    guest(
+        &backend,
+        &record,
+        "echo edited > /data/local/tmp/windroid-hardware",
+    );
+    assert_eq!(guest(&backend, &record, retained), "edited");
     stop(&mut backend, &mut facts);
     store.update_hardware(&record.id, second).unwrap();
     let reopened = InstanceStore::new(layout.clone());
@@ -386,7 +402,7 @@ fn stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot() {
     );
     assert_eq!(
         guest(&backend, &saved, "cat /data/local/tmp/windroid-hardware"),
-        "retained"
+        "edited"
     );
     stop(&mut backend, &mut facts);
 }

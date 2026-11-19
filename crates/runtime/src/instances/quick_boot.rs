@@ -125,3 +125,57 @@ pub(super) fn saved(dir: &Path, record: &InstanceRecord) -> io::Result<bool> {
     };
     Ok(stamp(dir, record)?.as_ref() == Some(&receipt))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract::{Image, InstanceId, Spec};
+    use std::path::PathBuf;
+
+    #[test]
+    fn skipping_uses_the_receipt_or_invalidation_for_this_exact_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "windroid-snapshot-{}",
+            super::super::nonce().unwrap()
+        ));
+        let record = InstanceRecord {
+            id: InstanceId::new("test"),
+            name: "test".into(),
+            port: 5554,
+            avd_name: "wd-test".into(),
+            spec: Spec {
+                template: "phone-1080".into(),
+                image: Image {
+                    api: 34,
+                    revision: 14,
+                    abi: concat!("arm64", "-v8a").into(),
+                    tag: "google_apis_playstore".into(),
+                },
+                disk_bytes: 6 << 30,
+            },
+        };
+        let snapshot: PathBuf = data_dir(&dir, &record).join("snapshots/default_boot/snapshot.pb");
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        allow_skip(&dir, &record).unwrap();
+        fs::write(&snapshot, "old snapshot").unwrap();
+        assert!(invalidate(&dir, &record).is_err());
+        assert!(!requires_cold_start(&dir, &record).unwrap());
+        record_save(&dir, &record, None, true).unwrap();
+        invalidate(&dir, &record).unwrap();
+        assert!(requires_cold_start(&dir, &record).unwrap());
+        allow_skip(&dir, &record).unwrap();
+
+        // 宿主在新快照落盘与签发凭证之间退出。新快照需正常恢复，不能被旧标记跳过。
+        fs::write(&snapshot, "a newly written snapshot").unwrap();
+        assert!(!requires_cold_start(&dir, &record).unwrap());
+        assert!(allow_skip(&dir, &record).is_err());
+        record_save(&dir, &record, None, true).unwrap();
+        allow_skip(&dir, &record).unwrap();
+        // 兼容只记录「这份快照已因改配失效」的早期空标记。
+        fs::remove_file(dir.join(DISK_SYNCED)).unwrap();
+        fs::write(dir.join(STALE), "").unwrap();
+        assert!(requires_cold_start(&dir, &record).unwrap());
+        allow_skip(&dir, &record).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

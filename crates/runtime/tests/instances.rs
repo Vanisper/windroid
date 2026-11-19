@@ -233,6 +233,9 @@ while :; do sleep 60; done
 if [ "$1" = version ]; then echo "Android Debug Bridge version 1.0.41"; exit; fi
 printf '%s\n' "$4" >> "$WINDROID_BACKEND_TEST_DIR/calls"
 case "$4" in
+  *windroid-disk-synced*)
+    if test -e "$WINDROID_BACKEND_TEST_DIR/sync-error"; then exit 1; fi
+    echo windroid-disk-synced ;;
   'getprop ro.boot.qemu.avd_name') cat "$WINDROID_BACKEND_TEST_DIR/identity" ;;
   'getprop ro.boot.qemu.avd_name; getprop sys.boot_completed; service list')
     cat "$WINDROID_BACKEND_TEST_DIR/identity"; echo; echo 1; cat "$WINDROID_BACKEND_TEST_DIR/services" ;;
@@ -461,11 +464,29 @@ esac
         assert!(args.contains(&format!("{flag}\n{value}\n")));
     }
     assert!(!args.contains("someone-elses-avd") && !args.contains("-no-snapshot"));
+    // 没有任何旧快照时，运行中的冷重启也不能丢掉尚未刷盘的当前会话。
+    let pid_before_sync = fs::read_to_string(&pid_marker).unwrap();
+    fs::write(root.join("sync-error"), "").unwrap();
+    let rejected = backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap_err();
+    assert!(matches!(rejected, Rejection::Error { detail, .. } if detail.contains("刷盘")));
+    assert_eq!(fs::read_to_string(&pid_marker).unwrap(), pid_before_sync);
     fs::write(root.join("save-on-exit"), "").unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(store.quick_boot_saved(&a.id).unwrap());
     assert!(facts.allocation.is_none());
+    // 普通停止仍回收离线或刷盘失败的实例。未确认的快照只能先正常恢复。
+    let rejected = backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap_err();
+    assert!(matches!(rejected, Rejection::Error { detail, .. } if detail.contains("先正常启动")));
+    assert!(!pid_marker.exists());
+    fs::remove_file(root.join("sync-error")).unwrap();
+    backend.exec(&Command::Start, &mut facts).unwrap();
+    await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    backend.exec(&Command::Stop, &mut facts).unwrap();
     // 下一次退出时若没有写入，磁盘上残留的旧快照不能让界面误报“已冻结”。
     fs::remove_file(root.join("save-on-exit")).unwrap();
     // 从已停止状态明确要求冷启动；启动仍需重新申请整笔预留。
