@@ -2,8 +2,10 @@
 use std::path::Path;
 use std::{fs, io};
 
+use super::{Hardware, HostCapacity};
 use super::{InstanceRecord, InstanceStore, data_dir, image_subdir, invalid};
 use crate::SessionResources;
+use crate::admission::{Budget, Demand, Reservation};
 use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -47,8 +49,66 @@ pub(crate) struct OwnedEmulator {
     launched: SystemTime,
     pid_file: PathBuf,
     _lease: File,
+    reservation: Reservation,
     pub resources: Arc<SessionResources>,
     pub record: InstanceRecord,
+}
+
+fn launch_requirements(
+    store: &InstanceStore,
+    record: &InstanceRecord,
+    paths: &crate::provision::RuntimePaths,
+) -> io::Result<(Hardware, Demand, Budget)> {
+    let host = HostCapacity::read()?;
+    let hardware = store.launch_hardware_at(record, paths, host)?;
+    let demand = Demand {
+        cores: hardware.cpu_cores,
+        ram_mib: hardware.ram_mib,
+    };
+    let budget = Budget {
+        logical_cores: host.logical_cores,
+        physical_mib: host.physical_mib,
+    };
+    Ok((hardware, demand, budget))
+}
+
+fn launch_paths(
+    dir: &Path,
+    record: &InstanceRecord,
+    paths: &crate::provision::RuntimePaths,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let image = paths.images.join(image_subdir(&record.spec.image)?);
+    for part in ["system.img", "vendor.img", "ramdisk.img", "kernel-ranchu"] {
+        if !image.join(part).is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("系统镜像缺少 {}", image.join(part).display()),
+            ));
+        }
+    }
+    let data = data_dir(dir, record);
+    let pointer = dir.join("avd").join(format!("{}.ini", record.avd_name()));
+    if data.canonicalize()? != data
+        || pointer.canonicalize()? != pointer
+        || !data.join("config.ini").is_file()
+    {
+        return Err(invalid("无法确认实例私有 AVD 目录"));
+    }
+    let text = fs::read_to_string(pointer)?;
+    let mut actual = text.lines().filter_map(|line| line.strip_prefix("path="));
+    if actual.next().map(Path::new) != Some(data.as_path()) || actual.next().is_some() {
+        return Err(invalid("AVD 指针与该实例的数据目录不符"));
+    }
+    for entry in fs::read_dir(&data)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            return Err(invalid(format!(
+                "私有 AVD 中存在外部链接 {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok((image, data))
 }
 
 impl OwnedEmulator {
@@ -57,42 +117,16 @@ impl OwnedEmulator {
         id: &InstanceId,
         port: u16,
         active: &crate::ActiveRuntime,
+        cold: bool,
     ) -> io::Result<Self> {
         let (record, dir, lease) = store.lease(id, port)?;
         let resources = active.acquire(store.home(), &record.spec.image)?;
         let paths = &resources.paths;
-        let image = paths.images.join(image_subdir(&record.spec.image)?);
-        for part in ["system.img", "vendor.img", "ramdisk.img", "kernel-ranchu"] {
-            if !image.join(part).is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("系统镜像缺少 {}", image.join(part).display()),
-                ));
-            }
-        }
-        let data = data_dir(&dir, &record);
-        let pointer = dir.join("avd").join(format!("{}.ini", record.avd_name()));
-        if data.canonicalize()? != data
-            || pointer.canonicalize()? != pointer
-            || !data.join("config.ini").is_file()
-        {
-            return Err(invalid("无法确认实例私有 AVD 目录"));
-        }
-        let text = fs::read_to_string(pointer)?;
-        let mut actual = text.lines().filter_map(|line| line.strip_prefix("path="));
-        if actual.next().map(Path::new) != Some(data.as_path()) || actual.next().is_some() {
-            return Err(invalid("AVD 指针与该实例的数据目录不符"));
-        }
-        for entry in fs::read_dir(&data)? {
-            let entry = entry?;
-            if entry.file_type()?.is_symlink() {
-                return Err(invalid(format!(
-                    "私有 AVD 中存在外部链接 {}",
-                    entry.path().display()
-                )));
-            }
-        }
+        let (image, data) = launch_paths(&dir, &record, paths)?;
+        let (hardware, demand, budget) = launch_requirements(store, &record, paths)?;
         adb::ensure_server(&paths.adb)?;
+        // adb 服务启动可能等待握手。完成后才读取宿主状态、取得额度并启动子进程。
+        let reservation = active.admission.reserve(port, demand, budget)?;
         super::avd::sync_image(&data, &image)?;
         let log = OpenOptions::new()
             .create(true)
@@ -121,18 +155,26 @@ impl OwnedEmulator {
             .arg(&data)
             .arg("-data")
             .arg(data.join("userdata-qemu.img"))
-            .args(["-no-window", "-no-audio", "-no-boot-anim", "-gpu"])
-            .arg("host")
+            .args(["-no-window", "-no-audio", "-no-boot-anim"])
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        // 版本锁随 QEMU 子进程继续有效，包括宿主异常退出后模拟器仍在运行的情形。
+        hardware.graphics.apply(&mut cmd);
+        if cold || super::quick_boot::requires_cold_start(&dir)? {
+            cmd.arg("-no-snapshot-load");
+        }
+        // 版本锁与额度预留随 QEMU 子进程继续有效，包括宿主异常退出后模拟器仍在运行的情形。
         // 在 fork 后仅修改子进程自己的 fd 标志。其他子进程沿用 CLOEXEC 默认值。
-        let version_fds: Vec<_> = resources._leases.iter().map(AsRawFd::as_raw_fd).collect();
+        let inherited_fds: Vec<_> = resources
+            ._leases
+            .iter()
+            .chain([&reservation.file, &lease])
+            .map(AsRawFd::as_raw_fd)
+            .collect();
         unsafe {
             cmd.pre_exec(move || {
-                for fd in &version_fds {
+                for fd in &inherited_fds {
                     if libc::fcntl(*fd, libc::F_SETFD, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -142,39 +184,71 @@ impl OwnedEmulator {
         }
         super::quick_boot::clear(&dir)?;
         let pid_file = dir.join("active.pid");
-        let mut pid = File::create_new(&pid_file)?;
         let launched = SystemTime::now();
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                fs::remove_file(&pid_file)?;
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("无法启动 {}：{e}", paths.emulator.display()),
-                ));
-            }
-        };
+        let child = cmd.spawn().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("无法启动 {}：{e}", paths.emulator.display()),
+            )
+        })?;
         let owned = Self {
             child,
             launched,
             pid_file,
             _lease: lease,
+            reservation,
             resources,
             record,
         };
-        // 先构造 RAII owner，写入 PID 失败也能回收刚启动的进程组。
-        writeln!(pid, "{}", owned.child.id())?;
-        pid.sync_all()?;
+        // 子进程已继承 run.lock。即使宿主在 spawn 与发布 PID 之间退出，也受运行锁保护。
+        // 使用同目录暂存文件，下一次打开只能看到完整 PID 或尚未发布的状态。
+        let temporary = dir.join(format!(".pid-{}", super::nonce()?));
+        let result = (|| {
+            let mut file = File::create_new(&temporary)?;
+            writeln!(file, "{}", owned.child.id())?;
+            file.sync_all()?;
+            fs::rename(&temporary, &owned.pid_file)
+        })();
+        if let Err(e) = result {
+            let _ = fs::remove_file(temporary);
+            return Err(e);
+        }
         Ok(owned)
+    }
+
+    pub fn check_replacement(
+        &self,
+        store: &InstanceStore,
+        active: &crate::ActiveRuntime,
+    ) -> io::Result<()> {
+        // 此时原模拟器及其版本租约仍存活。未通过的预检不会发送停止信号或清理窗口。
+        let record = store.get(&self.record.id)?;
+        let resources = active.resolve_versions(store.home(), &record.spec.image)?;
+        let dir = self.pid_file.parent().unwrap();
+        launch_paths(dir, &record, &resources.paths)?;
+        super::quick_boot::requires_cold_start(dir)?;
+        let (_, demand, budget) = launch_requirements(store, &record, &resources.paths)?;
+        adb::ensure_server(&resources.paths.adb)?;
+        active
+            .admission
+            .check_replacement(&self.reservation, demand, budget)
     }
 
     pub fn alive(&mut self) -> io::Result<bool> {
         Ok(self.child.try_wait()?.is_none())
     }
 
-    pub fn allocation(&self) -> Option<GuestAllocation> {
+    pub fn allocation(
+        &mut self,
+        admission: &crate::admission::Admission,
+    ) -> Option<GuestAllocation> {
         let avd = data_dir(self.pid_file.parent()?, &self.record);
-        super::hardware::allocation(&avd.join("hardware-qemu.ini"), self.launched)
+        let actual = super::hardware::allocation(&avd.join("hardware-qemu.ini"), self.launched)?;
+        if let Err(e) = admission.reconcile(&mut self.reservation, actual) {
+            log::warn!("无法更新实例 {} 的活动规格：{e}", self.record.id);
+            return None;
+        }
+        Some(actual)
     }
 
     // 未回收且仍存活的子进程持有 PID；要求它是我们新建的进程组组长。
@@ -237,6 +311,7 @@ impl Drop for OwnedEmulator {
         match self.stop(false) {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
+                let _ = self.reservation.file.unlock();
             }
             Err(e) => log::warn!("回收实例 {} 时无法确认进程退出：{e}", self.record.id),
         }

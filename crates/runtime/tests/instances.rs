@@ -192,6 +192,20 @@ fn bounded_device_backend_checks_ports_process_identity_and_services() {
         ] {
             fs::write(image.join(part), part).unwrap();
         }
+        fs::write(
+            image.join("build.prop"),
+            concat!(
+                "ro.build.version.sdk=34\nro.product.cpu.abi=arm64",
+                "-v8a\nro.build.flavor=sdk_gphone64_arm64-user\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(paths.emulator.parent().unwrap()).unwrap();
+        fs::write(
+            paths.emulator.parent().unwrap().join("source.properties"),
+            "Pkg.Revision=37.2.13\nPkg.BuildId=16740729\n",
+        )
+        .unwrap();
         executable(
             &paths.emulator,
             r#"#!/bin/sh
@@ -266,6 +280,19 @@ esac
     let fixture = runtime::ActiveRuntime::new(|home, _| {
         Ok((runtime::provision::RuntimePaths::discover(home), Vec::new()))
     });
+    let pressure_path = root.join("pressure-critical");
+    let fixture = fixture.with_admission(runtime::admission::Admission::new(
+        root.join("admission"),
+        move || {
+            use runtime::admission::{MemoryObservation, MemoryPressure};
+            let pressure = if pressure_path.exists() {
+                MemoryPressure::Critical
+            } else {
+                MemoryPressure::Normal
+            };
+            MemoryObservation::current(pressure, 16 << 10)
+        },
+    ));
     let mut backend = EmulatorBackend::with_runtime(a.id.clone(), layout.clone(), a.port, fixture);
     let mut facts = Facts::default();
     backend.observe(&mut facts);
@@ -296,11 +323,30 @@ esac
     assert!(backend.exec(&Command::Start, &mut facts).is_err());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(pid_marker.exists());
-    fs::remove_file(pid_marker).unwrap();
+    fs::remove_file(&pid_marker).unwrap();
+    // 在已经预留后制造 spawn 失败。恢复可执行文件后同一实例应能立即再次申请。
+    let emulator = runtime::provision::RuntimePaths::discover(&root).emulator;
+    let unavailable = emulator.with_extension("disabled");
+    fs::rename(&emulator, &unavailable).unwrap();
+    let failure = backend.exec(&Command::Start, &mut facts).unwrap_err();
+    assert!(matches!(failure, Rejection::Error { detail, .. } if detail.contains("无法启动")));
+    assert!(!facts.process_alive && !pid_marker.exists());
+    fs::rename(unavailable, emulator).unwrap();
     let hardware = avd(&root, &a).join("hardware-qemu.ini");
     fs::write(&hardware, "hw.cpu.ncore=8\nhw.ramSize=8192").unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
     assert!(store.delete(&a.id).is_err());
+    // 重启替换预检失败必须让旧子进程、私有运行锁和会话路径继续有效。
+    let original_pid = fs::read_to_string(&pid_marker).unwrap();
+    fs::write(root.join("pressure-critical"), b"1").unwrap();
+    let rejection = backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap_err();
+    assert!(matches!(rejection, Rejection::Error { detail, .. } if detail.contains("内存压力")));
+    assert!(facts.process_alive);
+    assert_eq!(fs::read_to_string(&pid_marker).unwrap(), original_pid);
+    assert!(backend.active_runtime().current().is_some());
+    fs::remove_file(root.join("pressure-critical")).unwrap();
     let mut another = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
     assert!(
         another
@@ -398,10 +444,22 @@ esac
     assert!(facts.allocation.is_none());
     // 下一次退出时若没有写入，磁盘上残留的旧快照不能让界面误报“已冻结”。
     fs::remove_file(root.join("save-on-exit")).unwrap();
-    backend.exec(&Command::Start, &mut facts).unwrap();
+    // 从已停止状态明确要求冷启动；启动仍需重新申请整笔预留。
+    backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     await_observation(&mut backend, &mut facts, |f| f.services.ready());
     assert!(facts.allocation.is_none());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !fs::read_to_string(root.join("args"))
+        .unwrap()
+        .lines()
+        .any(|s| s == "-no-snapshot-load")
+    {
+        assert!(Instant::now() < deadline, "冷启动参数未交给子进程");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     assert_eq!(backend.catalog_status(), CatalogStatus::Pending);

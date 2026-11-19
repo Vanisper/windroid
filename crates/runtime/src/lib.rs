@@ -100,6 +100,7 @@ type ResourceResolver = fn(&Path, &contract::Image) -> io::Result<(RuntimePaths,
 pub struct ActiveRuntime {
     current: Arc<Mutex<Weak<SessionResources>>>,
     resolve: ResourceResolver,
+    admission: admission::Admission,
 }
 
 impl Default for ActiveRuntime {
@@ -114,7 +115,13 @@ impl ActiveRuntime {
         Self {
             current: Default::default(),
             resolve,
+            admission: Default::default(),
         }
+    }
+
+    pub fn with_admission(mut self, admission: admission::Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn acquire(
@@ -122,13 +129,21 @@ impl ActiveRuntime {
         home: &std::path::Path,
         image: &contract::Image,
     ) -> io::Result<Arc<SessionResources>> {
-        let (paths, leases) = (self.resolve)(home, image)?;
-        let resources = Arc::new(SessionResources {
-            paths,
-            _leases: leases,
-        });
+        let resources = self.resolve_versions(home, image)?;
         *self.current.lock().unwrap() = Arc::downgrade(&resources);
         Ok(resources)
+    }
+
+    fn resolve_versions(
+        &self,
+        home: &Path,
+        image: &contract::Image,
+    ) -> io::Result<Arc<SessionResources>> {
+        let (paths, leases) = (self.resolve)(home, image)?;
+        Ok(Arc::new(SessionResources {
+            paths,
+            _leases: leases,
+        }))
     }
 
     pub fn current(&self) -> Option<Arc<SessionResources>> {
@@ -266,11 +281,11 @@ impl EmulatorBackend {
         Ok(false)
     }
 
-    fn start(&mut self, facts: &mut Facts) -> io::Result<()> {
+    fn start(&mut self, cold: bool, facts: &mut Facts) -> io::Result<()> {
         if self.live()? {
             return Ok(());
         }
-        let process = OwnedEmulator::start(&self.store, &self.id, self.port, &self.active)?;
+        let process = OwnedEmulator::start(&self.store, &self.id, self.port, &self.active, cold)?;
         self.record = Some(process.record.clone());
         self.process = Some(process);
         self.reset_catalog();
@@ -372,7 +387,9 @@ impl EmulatorBackend {
                     });
                 }
             }
-            Cmd::Create { .. } | Cmd::Delete | Cmd::Start | Cmd::Stop => unreachable!(),
+            Cmd::Create { .. } | Cmd::Delete | Cmd::Start | Cmd::Restart { .. } | Cmd::Stop => {
+                unreachable!()
+            }
         }
         Ok(())
     }
@@ -417,7 +434,19 @@ impl Backend for EmulatorBackend {
                 self.reset_catalog();
                 *facts = Facts::default();
             }
-            Cmd::Start => self.start(facts).map_err(io_rejection)?,
+            Cmd::Start => self.start(false, facts).map_err(io_rejection)?,
+            Cmd::Restart { cold } => {
+                if self.live().map_err(io_rejection)? {
+                    self.process
+                        .as_ref()
+                        .unwrap()
+                        .check_replacement(&self.store, &self.active)
+                        .map_err(io_rejection)?;
+                    self.stop(true, facts).map_err(io_rejection)?;
+                    facts.stop_requested = true;
+                }
+                self.start(*cold, facts).map_err(io_rejection)?;
+            }
             Cmd::Stop => {
                 self.stop(true, facts).map_err(io_rejection)?;
                 facts.stop_requested = true;
@@ -468,7 +497,10 @@ impl Backend for EmulatorBackend {
                 .allocation
                 .is_none_or(|a| a.cpu_cores.is_none() || a.ram_mib.is_none())
         {
-            facts.allocation = self.process.as_ref().and_then(OwnedEmulator::allocation);
+            facts.allocation = self
+                .process
+                .as_mut()
+                .and_then(|p| p.allocation(&self.active.admission));
         }
         self.next_probe = Some(
             Instant::now()

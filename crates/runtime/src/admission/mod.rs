@@ -5,7 +5,7 @@ mod observation;
 pub use observation::{MemoryObservation, MemoryPressure};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -97,7 +97,11 @@ impl Admission {
             };
             let file = lock_file(&entry.path())?;
             match file.try_lock() {
-                Ok(()) => continue, // 上次进程已退出，其旧记录不占额度。
+                Ok(()) => {
+                    // 显式解锁，避免并发 fork 短暂继承这个只用于检查的文件描述符。
+                    file.unlock()?;
+                    continue;
+                }
                 Err(std::fs::TryLockError::WouldBlock) => (),
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
@@ -153,6 +157,32 @@ impl Admission {
         serde_json::to_writer(&mut file, &grant)?;
         file.flush()?;
         Ok(Reservation { file, grant })
+    }
+
+    /// 同一启动回读到 QEMU 最终参数后，以真实分配计入后续共享额度。
+    pub(crate) fn reconcile(
+        &self,
+        current: &mut Reservation,
+        actual: contract::GuestAllocation,
+    ) -> io::Result<()> {
+        let prior = current.grant.demand;
+        let cores = actual.cpu_cores.unwrap_or(prior.cores);
+        let ram_mib = actual.ram_mib.unwrap_or(prior.ram_mib);
+        if cores == prior.cores && ram_mib == prior.ram_mib {
+            return Ok(());
+        }
+        let _guard = self.lock()?;
+        let updated = Grant {
+            demand: Demand { cores, ram_mib },
+            ..current.grant
+        };
+        // 与读取同锁。写入中断留下不可解析的活动记录，其他启动会等待修复或退出。
+        current.file.rewind()?;
+        current.file.set_len(0)?;
+        serde_json::to_writer(&mut current.file, &updated)?;
+        current.file.flush()?;
+        current.grant = updated;
+        Ok(())
     }
 
     pub(crate) fn check_replacement(
