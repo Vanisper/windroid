@@ -90,6 +90,17 @@ struct Shared {
     transfer: Mutex<Option<Child>>,
 }
 
+/// fork 到 exec 之间，其他线程创建的子进程可能临时继承描述符。
+/// 在发布或恢复完成后显式解锁，以便紧接着进行的共享核验或手动续传可取得租约。
+struct Leases(Vec<fs::File>);
+impl Drop for Leases {
+    fn drop(&mut self) {
+        for file in self.0.iter().rev() {
+            let _ = file.unlock();
+        }
+    }
+}
+
 struct Owner {
     worker: Arc<Shared>,
 }
@@ -333,7 +344,7 @@ impl Provisioner {
         if let Err(e) = std::thread::Builder::new()
             .name("windroid-provision".into())
             .spawn(move || {
-                let _leases = leases;
+                let _leases = Leases(leases);
                 worker.run(&selected, task, &paths, candidate_job);
             })
         {
@@ -423,8 +434,13 @@ fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
         if let Some(error) = &paths.config_error {
             return Err(io::Error::new(ErrorKind::InvalidInput, error.clone()));
         }
-        crate::storage::check_volume(&location)?;
+        crate::storage::check_selected_volume(home, paths.installation_root(pkg))?;
         if archive::is_workspace(&stage) && stage.join("publish.json").try_exists()? {
+            for existing in [&location, &stage.join("previous")] {
+                if fs::symlink_metadata(existing).is_ok() {
+                    manifest::repairable(existing, pkg)?;
+                }
+            }
             return Err(invalid("此版本的发布中断，请确认恢复此版本"));
         }
         directory(
@@ -432,11 +448,14 @@ fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
             location.parent().unwrap(),
             false,
         )?;
-        let _lease = crate::storage::version_read_lease(&location)?;
-        if manifest::empty_skeleton(&location, pkg)? {
-            return Ok("missing");
-        }
-        manifest::check(home, &location, pkg, false, || Ok(()))
+        let lease = crate::storage::version_read_lease(&location)?;
+        let result = match manifest::empty_skeleton(&location, pkg) {
+            Ok(true) => Ok("missing"),
+            Ok(false) => manifest::check(home, &location, pkg, false, || Ok(())),
+            Err(e) => Err(e),
+        };
+        let _ = lease.unlock();
+        result
     })();
     let (integrity, issue) = match checked {
         Ok(mode) => (mode, None),
@@ -444,7 +463,8 @@ fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
             if e.kind() == ErrorKind::NotFound
                 && fs::symlink_metadata(&location)
                     .is_err_and(|e| e.kind() == ErrorKind::NotFound)
-                && crate::storage::check_volume(&location).is_ok() =>
+                && crate::storage::check_selected_volume(home, paths.installation_root(pkg))
+                    .is_ok() =>
         {
             ("missing", None)
         }
@@ -472,7 +492,9 @@ fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
         prefix_bytes(paths, pkg)
     };
     let (license, license_url, license_text) = pkg.license();
-    let volume = volume_info(location.parent().unwrap()).ok();
+    let volume = crate::storage::check_selected_volume(home, paths.installation_root(pkg))
+        .and_then(|_| volume_info(location.parent().unwrap()))
+        .ok();
     Component {
         id: pkg.id,
         name: pkg.name,
@@ -505,6 +527,27 @@ fn required_bytes(pkg: Artifact, prefix: u64) -> u64 {
         .saturating_sub(prefix)
         .saturating_add(pkg.unpacked)
         .saturating_add(4 * 1024 * 1024)
+}
+
+fn check_capacity(parent: &Path, pkg: Artifact, prefix: u64) -> io::Result<()> {
+    let (available, writable) = volume_info(parent)?;
+    if !writable {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("目标位置不可写：{}", parent.display()),
+        ));
+    }
+    let required = required_bytes(pkg, prefix);
+    if required > available {
+        return Err(io::Error::new(
+            ErrorKind::StorageFull,
+            format!(
+                "目标卷空间不足，需要 {required} 字节，可用 {available} 字节：{}",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn volume_info(path: &Path) -> io::Result<(u64, bool)> {
@@ -614,7 +657,12 @@ impl Shared {
         if candidate {
             snap.current_component = current;
             snap.candidate_target = state.snapshot.candidate_target.clone();
-            snap.candidate_downloaded_bytes = state.snapshot.candidate_downloaded_bytes;
+            let pkg = packages[0];
+            snap.candidate_downloaded_bytes = Some(if result.is_ok() {
+                pkg.bytes
+            } else {
+                prefix_bytes(paths, pkg)
+            });
             snap.phase = "ready";
         } else if result.is_ok() {
             for row in snap
@@ -633,7 +681,16 @@ impl Shared {
                     "failed"
                 };
             if snap.phase == "failed" {
-                snap.error = Some(e.to_string());
+                let reason = match e.raw_os_error() {
+                    Some(libc::EIO | libc::ENXIO | libc::ENODEV | libc::ESTALE) => {
+                        format!("目标卷读写失败，请重新挂载后手动继续。{e}")
+                    }
+                    Some(libc::ENOSPC | libc::EDQUOT) => {
+                        format!("目标卷可用空间不足，请释放空间后手动继续。{e}")
+                    }
+                    _ => e.to_string(),
+                };
+                snap.error = Some(reason);
             }
         }
         state.active = false;
@@ -660,9 +717,10 @@ impl Shared {
         let parent = dest.parent().expect("version directory");
         if matches!(task, Task::Verify) {
             self.phase(pkg, "verifying");
-            let _lease = crate::storage::version_read_lease(&dest)?;
-            manifest::check(&self.home, &dest, pkg, true, || self.check_pause())?;
-            return Ok(());
+            let lease = crate::storage::version_read_lease(&dest)?;
+            let result = manifest::check(&self.home, &dest, pkg, true, || self.check_pause());
+            let _ = lease.unlock();
+            return result.map(|_| ());
         }
         let check = || {
             self.check_pause()?;
@@ -676,30 +734,28 @@ impl Shared {
                 pkg.image_spec.is_some(),
             )?;
         }
+        let selected_volume = || {
+            if candidate {
+                crate::storage::check_volume(&dest)
+            } else {
+                crate::storage::check_selected_volume(&self.home, paths.installation_root(pkg))
+            }
+        };
+        selected_volume()?;
         let prefix = if matches!(task, Task::Import(_)) {
             0
         } else {
             prefix_bytes(paths, pkg)
         };
-        let (available, writable) = volume_info(parent)?;
-        let required = required_bytes(pkg, prefix);
-        if !writable {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                format!("目标位置不可写：{}", parent.display()),
-            ));
-        }
-        if required > available {
-            return Err(io::Error::new(
-                ErrorKind::StorageFull,
-                format!(
-                    "目标卷空间不足，需要 {required} 字节，可用 {available} 字节：{}",
-                    parent.display()
-                ),
-            ));
+        let stage_path = archive::stage_path(&dest, pkg);
+        let recovering =
+            archive::is_workspace(&stage_path) && stage_path.join("publish.json").try_exists()?;
+        // 已经换入的新版本只需复查和回收备份，不要求再腾出一份完整解压空间。
+        if !recovering {
+            check_capacity(parent, pkg, prefix)?;
         }
         directory(paths.installation_root(pkg), parent, true)?;
-        let _leases = crate::storage::version_write_lease(&dest)?;
+        let mut leases = Leases(crate::storage::version_write_lease(&dest)?);
         let (stage, _lock) = archive::workspace(&dest, pkg)?;
         use std::os::unix::fs::MetadataExt;
         let owner = _lock.metadata()?;
@@ -716,15 +772,16 @@ impl Shared {
             Ok(())
         };
         guard()?;
-        let initially_missing = !dest.try_exists()?;
-        archive::recover(&self.home, &stage, &dest, pkg)?;
-        let _restored = if initially_missing && dest.try_exists()? {
-            Some(crate::storage::lock_staged_version(&dest)?)
-        } else {
-            None
-        };
+        selected_volume()?;
+        if let Some(restored) = archive::recover(&self.home, &stage, &dest, pkg)? {
+            leases.0.push(restored);
+        }
         if dest.try_exists()? {
             if manifest::check(&self.home, &dest, pkg, false, || self.check_pause()).is_ok() {
+                let part = partial(&stage, pkg);
+                if download::part_len(&part)? > 0 {
+                    fs::remove_file(part)?;
+                }
                 self.progress(pkg, pkg.bytes);
                 return Ok(());
             }
@@ -735,6 +792,9 @@ impl Shared {
                     dest.display()
                 )));
             }
+        }
+        if recovering {
+            check_capacity(parent, pkg, prefix)?;
         }
         let part = partial(&stage, pkg);
         let input = if let Task::Import(source) = task {
@@ -757,6 +817,7 @@ impl Shared {
         self.phase(pkg, "installing");
         // 下载、逐块解压与复制的写错误直接返回；发布前再次检查挂载，防止弹盘后落在系统盘。
         guard()?;
+        selected_volume()?;
         archive::install(
             &self.home,
             &stage,
@@ -764,7 +825,7 @@ impl Shared {
             &dest,
             pkg,
             matches!(task, Task::Repair(_)),
-            &guard,
+            guard,
         )?;
         guard()?;
         if part.try_exists()? {

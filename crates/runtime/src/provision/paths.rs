@@ -42,7 +42,7 @@ impl ManagedPackage {
             self.artifact.version
         )
     }
-    pub(crate) fn bytes(&self) -> u64 {
+    pub(crate) fn unpacked_bytes(&self) -> u64 {
         self.artifact.unpacked
     }
     /// 调用方在整个使用期间持有版本对象的共享租约。
@@ -220,12 +220,7 @@ pub(super) fn validate_payload(dest: &Path, pkg: Artifact) -> io::Result<()> {
         directory(dest, path.parent().expect("relative component file"), false)?;
         let meta = regular(&path)
             .map_err(|e| io::Error::new(e.kind(), format!("{}：{e}", path.display())))?;
-        if executable
-            && CATALOG
-                .iter()
-                .any(|official| official.digest.hex() == pkg.digest.hex())
-            && !has_arm64(&path)?
-        {
+        if executable && !has_arm64(&path)? {
             return Err(invalid(format!(
                 "宿主可执行文件缺少 arm64 架构：{}",
                 path.display()

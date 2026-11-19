@@ -292,6 +292,8 @@ fn checksum_mismatch_discards_the_partial_and_preserves_live_data() {
     assert_eq!(fs::read(&p.paths().server_jar).unwrap(), b"old");
 }
 
+const HOST_ARM64: &[u8] = b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01fixture";
+const ARM_EXECUTABLE: &[(&str, u64)] = &[("adb", HOST_ARM64.len() as u64)];
 fn zip_fixture(entries: &[(&str, &[u8], u32)]) -> (Artifact, Vec<u8>) {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for &(name, body, mode) in entries {
@@ -331,7 +333,7 @@ fn zip_fixture(entries: &[(&str, &[u8], u32)]) -> (Artifact, Vec<u8>) {
         kind: Kind::Adb,
         id: "platform-tools",
         prefix: Some("platform-tools"),
-        essentials: &[("adb", 7)],
+        essentials: ARM_EXECUTABLE,
         unpacked: entries.iter().map(|(_, b, _)| b.len() as u64).sum(),
         ..fixture(&bytes, "https://example.invalid".into())
     };
@@ -367,7 +369,7 @@ fn staged_sdk_payload_is_checked_before_publish_and_on_each_scan() {
             b"Pkg.Revision=1\n",
             0o644,
         ),
-        ("platform-tools/adb", b"fixture", 0o755),
+        ("platform-tools/adb", HOST_ARM64, 0o755),
     ]);
     stage(&t.0, pkg, &bytes);
     let p = controller(&t.0, pkg);
@@ -375,7 +377,7 @@ fn staged_sdk_payload_is_checked_before_publish_and_on_each_scan() {
     let snap = settled(&p);
     assert_eq!(snap.phase, "ready", "{:?}", snap.error);
     let adb = p.paths().destination(pkg).join("adb");
-    assert_eq!(fs::read(&adb).unwrap(), b"fixture");
+    assert_eq!(fs::read(&adb).unwrap(), HOST_ARM64);
     fs::set_permissions(&adb, fs::Permissions::from_mode(0o644)).unwrap();
     p.recheck().unwrap();
     assert_eq!(p.snapshot().components[0].integrity, "damaged");
@@ -400,7 +402,7 @@ fn staged_sdk_payload_is_checked_before_publish_and_on_each_scan() {
 
 #[test]
 fn invalid_archive_or_version_never_replaces_the_installed_directory() {
-    let adb: (&str, &[u8], u32) = ("platform-tools/adb", b"fixture", 0o755);
+    let adb: (&str, &[u8], u32) = ("platform-tools/adb", HOST_ARM64, 0o755);
     let props: (&str, &[u8], u32) = (
         "platform-tools/source.properties",
         b"Pkg.Revision=1\n",
@@ -534,7 +536,7 @@ fn publishes_verified_archives_in_configured_resource_directory() {
             b"Pkg.Revision=1\n",
             0o644,
         ),
-        ("platform-tools/adb", b"fixture", 0o755),
+        ("platform-tools/adb", HOST_ARM64, 0o755),
     ]);
     stage(&home.0, pkg, &bytes);
     let p = controller(&home.0, pkg);
@@ -796,4 +798,60 @@ fn space_and_disconnected_volumes_are_checked_before_transferring() {
     assert!(!row.writable && row.issue.as_deref().unwrap().contains("挂载"));
     p.start().unwrap();
     assert!(http.ranges.lock().unwrap().is_empty() && !offline.exists());
+}
+
+#[test]
+fn candidate_download_progress_and_prefix_stay_with_the_selected_volume() {
+    let home = Temp::new();
+    let other = Temp::new();
+    let official = CATALOG.iter().find(|p| p.id == "system-image").unwrap();
+    let prefix = official.prefix.unwrap();
+    let properties = format!(
+        "Pkg.Revision=14\nPkg.Dependencies=emulator#34.2.16\nAndroidVersion.ApiLevel=34\nSystemImage.Abi={prefix}\nSystemImage.TagId=google_apis_playstore\nAddon.VendorId=google"
+    );
+    let (fixture, bytes) = zip_fixture(&[
+        (
+            &format!("{prefix}/source.properties"),
+            properties.as_bytes(),
+            0o644,
+        ),
+        (&format!("{prefix}/system.img"), &vec![0x71; 131_072], 0o644),
+    ]);
+    let http = Http::new(bytes.clone(), FirstResponse::Stall, false);
+    let image = Artifact {
+        kind: Kind::Image,
+        id: official.id,
+        version: official.version,
+        prefix: official.prefix,
+        image_spec: official.image_spec,
+        essentials: &[],
+        url: Box::leak(http.url.clone().into_boxed_str()),
+        ..fixture
+    };
+    let p = controller(&home.0, image);
+    let settings = StorageLocations {
+        image_root: other.0.join("candidate"),
+        ..StorageLocations::defaults(&home.0)
+    };
+    let dest = RuntimePaths::for_locations(&settings).destination(image);
+    let part = partial(&archive::stage_path(&dest, image), image);
+    p.start_image_at(image.id, &settings).unwrap();
+    wait_for(|| fs::metadata(&part).is_ok_and(|m| m.len() > 0));
+    assert_eq!(p.snapshot().candidate_target.as_ref(), Some(&dest));
+    p.pause().unwrap();
+    let paused = settled(&p);
+    assert_eq!(paused.phase, "paused");
+    assert!(!paused.images[0].ready && paused.images[0].downloaded_bytes == 0);
+    let retained = fs::metadata(&part).unwrap().len();
+    drop(p);
+    let reopened = controller(&home.0, image);
+    assert_eq!(reopened.snapshot().images[0].downloaded_bytes, 0);
+    reopened.start_image_at(image.id, &settings).unwrap();
+    let done = settled(&reopened);
+    assert_eq!(done.candidate_target.as_ref(), Some(&dest));
+    assert_eq!(done.candidate_downloaded_bytes, Some(bytes.len() as u64));
+    assert!(!done.images[0].ready && !done.images[0].location.exists());
+    assert_eq!(*http.ranges.lock().unwrap(), [0, retained as usize]);
+    assert!(dest.join("system.img").is_file());
+    assert!(!home.0.join(windroid_locations::SETTINGS).exists());
 }

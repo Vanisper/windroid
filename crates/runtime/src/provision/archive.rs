@@ -138,8 +138,10 @@ pub(super) fn workspace(dest: &Path, pkg: Artifact) -> io::Result<(PathBuf, File
         .create(empty)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&owner)?;
-    lock.try_lock()
-        .map_err(|e| io::Error::other(format!("组件正在其他工作区安装：{e}")))?;
+    // 调用方已持有跨工作区的版本写锁；这个描述符只用于标识原卷和暂存对象。
+    if !lock.metadata()?.is_file() || lock.metadata()?.nlink() != 1 {
+        return Err(invalid("暂存身份记录必须为独立普通文件"));
+    }
     let marker = small_text(&owner)?;
     if marker.is_empty()
         && fs::read_dir(&stage)?.all(|e| e.is_ok_and(|f| f.path() == owner))
@@ -174,16 +176,22 @@ fn object(path: &Path) -> io::Result<Option<(u64, u64)>> {
 }
 
 /// 事务仅操作同卷私有路径。重入时若版本已换入，先核验再清理；否则恢复原目录。
-pub(super) fn recover(home: &Path, stage: &Path, dest: &Path, pkg: Artifact) -> io::Result<()> {
+pub(super) fn recover(
+    home: &Path,
+    stage: &Path,
+    dest: &Path,
+    pkg: Artifact,
+) -> io::Result<Option<File>> {
     let journal = stage.join("publish.json");
     let record: Publish = match small_text(&journal) {
         Ok(s) => serde_json::from_str(&s)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let backup = stage.join("previous");
     let current = object(dest)?;
     let previous = object(&backup)?;
+    let mut restored = None;
     if previous.is_some() && previous != record.old {
         return Err(invalid(format!("原版本备份发生变化：{}", backup.display())));
     }
@@ -191,6 +199,7 @@ pub(super) fn recover(home: &Path, stage: &Path, dest: &Path, pkg: Artifact) -> 
         if let Err(e) = super::manifest::check(home, dest, pkg, true, || Ok(())) {
             if previous.is_some() {
                 // 只撤回已识别、没有新加入用户文件的本次发布物。
+                let _previous = crate::storage::lock_staged_version(&backup)?;
                 super::manifest::repairable(dest, pkg)?;
                 crate::storage::rename_exclusive(dest, &stage.join("rejected"))?;
                 crate::storage::rename_exclusive(&backup, dest)?;
@@ -205,7 +214,7 @@ pub(super) fn recover(home: &Path, stage: &Path, dest: &Path, pkg: Artifact) -> 
             remove_owned(&backup)?;
         }
     } else if current.is_none() && previous.is_some() {
-        let _lease = crate::storage::lock_staged_version(&backup)?;
+        restored = Some(crate::storage::lock_staged_version(&backup)?);
         crate::storage::rename_exclusive(&backup, dest)?;
     } else if current != record.old {
         return Err(invalid(format!(
@@ -214,7 +223,7 @@ pub(super) fn recover(home: &Path, stage: &Path, dest: &Path, pkg: Artifact) -> 
         )));
     }
     fs::remove_file(journal)?;
-    Ok(())
+    Ok(restored)
 }
 
 pub(super) fn install(
@@ -291,7 +300,7 @@ pub(super) fn install(
         // 另一线程可能正在 fork 子进程，显式解锁后才向调用方报告新版本可读。
         File::unlock(&_next)
     })();
-    if result.is_err() {
+    if result.is_err() && check().is_ok() {
         remove_owned(&scratch)?;
     }
     result
