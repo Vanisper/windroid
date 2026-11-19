@@ -48,6 +48,7 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
     if !home.is_absolute() {
         return Err(unknown("工作区需要绝对路径"));
     }
+    crate::storage::check_volume(home).map_err(unknown)?;
     match fs::symlink_metadata(home) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Workspace::Empty),
         Err(e) => return Err(unknown(e)),

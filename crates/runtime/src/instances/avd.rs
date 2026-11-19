@@ -46,7 +46,7 @@ fn dimensions(template: &str) -> io::Result<(u32, u32, u32)> {
 // SDK 镜像目录用 ABI，模拟器的 hw.cpu.arch 使用内核架构名。
 fn abi(image: &Image) -> io::Result<(&'static str, &'static str)> {
     match image.abi.as_str() {
-        "arm64" | "arm64-v8a" => Ok(("arm64-v8a", "arm64")),
+        "arm64-v8a" => Ok(("arm64-v8a", "arm64")),
         "x86_64" => Ok(("x86_64", "x86_64")),
         _ => Err(invalid(format!("不支持的 Android ABI {}", image.abi))),
     }

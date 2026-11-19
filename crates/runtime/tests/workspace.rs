@@ -125,7 +125,7 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
             .unwrap(),
             "linked-lock" => symlink(external.join("keep"), home.join(".storage.lock")).unwrap(),
             "unreadable" => {
-                fs::set_permissions(home.join("workspace-format"), fs::Permissions::from_mode(0))
+                fs::set_permissions(home.join("workspace-format"), fs::Permissions::from_mode(0o0))
                     .unwrap();
                 if fs::File::open(home.join("workspace-format")).is_ok() {
                     continue;
