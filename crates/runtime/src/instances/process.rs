@@ -58,6 +58,13 @@ pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopMode {
+    Graceful,
+    Restart { cold: bool },
+    Force,
+}
+
 pub(crate) struct OwnedEmulator {
     child: Child,
     launched: SystemTime,
@@ -137,6 +144,10 @@ impl OwnedEmulator {
         let resources = active.acquire(store.home(), &record.spec.image)?;
         let paths = &resources.paths;
         let (image, data) = launch_paths(&dir, &record, paths)?;
+        let skip_snapshot = cold || super::quick_boot::requires_cold_start(&dir, &record)?;
+        if skip_snapshot {
+            super::quick_boot::allow_skip(&dir, &record)?;
+        }
         let (hardware, demand, budget) = launch_requirements(store, &record, paths)?;
         adb::ensure_server(&paths.adb)?;
         // adb 服务启动可能等待握手。完成后才读取宿主状态、取得额度并启动子进程。
@@ -178,7 +189,7 @@ impl OwnedEmulator {
             .stdout(log.try_clone()?)
             .stderr(log);
         hardware.graphics.apply(&mut cmd);
-        if cold || super::quick_boot::requires_cold_start(&dir)? {
+        if skip_snapshot {
             cmd.arg("-no-snapshot-load");
         }
         // 版本锁与额度预留随 QEMU 子进程继续有效，包括宿主异常退出后模拟器仍在运行的情形。
@@ -245,7 +256,7 @@ impl OwnedEmulator {
         let dir = self.pid_file.parent().unwrap();
         crate::workspace::access(&resources.paths.emulator, libc::X_OK)?;
         launch_paths(dir, &record, &resources.paths)?;
-        super::quick_boot::requires_cold_start(dir)?;
+        super::quick_boot::requires_cold_start(dir, &record)?;
         let (_, demand, budget) = launch_requirements(store, &record, &resources.paths)?;
         adb::ensure_server(&resources.paths.adb)?;
         active
@@ -299,16 +310,65 @@ impl OwnedEmulator {
         Ok(true)
     }
 
-    pub fn stop(&mut self, graceful: bool) -> io::Result<()> {
-        if graceful && self.alive()? {
+    /// SIGTERM 保存 Quick Boot 的客户机内存。另行让已挂载的 /data 刷盘，才能在随后的
+    /// 冷启动中找回刚写入的字节。adb 每次探测和 shell 均有截止时间。
+    fn sync_guest_disk(&self) -> io::Result<bool> {
+        if self
+            .record
+            .verify_device(&self.resources.paths.adb)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        // 将身份复核与 sync 放在同一远端 shell 中，即使 serial 被重用也不触碰其他设备。
+        let cmd = format!(
+            r#"if [ "$(getprop ro.boot.qemu.avd_name)" != '{}' ]; then exit 61; fi
+grep -q ' /data ' /proc/mounts || exit 62
+sync && echo windroid-disk-synced"#,
+            self.record.avd_name()
+        );
+        let serial = self.record.serial();
+        let output = adb::shell(self.resources.device(&serial), &cmd)
+            .map_err(|e| io::Error::other(format!("无法确认 Android 用户分区刷盘：{e}")))?;
+        match output.code {
+            Some(0) if output.stdout.trim() == "windroid-disk-synced" => Ok(true),
+            Some(61 | 62) => Ok(false),
+            _ => Err(io::Error::other(format!(
+                "Android 用户分区刷盘失败（{:?} {}）",
+                output.code,
+                output.stderr.trim()
+            ))),
+        }
+    }
+
+    pub fn stop(&mut self, mode: StopMode) -> io::Result<()> {
+        if mode != StopMode::Force && self.alive()? {
             // TERM 触发模拟器的正常退出与 Quick Boot 保存，参见 docs/实测/02-设备域.md 第七节。
             let dir = self.pid_file.parent().unwrap().to_owned();
+            let needs_sync = if let StopMode::Restart { cold } = mode {
+                cold || super::quick_boot::requires_cold_start(&dir, &self.record)?
+            } else {
+                false
+            };
+            let synced = match self.sync_guest_disk() {
+                Ok(synced) => synced,
+                Err(e) => {
+                    // 普通退出仍能保存内存快照；缺少刷盘凭证时稍后不能直接跳过快照。
+                    log::warn!("实例 {} 未确认 Android 用户分区刷盘：{e}", self.record.id);
+                    false
+                }
+            };
+            if needs_sync && !synced {
+                return Err(io::Error::other(
+                    "尚未确认 Android 用户分区刷盘，已保留当前会话。请等设备就绪后再冷启动。",
+                ));
+            }
             let before = super::quick_boot::stamp(&dir, &self.record);
             self.signal(libc::SIGTERM)?;
             if self.await_exit(Duration::from_secs(20))? {
-                if let Err(e) = before
-                    .and_then(|stamp| super::quick_boot::record_save(&dir, &self.record, stamp))
-                {
+                if let Err(e) = before.and_then(|stamp| {
+                    super::quick_boot::record_save(&dir, &self.record, stamp, synced)
+                }) {
                     log::warn!("无法确认实例 {} 的快照：{e}", self.record.id);
                 }
                 return Ok(());
@@ -327,7 +387,7 @@ impl OwnedEmulator {
 
 impl Drop for OwnedEmulator {
     fn drop(&mut self) {
-        match self.stop(false) {
+        match self.stop(StopMode::Force) {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
                 let _ = self.reservation.file.unlock();

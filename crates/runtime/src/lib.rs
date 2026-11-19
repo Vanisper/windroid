@@ -25,7 +25,10 @@ use std::time::{Duration, Instant};
 use contract::{
     Backend, CatalogStatus, Command as Cmd, ErrorCode, Facts, InstanceId, Rejection, Services,
 };
-use instances::{InstanceRecord, InstanceStore, process::OwnedEmulator};
+use instances::{
+    InstanceRecord, InstanceStore,
+    process::{OwnedEmulator, StopMode},
+};
 use provision::RuntimePaths;
 
 #[derive(Debug, Clone)]
@@ -299,9 +302,9 @@ impl EmulatorBackend {
         Ok(())
     }
 
-    fn stop(&mut self, graceful: bool, facts: &mut Facts) -> io::Result<()> {
+    fn stop(&mut self, mode: StopMode, facts: &mut Facts) -> io::Result<()> {
         if let Some(process) = self.process.as_mut() {
-            process.stop(graceful)?;
+            process.stop(mode)?;
         }
         self.process.take();
         self.reset_catalog();
@@ -442,13 +445,14 @@ impl Backend for EmulatorBackend {
                         .unwrap()
                         .check_replacement(&self.store, &self.active)
                         .map_err(io_rejection)?;
-                    self.stop(true, facts).map_err(io_rejection)?;
+                    self.stop(StopMode::Restart { cold: *cold }, facts)
+                        .map_err(io_rejection)?;
                     facts.stop_requested = true;
                 }
                 self.start(*cold, facts).map_err(io_rejection)?;
             }
             Cmd::Stop => {
-                self.stop(true, facts).map_err(io_rejection)?;
+                self.stop(StopMode::Graceful, facts).map_err(io_rejection)?;
                 facts.stop_requested = true;
             }
             _ => self.device_command(cmd)?,
@@ -457,7 +461,7 @@ impl Backend for EmulatorBackend {
     }
 
     fn abort(&mut self, facts: &mut Facts) {
-        if let Err(e) = self.stop(false, facts) {
+        if let Err(e) = self.stop(StopMode::Force, facts) {
             log::error!("无法终止模拟器 {}：{e}", self.id);
         }
     }

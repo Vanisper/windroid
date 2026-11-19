@@ -7,14 +7,57 @@ use std::path::Path;
 
 // 用户修改硬件后，一直跳过旧快照，直至相同配置的一次优雅退出保存新快照。
 const STALE: &str = ".hardware-snapshot-stale";
+const DISK_SYNCED: &str = ".guest-disk-synced";
 
-pub(super) fn requires_cold_start(dir: &Path) -> io::Result<bool> {
-    dir.join(STALE).try_exists()
+/// 跳过快照也会跳过 Android 内存中的脏页。旧版本只确认快照写完，未确认客户机刷盘。
+pub(super) fn allow_skip(dir: &Path, record: &InstanceRecord) -> io::Result<()> {
+    let Some(snapshot) = stamp(dir, record)? else {
+        return Ok(());
+    };
+    // 已因改配明确失效的同一份快照不能再正常恢复。早期空标记亦沿用其原有的跳过语义。
+    if requires_cold_start(dir, record)? {
+        return Ok(());
+    }
+    let receipt = match super::hardware::read_ini(&dir.join(DISK_SYNCED), None) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if receipt.as_ref() != Some(&snapshot) {
+        return Err(super::invalid(
+            "当前快照可能包含尚未写入用户分区的数据。请先正常启动以恢复快照，等设备就绪后正常停止，再修改硬件或冷启动。",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn requires_cold_start(dir: &Path, record: &InstanceRecord) -> io::Result<bool> {
+    let marker = match super::hardware::read_ini(&dir.join(STALE), None) {
+        Ok(marker) => marker,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(stamp(dir, record)?.is_some_and(|snapshot| marker.is_empty() || marker == snapshot))
+}
+
+fn write_stamp(dir: &Path, name: &str, stamp: &str) -> io::Result<()> {
+    let temporary = dir.join(format!(".snapshot-stamp-{}", super::nonce()?));
+    let mut file = File::create_new(&temporary)?;
+    let result = (|| {
+        file.write_all(stamp.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, dir.join(name))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 pub(super) fn invalidate(dir: &Path, record: &InstanceRecord) -> io::Result<()> {
-    if stamp(dir, record)?.is_some() && !requires_cold_start(dir)? {
-        File::create_new(dir.join(STALE))?.sync_all()?;
+    allow_skip(dir, record)?;
+    if let Some(current) = stamp(dir, record)? {
+        write_stamp(dir, STALE, &current)?;
     }
     clear(dir)
 }
@@ -48,13 +91,23 @@ pub(super) fn record_save(
     dir: &Path,
     record: &InstanceRecord,
     before: Option<String>,
+    synced: bool,
 ) -> io::Result<()> {
-    if let Some(after) = stamp(dir, record)?
-        && before.as_ref() != Some(&after)
-    {
+    let Some(after) = stamp(dir, record)? else {
+        return Ok(());
+    };
+    if synced {
+        write_stamp(dir, DISK_SYNCED, &after)?;
+    } else {
+        match fs::remove_file(dir.join(DISK_SYNCED)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            result => result?,
+        }
+    }
+    if before.as_ref() != Some(&after) {
         let mut file = File::create_new(dir.join(RECEIPT))?;
         file.write_all(after.as_bytes())?;
-        if requires_cold_start(dir)? {
+        if dir.join(STALE).try_exists()? {
             fs::remove_file(dir.join(STALE))?;
         }
     }
@@ -62,7 +115,7 @@ pub(super) fn record_save(
 }
 
 pub(super) fn saved(dir: &Path, record: &InstanceRecord) -> io::Result<bool> {
-    if requires_cold_start(dir)? {
+    if requires_cold_start(dir, record)? {
         return Ok(false);
     }
     let receipt = match fs::read_to_string(dir.join(RECEIPT)) {
