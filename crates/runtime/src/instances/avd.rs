@@ -73,20 +73,28 @@ fn ini_image(image: &Path) -> io::Result<&str> {
 pub(super) fn sync_image(data: &Path, image: &Path) -> io::Result<()> {
     let path = ini_image(image)?;
     let key = "image.sysdir.1";
-    let wanted = format!("{key}={path}/");
+    replace_keys(data, &[(key, format!("{path}/"))])
+}
+
+/// 一次原子替换所有指定键，保留同一 AVD 中其余配置和私有数据。
+pub(super) fn replace_keys(data: &Path, updates: &[(&str, String)]) -> io::Result<()> {
     let config = data.join("config.ini");
-    let original = fs::read_to_string(&config)?;
-    let matches = |line: &str| {
-        line.split_once('=')
-            .is_some_and(|(name, _)| name.trim() == key)
-    };
-    let mut found = original.lines().filter(|line| matches(line));
-    if found.next() == Some(wanted.as_str()) && found.next().is_none() {
+    let original = super::hardware::read_ini(&config, None)?;
+    if updates.iter().all(|(key, value)| {
+        super::hardware::field(&original, key).ok() == Some(Some(value.as_str()))
+    }) {
         return Ok(());
     }
-    // 切换资源根时只更新镜像引用。保留硬件设置、私有数据与快照。
-    let mut lines: Vec<_> = original.lines().filter(|line| !matches(line)).collect();
-    lines.push(&wanted);
+    let mut lines: Vec<String> = original
+        .lines()
+        .filter(|line| {
+            !line
+                .split_once('=')
+                .is_some_and(|(name, _)| updates.iter().any(|(key, _)| name.trim() == *key))
+        })
+        .map(str::to_owned)
+        .collect();
+    lines.extend(updates.iter().map(|(key, value)| format!("{key}={value}")));
     let temp = data.join(format!(".config-{}", super::nonce()?));
     let mut file = fs::File::create_new(&temp)?;
     let result = (|| {
@@ -110,6 +118,7 @@ pub(super) fn generate(
     final_dir: &Path,
     record: &InstanceRecord,
     paths: &crate::provision::RuntimePaths,
+    hardware: super::Hardware,
 ) -> io::Result<()> {
     let spec = &record.spec;
     let (width, height, density) = dimensions(&spec.template)?;
@@ -133,9 +142,9 @@ pub(super) fn generate(
     let config = format!(
         concat!(
             "avd.ini.encoding=UTF-8\nAvdId={name}\navd.ini.displayname={name}\n",
-            "abi.type={abi}\nhw.cpu.arch={arch}\nhw.cpu.ncore=2\nhw.ramSize={ram}\n",
+            "abi.type={abi}\nhw.cpu.arch={arch}\nhw.cpu.ncore={cores}\nhw.ramSize={ram}\n",
             "hw.lcd.width={width}\nhw.lcd.height={height}\nhw.lcd.density={density}\n",
-            "hw.gpu.enabled=yes\nhw.gpu.mode=host\nhw.keyboard=yes\nhw.mainKeys=no\n",
+            "hw.gpu.enabled=yes\nhw.gpu.mode={gpu}\nwindroid.graphics.batch={batch}\nhw.keyboard=yes\nhw.mainKeys=no\n",
             "hw.sdCard=no\nshowDeviceFrame=no\nfastboot.forceColdBoot=no\n",
             "image.sysdir.1={image}/\ntag.id={tag}\nPlayStore.enabled={play}\n",
             "disk.dataPartition.size={size}\n"
@@ -146,7 +155,10 @@ pub(super) fn generate(
         width = width,
         height = height,
         density = density,
-        ram = super::ram_mib(&spec.template),
+        cores = hardware.cpu_cores,
+        ram = hardware.ram_mib,
+        gpu = hardware.graphics.gpu(),
+        batch = hardware.graphics == super::GraphicsMode::Batch,
         image = ini_image(&image)?,
         tag = spec.image.tag,
         play = spec.image.tag == "google_apis_playstore",

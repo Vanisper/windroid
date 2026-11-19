@@ -5,6 +5,20 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+// 用户修改硬件后，一直跳过旧快照，直至相同配置的一次优雅退出保存新快照。
+const STALE: &str = ".hardware-snapshot-stale";
+
+pub(super) fn requires_cold_start(dir: &Path) -> io::Result<bool> {
+    dir.join(STALE).try_exists()
+}
+
+pub(super) fn invalidate(dir: &Path, record: &InstanceRecord) -> io::Result<()> {
+    if stamp(dir, record)?.is_some() && !requires_cold_start(dir)? {
+        File::create_new(dir.join(STALE))?.sync_all()?;
+    }
+    clear(dir)
+}
+
 const RECEIPT: &str = ".quick-boot-saved";
 
 pub(super) fn clear(dir: &Path) -> io::Result<()> {
@@ -40,11 +54,17 @@ pub(super) fn record_save(
     {
         let mut file = File::create_new(dir.join(RECEIPT))?;
         file.write_all(after.as_bytes())?;
+        if requires_cold_start(dir)? {
+            fs::remove_file(dir.join(STALE))?;
+        }
     }
     Ok(())
 }
 
 pub(super) fn saved(dir: &Path, record: &InstanceRecord) -> io::Result<bool> {
+    if requires_cold_start(dir)? {
+        return Ok(false);
+    }
     let receipt = match fs::read_to_string(dir.join(RECEIPT)) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),

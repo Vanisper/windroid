@@ -8,11 +8,9 @@ mod quick_boot;
 mod specification;
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -23,7 +21,7 @@ pub use hardware::InstanceConfig;
 use serde::{Deserialize, Serialize};
 pub use specification::{DiskLimits, GraphicsMode, Hardware, HostCapacity, SpecLimits};
 
-/// 各模板分配的客户机内存，用于 AVD 配置与设备域资源准入。
+/// 新格式首版模板的保存值。创建时提升至当前镜像下限，已有 AVD 保留原值。
 pub fn ram_mib(template: &str) -> u64 {
     match template {
         "compact-720" => 1536,
@@ -161,15 +159,43 @@ impl InstanceStore {
     }
 
     pub fn create(&self, name: &str, spec: Spec) -> io::Result<InstanceRecord> {
-        self.create_inner(None, name, spec)
+        self.create_inner(None, name, Hardware::original(&spec.template), spec)
     }
 
     /// 在根设置读锁内核对将要持久化的修订。跨工作区切换或准备与创建相交时，
     /// 界面此前显示的就绪快照不能替代提交前的本地核验。
     pub fn create_prepared(&self, name: &str, spec: Spec) -> io::Result<InstanceRecord> {
+        self.create_checked(name, spec, None)
+    }
+
+    pub fn create_with_hardware(
+        &self,
+        name: &str,
+        spec: Spec,
+        hardware: Hardware,
+    ) -> io::Result<InstanceRecord> {
+        self.create_checked(name, spec, Some(hardware))
+    }
+
+    fn create_checked(
+        &self,
+        name: &str,
+        spec: Spec,
+        hardware: Option<Hardware>,
+    ) -> io::Result<InstanceRecord> {
+        avd::validate(&spec)?;
         let _selection = crate::storage::resource_lease(self.home(), true, true)?;
-        let _versions = crate::storage::instance_lease(self.home(), &spec.image)?;
-        self.create(name, spec)
+        let (paths, _versions) = crate::storage::instance_lease(self.home(), &spec.image)?;
+        let name_in_image = specification::product_name(&paths, &spec.image)?;
+        let limits = SpecLimits::for_template(
+            HostCapacity::read()?,
+            &spec.template,
+            spec.image.api,
+            &name_in_image,
+        )?;
+        let hardware = hardware.unwrap_or_else(|| limits.defaults());
+        limits.validate(hardware)?;
+        self.create_inner(None, name, hardware, spec)
     }
 
     // Backend::Create 的旧调用者提供自己的 id 和端口，走同一套发布与校验流程。
@@ -179,13 +205,19 @@ impl InstanceStore {
         port: u16,
         spec: Spec,
     ) -> io::Result<InstanceRecord> {
-        self.create_inner(Some((id, port)), id.as_str(), spec)
+        self.create_inner(
+            Some((id, port)),
+            id.as_str(),
+            Hardware::original(&spec.template),
+            spec,
+        )
     }
 
     fn create_inner(
         &self,
         at: Option<(&InstanceId, u16)>,
         name: &str,
+        hardware: Hardware,
         spec: Spec,
     ) -> io::Result<InstanceRecord> {
         let name = valid_name(name)?.trim();
@@ -202,7 +234,7 @@ impl InstanceStore {
                 "实例目录已存在",
             ));
         }
-        check_space(&root, spec.disk_bytes)?;
+        self.disk_limits()?.check(spec.disk_bytes)?;
         let reserved: BTreeSet<u16> = records_in(&root)?.iter().map(|r| r.port).collect();
         let port = match at {
             Some((_, port)) => {
@@ -230,7 +262,7 @@ impl InstanceStore {
         fs::DirBuilder::new().mode(0o700).create(&stage)?;
         let result = (|| {
             let paths = crate::provision::RuntimePaths::discover(&self.layout.root);
-            avd::generate(&stage, &final_dir, &record, &paths)?;
+            avd::generate(&stage, &final_dir, &record, &paths, hardware)?;
             let mut manifest = File::create_new(stage.join(MANIFEST))?;
             serde_json::to_writer_pretty(&mut manifest, &record)?;
             manifest.sync_all()?;
@@ -499,26 +531,6 @@ pub(crate) fn check_ports(port: u16) -> io::Result<()> {
             Err(e) => return Err(e),
             Ok(_) => (),
         }
-    }
-    Ok(())
-}
-
-fn check_space(root: &Path, bytes: u64) -> io::Result<()> {
-    let path = CString::new(root.as_os_str().as_bytes())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: path 为 NUL 结尾的字节串，成功时 statvfs 填充整个结构。
-    let stat = unsafe {
-        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        stat.assume_init()
-    };
-    let available = stat.f_bavail as u128 * stat.f_frsize as u128;
-    if (bytes as u128) * 10 > available * 7 {
-        return Err(io::Error::new(
-            io::ErrorKind::StorageFull,
-            "数据盘超过当前可用空间的 70%",
-        ));
     }
     Ok(())
 }
