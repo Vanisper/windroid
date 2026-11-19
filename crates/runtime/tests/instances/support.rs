@@ -8,6 +8,10 @@ pub struct Temp(pub PathBuf);
 impl Temp {
     pub fn create() -> Self {
         let base = std::env::temp_dir().canonicalize().unwrap();
+        Self::in_directory(&base)
+    }
+
+    pub fn in_directory(base: &Path) -> Self {
         let path = base.join(format!(
             "windroid-instance-test-{}-{}",
             std::process::id(),

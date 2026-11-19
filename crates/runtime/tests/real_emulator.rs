@@ -83,7 +83,7 @@ fn isolated(name: &str, apis: &[u32]) -> bool {
         .status()
         .unwrap();
     // 只回收本用例创建在随机端口的服务。
-    let adb = runtime::provision::RuntimePaths::discover(&home).adb;
+    let adb = home.join("runtime/platform-tools/37.0.1/adb");
     let _ = ChildCommand::new(adb)
         .args(["-P", &port, "kill-server"])
         .env_remove("ADB_SERVER_SOCKET")
@@ -180,16 +180,33 @@ fn migrated_images_keep_private_guest_data() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(store.list().unwrap().is_empty());
-    let a = store.create("A", spec("compact-720")).unwrap();
-    let b = store.create("B", a.spec.clone()).unwrap();
-    let mut spec = b.spec.clone();
-    spec.image = alternate;
-    let c = store.create("C", spec).unwrap();
-    let target = StorageLocations {
-        runtime_root: root.join("components"),
-        image_root: root.join("images"),
+    let create = |name: &str, port, spec| {
+        let id = contract::InstanceId::new(name);
+        let mut backend = EmulatorBackend::new(id.clone(), layout.clone(), port);
+        backend
+            .exec(&Command::Create { spec }, &mut Facts::default())
+            .unwrap();
+        store.get(&id).unwrap()
     };
-
+    let a = create("A", 5562, spec("compact-720"));
+    let b = create("B", 5564, a.spec.clone());
+    let mut alternate_spec = b.spec.clone();
+    alternate_spec.image = alternate;
+    let c = create("C", 5566, alternate_spec);
+    let mounted = std::env::var_os("WINDROID_TEST_MIGRATION_VOLUME").map(std::path::PathBuf::from);
+    let external = mounted.as_deref().map(Temp::in_directory);
+    let destination = external.as_ref().map_or(root, |t| t.0.as_path());
+    if mounted.is_some() {
+        use std::os::unix::fs::MetadataExt;
+        let from = fs::metadata(root).unwrap().dev();
+        let to = fs::metadata(destination).unwrap().dev();
+        assert_ne!(from, to, "必须是另一个实际卷");
+        println!("跨卷迁移 dev={from} → dev={to}");
+    }
+    let target = StorageLocations {
+        runtime_root: destination.join("components"),
+        image_root: destination.join("images"),
+    };
     let (mut vm, mut facts) = boot(&layout, &a);
     guest(&vm, &a, "echo A > /data/local/tmp/windroid-private");
     let moving = preview(&layout.root, &target).unwrap();
