@@ -162,6 +162,14 @@ impl InstanceStore {
         self.create_inner(None, name, spec)
     }
 
+    /// 在根设置读锁内核对将要持久化的修订。跨工作区切换或准备与创建相交时，
+    /// 界面此前显示的就绪快照不能替代提交前的本地核验。
+    pub fn create_prepared(&self, name: &str, spec: Spec) -> io::Result<InstanceRecord> {
+        let _selection = crate::storage::resource_lease(self.home(), true, true)?;
+        let _versions = crate::storage::instance_lease(self.home(), &spec.image)?;
+        self.create(name, spec)
+    }
+
     // Backend::Create 的旧调用者提供自己的 id 和端口，走同一套发布与校验流程。
     pub(crate) fn create_at(
         &self,

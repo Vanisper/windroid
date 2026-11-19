@@ -232,7 +232,7 @@ impl Library {
         let id = if let Some(store) = &self.store {
             let _admission = self.starting.lock().unwrap();
             self.check_budget(template)?;
-            let record = store.create(name, spec).map_err(error)?;
+            let record = store.create_prepared(name, spec).map_err(error)?;
             let id = record.id.to_string();
             self.add_record(record);
             id
