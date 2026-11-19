@@ -384,7 +384,7 @@ fn image(id: &str, api: u32, ready: bool) -> Value {
     json!({"id":id, "name":format!("Android API {api}"), "version":"14", "source":"https://example.org/image.zip",
         "license":"镜像许可", "licenseUrl":"https://example.org/terms", "licenseText":"镜像许可条款", "sizeBytes":1048576,
         "ready":ready, "location":"/tmp/images", "borrowed":false, "downloadedBytes":0, "issue":null,
-        "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a"},"minEmulator":"34.0.0"})
+        "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a","revision":14},"minEmulator":"34.0.0"})
 }
 
 fn ready_view() -> Value {
@@ -485,7 +485,10 @@ fn images_require_separate_consent_selection_and_instance_creation() {
                 v["preparation"]["phase"] = json!("downloading");
                 v["preparation"]["images"][1]["downloadedBytes"] = json!(524288);
             }
-            "createInstance" => assert_eq!(cmd["imageId"], "r35"),
+            "createInstance" => {
+                assert_eq!(cmd["imageId"], "r35");
+                assert_eq!(cmd["image"], image("r35", 35, true)["image"]);
+            }
             _ => panic!("意外命令 {cmd}"),
         }
         json!({"status":"accepted"})
@@ -519,6 +522,31 @@ fn images_require_separate_consent_selection_and_instance_creation() {
     press(&mut ui.app, "create");
     gone(&mut ui.app, "id:pending");
     assert_eq!(ui.commands.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn selection_pins_one_of_two_revisions_of_the_same_image() {
+    let mut view = ready_view();
+    view["instances"] = json!([]);
+    view["selectedId"] = Value::Null;
+    let mut other = image("api34-r15", 34, true);
+    other["version"] = json!("15");
+    other["image"]["revision"] = json!(15);
+    view["preparation"]["images"] = json!([image("api34-r14", 34, true), other]);
+    let mut ui = Scripted::new(view, |cmd, _| {
+        assert_eq!(cmd["kind"], "createInstance");
+        assert_eq!(cmd["imageId"], "api34-r14");
+        assert_eq!(cmd["image"], image("api34-r14", 34, true)["image"]);
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:inventory");
+    press(&mut ui.app, "workspace-next");
+    wait(&mut ui.app, "id:image-api34-r15 >> text:/修订版 15/");
+    press(&mut ui.app, "use-api34-r14");
+    wait(&mut ui.app, "id:create-form >> text:/修订版 14/");
+    press(&mut ui.app, "create");
+    gone(&mut ui.app, "id:pending");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -1014,7 +1042,7 @@ fn recommended_template_can_be_overridden_before_creation() {
     assert_eq!(
         *ui.commands.lock().unwrap(),
         [
-            json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作","imageId":"r34"})
+            json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作","imageId":"r34","image":image("r34",34,true)["image"]})
         ]
     );
 }

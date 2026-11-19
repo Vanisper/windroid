@@ -6,8 +6,15 @@ export const stateName: Record<DeviceState, string> = {
   ready: "就绪", streaming: "运行中", stopping: "正在停止", failed: "启动失败",
 };
 
+export interface ImageIdentity { api: number; tag: string; abi: string; revision: number }
+
+export function describeImage(image: ImageIdentity) {
+  const variant = image.tag === "google_apis_playstore" ? "Google Play" : image.tag;
+  return "API " + image.api + " · " + variant + " · " + image.abi + " · " + (image.revision > 0 ? "修订版 " + image.revision : "缺少修订号");
+}
+
 export interface InstanceConfig {
-  template: string; image: { api: number; tag: string; abi: string };
+  template: string; image: ImageIdentity;
   cpuCores: number | null; ramMiB: number | null; screenWidth: number | null;
   screenHeight: number | null; diskBytes: number;
 }
@@ -71,7 +78,7 @@ export interface Snapshot {
 type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "refreshApps" | "openDevice" | "addApk";
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
-  | { kind: "createInstance"; name: string; template: string; imageId: string }
+  | { kind: "createInstance"; name: string; template: string; imageId: string; image: ImageIdentity }
   | { kind: "applyStorage"; plan: { previewId: number } }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
   | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }

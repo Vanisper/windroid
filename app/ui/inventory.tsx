@@ -1,7 +1,7 @@
 import { computed, signal, Text, View, windowSize } from "nsh";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
 import { DeviceControls } from "./library";
-import { activeTransfer, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
+import { activeTransfer, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, preparation, selected, snapshot, startCreation, switching, type Instance } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -88,7 +88,7 @@ export function ManageInstance() {
     <View style={card()}>
       <Heading text="实例配置" />
       <Detail text={"设备模板 · " + (config()?.template ?? unknown)} />
-      <Detail text={"系统镜像 · " + (config()?.image ? "Android API " + config()!.image.api + " · " + config()!.image.tag + " · " + config()!.image.abi : unknown)} />
+      <Detail text={"系统镜像 · " + (config()?.image ? describeImage(config()!.image) : unknown)} />
       <Each of={specs(selected())} key={s => s.label}>{s => <Detail text={s().label + " · " + s().value} />}</Each>
       <Detail text="自定义硬件配置将在后续版本提供。" />
     </View>

@@ -1,12 +1,11 @@
 import { cleanup, computed, effect, host, signal, Text, View } from "nsh";
 import { Button, card, colors, Detail, Heading, row } from "./controls";
-import { activeTransfer, busy, environmentReady, images, pickResource, preparation, send, startCreation, type Component } from "./model";
+import { activeTransfer, busy, describeImage, environmentReady, images, pickResource, preparation, send, startCreation, type Component } from "./model";
 import { LicenseLink, Location, Progress, size } from "./resources";
 
 export function imageDescription(item: Component) {
   const image = item.image;
-  return image ? "API " + image.api + " · " + (image.tag === "google_apis_playstore" ? "Google Play" : image.tag)
-    + " · " + image.abi + " · 修订版 " + item.version : "修订版 " + item.version;
+  return image ? describeImage(image) : "镜像清单缺少版本身份";
 }
 
 function ImageRow(props: { item: Component; select?: (id: string) => void; download: (item: Component) => void }) {
@@ -48,7 +47,7 @@ function ImageRow(props: { item: Component; select?: (id: string) => void; downl
 }
 
 export function ImageList(props: { select?: (id: string) => void }) {
-  const versions = computed(() => [...images()].sort((a, b) => (b.image?.api ?? 0) - (a.image?.api ?? 0)));
+  const versions = computed(() => [...images()].sort((a, b) => (b.image?.api ?? 0) - (a.image?.api ?? 0) || (b.image?.revision ?? 0) - (a.image?.revision ?? 0)));
   const local = computed(() => versions().filter(c => c.ready));
   const remote = computed(() => versions().filter(c => !c.ready && !c.borrowed));
   const external = computed(() => versions().filter(c => !c.ready && c.borrowed));
