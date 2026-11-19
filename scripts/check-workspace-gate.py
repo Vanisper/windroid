@@ -42,14 +42,22 @@ def fixture(root, case, jar):
             "avd_name": "wd-" + "0" * 32, "spec": {"template": "compact-720",
             "diskBytes": 8 << 30, "image": {"api": 34, "tag": "google_apis_playstore",
             "abi": "arm64-v8a"}}}))
-        disk = record.with_name("userdata-qemu.img")
+        avd = record.parent / "avd" / ("wd-" + "0" * 32 + ".avd")
+        avd.mkdir(parents=True)
+        (avd / "config.ini").write_text("hw.ramSize=2048\n")
+        disk = avd / "userdata-qemu.img"
         disk.write_bytes(b"private guest disk")
         disk.chmod(0o640)
         if case == "legacy":
             settings = json.dumps({"runtimeRoot": str(other), "imageRoot": None})
             (home / "storage-locations.json").write_text(settings)
-            (home / ".storage-migration.json").write_text(
-                json.dumps({"before": json.loads(settings), "packages": []}))
+            # 与 13f90fe 的 Journal 相符。旧版在设置已切换时应完成此零包事务。
+            journal = {"before": {"runtimeRoot": str(home / "runtime"), "imageRoot": None},
+                       "after": json.loads(settings), "nonce": "0" * 32, "packages": []}
+            (home / ".storage-migration.json").write_text(json.dumps(journal))
+            (home / "preferences").mkdir()
+            (home / "preferences/window-close").write_text("background")
+
         else:
             marker.write_bytes(b"windroid-workspace-v2\n")
     elif case == "seed":
