@@ -34,11 +34,11 @@ impl Fixture {
     }
 
     fn start(&self, target: DisplayTarget) -> io::Result<VideoSession> {
-        VideoSession::start(
-            &self.0.join("fake adb"),
-            SERIAL,
+        VideoSession::start_on(
+            adb::Device::injected(&self.0.join("fake adb"), SERIAL),
             &self.0.join("server.jar"),
             target,
+            || false,
         )
     }
 
@@ -365,9 +365,8 @@ fn cancelling_an_incomplete_handshake_never_sends_start_app() {
     thread::scope(|scope| {
         let f = &f;
         let start = scope.spawn(move || {
-            VideoSession::start_cancellable(
-                &f.0.join("fake adb"),
-                SERIAL,
+            VideoSession::start_on(
+                adb::Device::injected(&f.0.join("fake adb"), SERIAL),
                 &f.0.join("server.jar"),
                 app(),
                 || cancelled.load(Ordering::Acquire),
@@ -399,4 +398,76 @@ fn unbounded_packet_length_and_invalid_display_size_abort_the_session() {
         );
         assert!(!f.map(peer.port).exists());
     }
+}
+
+/// 在同一个进程中先启动会话，再让服务在 forward 与长连接之间换成旧协议。
+#[test]
+fn daemon_changed_before_stream_launch_preserves_the_replacement() {
+    const HELPER: &str = "WINDROID_STREAM_CHECK_REPLACEMENT";
+    if std::env::var_os(HELPER).is_some() {
+        let fixture = Fixture::new();
+        let program = fixture.0.join("fake adb");
+        fs::write(fixture.0.join("next-port"), "19000\n").unwrap();
+        adb::ensure_server(&program).unwrap();
+        let result = VideoSession::start(
+            &program,
+            SERIAL,
+            &fixture.0.join("server.jar"),
+            DisplayTarget::Device,
+        );
+        let issue = result.err().unwrap();
+        assert!(issue.to_string().contains("不兼容"), "{issue}");
+        let calls = fixture.calls();
+        let commands: Vec<_> = calls
+            .lines()
+            .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(commands.len(), 3, "{calls}");
+        assert_eq!(commands[0], ["shell", "mkdir"]);
+        assert_eq!(commands[1][0], "push");
+        assert_eq!(commands[2], ["forward", "--no-rebind"]);
+        return;
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::scope(|threads| {
+        let service = threads.spawn(|| {
+            let mut count = 0;
+            for connection in listener.incoming() {
+                let mut socket = connection.unwrap();
+                let mut query = [0; 16];
+                if socket.read_exact(&mut query).is_err() {
+                    break;
+                }
+                assert_eq!(&query, b"000chost:version");
+                count += 1;
+                socket
+                    .write_all(if count <= 4 {
+                        b"OKAY00040029"
+                    } else {
+                        b"OKAY00040028"
+                    })
+                    .unwrap();
+            }
+            count
+        });
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_changed_before_stream_launch_preserves_the_replacement",
+            ])
+            .env(HELPER, "1")
+            .env_remove("ADB_SERVER_SOCKET")
+            .env_remove("ANDROID_ADB_SERVER_ADDRESS")
+            .env("ANDROID_ADB_SERVER_PORT", address.port().to_string())
+            .status()
+            .unwrap();
+        drop(TcpStream::connect(address).unwrap());
+        let probes = service.join().unwrap();
+        assert!(result.success());
+        assert_eq!(
+            probes, 7,
+            "启动前、mkdir、push、forward、长连接及两次清理都须握手"
+        );
+    });
 }

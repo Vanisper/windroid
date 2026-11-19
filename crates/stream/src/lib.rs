@@ -174,6 +174,16 @@ impl VideoSession {
         target: DisplayTarget,
         cancelled: impl Fn() -> bool,
     ) -> io::Result<Self> {
+        Self::start_on(adb::Device::new(adb, serial), server_jar, target, cancelled)
+    }
+
+    pub fn start_on(
+        device: adb::Device<'_>,
+        server_jar: &Path,
+        target: DisplayTarget,
+        cancelled: impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        let serial = device.serial;
         check_cancel(&cancelled)?;
         target.validate()?;
         if serial.is_empty()
@@ -186,7 +196,7 @@ impl VideoSession {
                 "adb serial 无效",
             ));
         }
-        let mut server = Server::start(adb, serial, server_jar, &target, &cancelled)?;
+        let mut server = Server::start(device, server_jar, &target, &cancelled)?;
         let handshake = Self::connect(&mut server, &target, &cancelled).map_err(|e| {
             if cancelled() {
                 io::Error::new(io::ErrorKind::Interrupted, "窗口已取消投屏")

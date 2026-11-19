@@ -19,16 +19,35 @@ const MAX_OUTPUT_PER_STREAM: usize = 8 * 1024 * 1024;
 pub struct Device<'a> {
     pub program: &'a Path,
     pub serial: &'a str,
+    pub transport: Transport,
 }
 
 impl<'a> Device<'a> {
     pub fn new(program: &'a Path, serial: &'a str) -> Self {
-        Self { program, serial }
+        Self {
+            program,
+            serial,
+            transport: Transport::Local,
+        }
+    }
+
+    pub fn injected(program: &'a Path, serial: &'a str) -> Self {
+        Self {
+            program,
+            serial,
+            transport: Transport::Injected,
+        }
+    }
+
+    pub fn command(self, until: Instant) -> io::Result<Command> {
+        let mut cmd = self.transport.command(self.program, until)?;
+        cmd.args(["-s", self.serial]);
+        Ok(cmd)
     }
 }
 
 mod service;
-pub use service::ensure_server;
+pub use service::{Transport, ensure_server};
 
 /// 短命令的输出截止时间覆盖进程退出和两个输出流的 EOF。超时会终止并回收直接子进程。
 /// cmd 的参数、工作目录和环境保持原样。stdin 关闭，stdout 与 stderr 分别最多捕获 8 MiB。
@@ -237,9 +256,10 @@ pub fn run_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> io::Result<AdbOutput> {
-    let mut cmd = Command::new(device.program);
-    cmd.args(["-s", device.serial]).args(args);
-    let out = output_with_timeout(cmd, timeout)?;
+    let until = Instant::now() + timeout;
+    let mut cmd = device.command(until)?;
+    cmd.args(args);
+    let out = output_with_timeout(cmd, service::remaining(until)?)?;
     Ok(AdbOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -256,25 +276,33 @@ pub fn shell(device: Device<'_>, cmd: &str) -> io::Result<AdbOutput> {
 ///
 /// 只解析 `adb devices` 的正文：首行是标题，其余每行 `serial\tstate`。
 pub fn devices(program: &Path) -> io::Result<Vec<(String, String)>> {
-    let mut cmd = Command::new(program);
-    cmd.arg("devices");
-    let out = output_with_timeout(cmd, PROBE_TIMEOUT)?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let serial = it.next()?;
-            let state = it.next().unwrap_or("unknown");
-            Some((serial.to_owned(), state.to_owned()))
-        })
-        .collect())
+    Transport::Local.devices(program)
+}
+impl Transport {
+    pub fn devices(self, program: &Path) -> io::Result<Vec<(String, String)>> {
+        let until = Instant::now() + PROBE_TIMEOUT;
+        let mut cmd = self.command(program, until)?;
+        cmd.arg("devices");
+        let out = output_with_timeout(cmd, service::remaining(until)?)?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let serial = it.next()?;
+                let state = it.next().unwrap_or("unknown");
+                Some((serial.to_owned(), state.to_owned()))
+            })
+            .collect())
+    }
 }
 
 /// 该 serial 是否已连接且状态为 `device`。
 pub fn is_ready(device: Device<'_>) -> io::Result<bool> {
-    Ok(devices(device.program)?
+    Ok(device
+        .transport
+        .devices(device.program)?
         .into_iter()
         .any(|(s, state)| s == device.serial && state == "device"))
 }

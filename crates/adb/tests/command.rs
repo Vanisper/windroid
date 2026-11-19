@@ -152,15 +152,22 @@ fn incompatible_running_service_is_inspected_without_stopping_it() {
     let port = listener.local_addr().unwrap().port().to_string();
     std::thread::scope(|threads| {
         threads.spawn(|| {
-            let (mut client, _) = listener.accept().unwrap();
-            let mut request = [0; 16];
-            client.read_exact(&mut request).unwrap();
-            assert_eq!(&request, b"000chost:version");
-            client.write_all(b"OKAY00040028").unwrap();
+            for _ in 0..3 {
+                let (mut client, _) = listener.accept().unwrap();
+                let mut request = [0; 16];
+                client.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"000chost:version");
+                client.write_all(b"OKAY00040028").unwrap();
+            }
         });
         succeeds(
             f.child("incompatible")
-                .env("WINDROID_TEST_ADB", program)
+                .env(
+                    "WINDROID_TEST_ADB",
+                    std::env::var_os("WINDROID_QA_ADB")
+                        .map(PathBuf::from)
+                        .unwrap_or(program),
+                )
                 .env("ANDROID_ADB_SERVER_PORT", &port)
                 .env("ADB_SERVER_SOCKET", format!("tcp:localhost:{port}")),
         );
@@ -175,14 +182,18 @@ fn isolated_child() {
         return;
     };
     let program = PathBuf::from(env::var_os("WINDROID_TEST_ADB").unwrap());
-    let device = |serial| adb::Device::new(&program, serial);
+    let device = |serial| adb::Device::injected(&program, serial);
     match case.as_str() {
-        "incompatible" => assert!(
-            adb::ensure_server(&program)
-                .unwrap_err()
-                .to_string()
-                .contains("不兼容")
-        ),
+        "incompatible" => {
+            let selected = adb::Device::new(&program, "emulator-5554");
+            for failure in [
+                adb::ensure_server(&program).unwrap_err(),
+                adb::devices(&program).unwrap_err(),
+                adb::shell(selected, "true").unwrap_err(),
+            ] {
+                assert!(failure.to_string().contains("不兼容"), "{failure}");
+            }
+        }
         "streams" => {
             let out = adb::run(device("test serial"), &["shell", "two words"]).unwrap();
             assert_eq!(out.code, Some(9));
@@ -201,7 +212,7 @@ fn isolated_child() {
             );
         }
         "devices" => assert_eq!(
-            adb::devices(&program).unwrap(),
+            adb::Transport::Injected.devices(&program).unwrap(),
             vec![
                 ("emulator-5554".into(), "device".into()),
                 ("emulator-5556".into(), "offline".into())

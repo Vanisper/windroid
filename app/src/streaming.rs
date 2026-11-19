@@ -167,9 +167,8 @@ impl Worker {
                         Some(package) => DisplayTarget::App { package },
                         None => DisplayTarget::Device,
                     };
-                    let session = VideoSession::start_cancellable(
-                        &source.resources.paths.adb,
-                        &source.serial,
+                    let session = VideoSession::start_on(
+                        source.resources.device(&source.serial),
                         &source.resources.paths.server_jar,
                         target,
                         || conn.stopped.load(Ordering::Acquire),

@@ -1,6 +1,7 @@
 #!/bin/sh
 # 仅在夹具的临时目录记下调用，实际协议由测试的 loopback server 提供。
 set -eu
+if [ "$1" = 'version' ]; then echo 'Android Debug Bridge version 1.0.41'; exit; fi
 dir=$(dirname "$0")
 [ "$1" = '-s' ] && [ "$2" = 'test-serial' ] || exit 17
 shift 2

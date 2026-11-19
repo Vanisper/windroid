@@ -136,8 +136,8 @@ impl Labels {
         device: adb::Device<'_>,
         deadline: Instant,
     ) -> Option<BTreeMap<String, InstalledApk>> {
-        let mut cmd = Command::new(device.program);
-        cmd.args(["-s", device.serial, "shell", INDEX]);
+        let mut cmd = device.command(deadline).ok()?;
+        cmd.args(["shell", INDEX]);
         let text = stdout(cmd, deadline)?;
         let mut packages = BTreeMap::new();
         // -f 取 applicationInfo.sourceDir，--show-versioncode 取 longVersionCode。
@@ -171,9 +171,8 @@ impl Labels {
         local: &Path,
         deadline: Instant,
     ) -> Option<String> {
-        let mut pull = Command::new(device.program);
-        pull.args(["-s", device.serial, "pull", &apk.path])
-            .arg(local);
+        let mut pull = device.command(deadline).ok()?;
+        pull.args(["pull", &apk.path]).arg(local);
         stdout(pull, deadline)?;
         let metadata = fs::metadata(local).ok()?;
         if !metadata.is_file() || metadata.len() == 0 {

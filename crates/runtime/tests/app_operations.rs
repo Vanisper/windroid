@@ -36,7 +36,7 @@ struct Fixture {
 
 impl Fixture {
     fn device(&self) -> adb::Device<'_> {
-        adb::Device::new(&self.adb, SERIAL)
+        adb::Device::injected(&self.adb, SERIAL)
     }
 
     /// 工具根据调用顺序重放保存的两路输出；每个 argv 独立记录，可检测空格、选项及重复命令。
@@ -267,7 +267,7 @@ fn labels_isolate_simultaneous_pulls_and_discard_racing_updates() {
             let resolve = |serial: &str| {
                 Labels::new(&d.root, &InstanceId::new(serial))
                     .resolve(
-                        adb::Device::new(&d.adb, serial),
+                        adb::Device::injected(&d.adb, serial),
                         &d.root.join("aapt"),
                         &[PKG.to_owned()],
                     )
