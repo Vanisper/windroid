@@ -231,7 +231,7 @@ impl Disk {
                 if let Err(e) = retention::maintain(self, None)
                     && !health.disk_failed.swap(true, Ordering::AcqRel)
                 {
-                    eprintln!("日志保留检查失败：{e}");
+                    let _ = writeln!(io::stderr().lock(), "日志保留检查失败：{e}");
                 }
                 maintenance = Instant::now();
             }
@@ -258,7 +258,7 @@ impl Disk {
                         if let Err(e) = self.write_row(*row) {
                             self.manifest.lost = true;
                             if !health.disk_failed.swap(true, Ordering::AcqRel) {
-                                eprintln!("写入诊断日志失败：{e}")
+                                let _ = writeln!(io::stderr().lock(), "写入诊断日志失败：{e}");
                             }
                         }
                     }
@@ -295,7 +295,7 @@ impl Disk {
                 && let Err(e) = self.save()
             {
                 if !health.disk_failed.swap(true, Ordering::AcqRel) {
-                    eprintln!("无法发布诊断日志索引：{e}")
+                    let _ = writeln!(io::stderr().lock(), "无法发布诊断日志索引：{e}");
                 }
             } else if self.persisted == unfinished {
                 health.saved.store(self.persisted, Ordering::Release);

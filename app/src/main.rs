@@ -22,7 +22,7 @@ fn main() -> Result<(), String> {
     // 格式确认可能是首个原生窗口。先让 AppKit 完成启动，模态按钮与辅助功能才可用。
     app.finishLaunching();
     logging::install();
-    let run_id = runtime::app_log::AppLog::allocate_id().map_err(|e| e.to_string())?;
+    let run_id = runtime::app_log::AppLog::allocate_id();
     let mut home = runtime::Layout::default_root().root;
     let mut review = host::surface::review_workspace(mtm, &home);
     let (library_window, library, logs) = loop {

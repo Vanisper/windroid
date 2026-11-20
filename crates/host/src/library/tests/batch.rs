@@ -332,7 +332,7 @@ fn only_executed_start_requests_persist_the_instance_and_refusal() {
             self.0.abort(facts);
         }
     }
-    let run_id = runtime::app_log::AppLog::allocate_id().unwrap();
+    let run_id = runtime::app_log::AppLog::allocate_id();
     let root = std::env::temp_dir().join(format!("windroid-command-log-{run_id}"));
     std::fs::create_dir(&root).unwrap();
     let logs = runtime::app_log::AppLog::open(&root, &run_id);

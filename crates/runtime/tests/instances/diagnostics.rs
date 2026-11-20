@@ -43,7 +43,7 @@ pub(super) fn faults(
     let logs = layout.instance(&instance.id).join("logs");
     let mode = root.join("log-test-mode");
     let permit = root.join("emit-after-host");
-    let app_id = app_log::AppLog::allocate_id().unwrap();
+    let app_id = app_log::AppLog::allocate_id();
     let app = app_log::AppLog::open(root, &app_id);
     let history = || Catalog::load(root, Some(id)).unwrap().runs;
     let issue = || app_log::capture_issue(root, Some(id));

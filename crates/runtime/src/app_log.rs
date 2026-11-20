@@ -1,5 +1,6 @@
 //! 主进程在工作区确认后登记本次启动。采集子进程和只读预览不初始化主程序日志。
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -33,7 +34,7 @@ impl AppLog {
         let (writer, error) = match RunWriter::app_with_id(home, id) {
             Ok(writer) => (Some(writer), None),
             Err(error) => {
-                eprintln!("Windroid 日志采集不可用：{error}");
+                let _ = writeln!(std::io::stderr().lock(), "Windroid 日志采集不可用：{error}");
                 (None, Some(error.to_string()))
             }
         };
@@ -52,8 +53,15 @@ impl AppLog {
         }
     }
 
-    pub fn allocate_id() -> std::io::Result<String> {
-        new_run_id()
+    pub fn allocate_id() -> String {
+        new_run_id().unwrap_or_else(|_| {
+            // 诊断初始化不能阻断正常开窗。备用标识仍经排他建目录，发生碰撞只会降级采集。
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{:032x}", (nanos << 32) | u128::from(std::process::id()))
+        })
     }
 
     pub fn finish(self, result: &str) {
@@ -62,7 +70,7 @@ impl AppLog {
         if let Some(writer) = self.writer
             && let Err(error) = writer.finish(diagnostic_text(result))
         {
-            eprintln!("Windroid 日志封存失败：{error}");
+            let _ = writeln!(std::io::stderr().lock(), "Windroid 日志封存失败：{error}");
         }
     }
 }
@@ -150,7 +158,12 @@ pub fn record(
         event.emulator_run_id = emulator_run.map(String::from);
         sink.emit(event);
     } else {
-        eprintln!("{level} {component} {} {message}", instance.unwrap_or(""));
+        drop(guard);
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{level} {component} {} {message}",
+            instance.unwrap_or("")
+        );
     }
 }
 
@@ -205,7 +218,7 @@ mod tests {
 
     #[test]
     fn unwritable_log_location_keeps_the_session_and_the_original_file() {
-        let id = AppLog::allocate_id().unwrap();
+        let id = AppLog::allocate_id();
         let root = std::env::temp_dir().join(format!("windroid-log-fallback-{id}"));
         std::fs::create_dir_all(root.join("logs")).unwrap();
         std::fs::write(root.join("logs/app"), b"existing").unwrap();
