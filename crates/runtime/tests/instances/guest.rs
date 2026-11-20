@@ -27,6 +27,9 @@ pub fn start_and_wait(
     facts: &mut Facts,
     command: Command,
 ) {
+    runtime::instances::register_collector(std::path::Path::new(env!(
+        "CARGO_BIN_EXE_windroid-log-collector"
+    )));
     // 真实 Mac 与前台应用共享内存。只为会随负载变化的宿主压力或余量等候，
     // 始终由产品入口重新采样；规格、资源包、端口等确定性失败立即返回。
     let waiting = Instant::now();
@@ -68,7 +71,7 @@ pub fn start_and_wait(
         assert!(
             facts.process_alive,
             "模拟器提前退出，日志在 {}",
-            layout.instance(&record.id).join("emulator.log").display()
+            layout.instance(&record.id).join("logs/emulator").display()
         );
         std::thread::sleep(Duration::from_millis(500));
     }

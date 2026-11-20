@@ -72,6 +72,7 @@ pub(crate) enum StopMode {
 
 pub(crate) struct OwnedEmulator {
     child: Child,
+    attempt: Option<super::collector::Attempt>,
     launched: SystemTime,
     pid_file: PathBuf,
     temporary: PathBuf,
@@ -162,13 +163,6 @@ impl OwnedEmulator {
                 .admission
                 .reserve(port, demand, budget, Some((store, &dir)))?;
         super::avd::sync_image(&data, &image)?;
-        let log = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(dir.join("emulator.log"))?;
         let mut cmd = Command::new(&paths.emulator);
         // AVD 搜索、快照和数据盘显式指向实例目录。
         // https://developer.android.com/studio/run/emulator-commandline#data-filedir
@@ -191,9 +185,7 @@ impl OwnedEmulator {
             .arg(data.join("userdata-qemu.img"))
             .args(["-no-window", "-no-audio", "-no-boot-anim"])
             .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
+            .stdin(Stdio::null());
         hardware.graphics.apply(&mut cmd);
         if skip_snapshot {
             cmd.arg("-no-snapshot-load");
@@ -233,16 +225,24 @@ impl OwnedEmulator {
                 "--grpc-port=0 --hci-port=0 --tcp-port=0 --ws-port=0",
             ]);
         let launched = SystemTime::now();
-        let child = cmd.spawn().map_err(|e| {
-            let _ = fs::remove_dir(&temporary);
-            io::Error::new(
-                e.kind(),
-                format!("无法启动 {}：{e}", paths.emulator.display()),
-            )
-        })?;
+        let attempt = super::collector::Attempt::prepare(store.home(), id.as_str(), &mut cmd);
+        let spawned = cmd.spawn();
+        // Command 复用时会保留配置的写端。先释放，创建失败的采集器也能读到两个 EOF。
+        drop(cmd);
+        let child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = fs::remove_dir(&temporary);
+                let reason = format!("无法启动 {}：{e}", paths.emulator.display());
+                attempt.finish(log::Level::Error, format!("模拟器进程创建失败：{reason}"));
+                return Err(io::Error::new(e.kind(), reason));
+            }
+        };
+        attempt.started(child.id());
         reservation.child_inherited();
         let owned = Self {
             child,
+            attempt: Some(attempt),
             launched,
             pid_file,
             temporary,
@@ -287,7 +287,20 @@ impl OwnedEmulator {
     }
 
     pub fn alive(&mut self) -> io::Result<bool> {
-        Ok(self.child.try_wait()?.is_none())
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(true);
+        };
+        if let Some(attempt) = self.attempt.take() {
+            attempt.finish(
+                if status.success() {
+                    log::Level::Info
+                } else {
+                    log::Level::Warn
+                },
+                format!("模拟器进程已退出（{status}）"),
+            );
+        }
+        Ok(false)
     }
 
     pub fn allocation(

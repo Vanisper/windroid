@@ -13,6 +13,9 @@ mod streaming;
 mod windows;
 
 fn main() -> Result<(), String> {
+    if let Some(result) = runtime::instances::collector_main() {
+        return result.map_err(|e| e.to_string());
+    }
     let mtm = MainThreadMarker::new().expect("必须在主线程启动");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);

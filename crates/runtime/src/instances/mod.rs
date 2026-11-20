@@ -2,6 +2,8 @@
 //! 分配、选择、启动加锁与删除共享一把目录锁。每个在运行的实例另持有独占文件锁。
 
 mod avd;
+mod collector;
+pub use collector::{collector_main, register_collector};
 mod hardware;
 mod ports;
 mod preview;
@@ -320,6 +322,12 @@ impl InstanceStore {
         let record = read_record(&root, id)?;
         let _lease = acquire_run_lock(&dir)?;
         process::ensure_previous_exit(&dir)?;
+        // 宿主异常退出后，QEMU 与采集进程可能先后离开。采集器封存前保留私有目录。
+        let capture = instance_directory(&dir)?;
+        capture.try_lock().map_err(|e| {
+            let e = io::Error::from(e);
+            io::Error::new(e.kind(), format!("实例日志尚未完成封存：{e}"))
+        })?;
         check_ports(record.port)?;
         let records = records_in(&root)?;
         if selected_in(&root, &records)?.as_ref() == Some(id) {
@@ -349,6 +357,13 @@ impl InstanceStore {
         check_ports(port)?;
         Ok((record, dir, lease))
     }
+}
+
+fn instance_directory(dir: &Path) -> io::Result<File> {
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
 }
 
 fn acquire_run_lock(dir: &Path) -> io::Result<File> {
