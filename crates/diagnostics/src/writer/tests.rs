@@ -258,3 +258,27 @@ fn quota_across_live_writers_reclaims_sealed_segments_then_resumes_with_a_gap() 
     assert_eq!(page.records[0].seq, 1);
     assert_eq!(page.records[1].text, "恢复");
 }
+
+#[test]
+fn only_host_with_an_actual_exit_can_finalize_dead_collector_history_once() {
+    let home = Home::new();
+    home.instance("test");
+    let id = new_run_id().unwrap();
+    let writer = RunWriter::emulator(&home.0, "test", None, &id).unwrap();
+    writer.sink().emit(Event::new("stderr", "before"));
+    assert!(record_interruption(&home.0, "test", &id, "退出码 3").is_err());
+    writer.finish_unknown().unwrap();
+    record_interruption(&home.0, "test", &id, "退出码 3").unwrap();
+    record_interruption(&home.0, "test", &id, "不应覆盖").unwrap();
+    let catalog = Catalog::load(&home.0, Some("test")).unwrap();
+    assert_eq!(catalog.runs[0].outcome.as_deref(), Some("退出码 3"));
+    assert!(catalog.runs[0].lost);
+    let page = read_page(&home.0, Some("test"), &id, None, 0, 8).unwrap();
+    assert_eq!(
+        page.records
+            .iter()
+            .map(|r| r.source.as_str())
+            .collect::<Vec<_>>(),
+        ["stderr", "gap", "windroid"]
+    );
+}

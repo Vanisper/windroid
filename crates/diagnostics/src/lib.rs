@@ -9,7 +9,7 @@ pub use fs::new_run_id;
 pub use reader::{Catalog, Page, RunInfo, legacy_page, read_page, reveal_path};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-pub use writer::{RunWriter, Sink};
+pub use writer::{RunWriter, Sink, record_interruption};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stamp {

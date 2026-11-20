@@ -365,5 +365,55 @@ impl Disk {
     }
 }
 
+/// 采集子进程意外退出后，宿主通过自己的进程句柄取得最终结果。只有原写者
+/// 已释放锁才能续写同一清单。丢失输出的具体数量未知，不能伪造其序号范围。
+pub fn record_interruption(home: &Path, instance: &str, id: &str, outcome: &str) -> io::Result<()> {
+    if !valid_run(id) {
+        return Err(invalid("启动标识无效"));
+    }
+    let dir = Dir::home(home)?
+        .runs(Some(instance), false)?
+        .sub(id, false)?;
+    let lock = dir.read("writer.lock")?;
+    lock.try_lock()?;
+    let manifest = crate::reader::sealed_manifest(&dir, id, Some(instance))?;
+    if manifest.outcome.is_some() {
+        return Ok(());
+    }
+    let persisted = manifest.segments.last().map_or(0, |s| s.last);
+    let mut disk = Disk {
+        home: home.into(),
+        dir,
+        manifest,
+        _lock: lock,
+        segment: None,
+        limit: retention::Limits::default(),
+        persisted,
+        dirty: false,
+    };
+    disk.manifest.lost = true;
+    let stamp = Stamp::now();
+    let result = disk
+        .append(Record {
+            seq: persisted + 1,
+            segment: 0,
+            stamp: stamp.clone(),
+            event: Event::new("gap", "采集器中断，后续模拟器输出可能缺失，数量未知"),
+        })
+        .and_then(|_| {
+            disk.append(Record {
+                seq: persisted + 2,
+                segment: 0,
+                stamp: stamp.clone(),
+                event: Event::new("windroid", outcome),
+            })
+        });
+    disk.manifest.ended = Some(stamp);
+    disk.manifest.outcome = Some(outcome.into());
+    disk.manifest.sealed = true;
+    disk.save()?;
+    result
+}
+
 #[cfg(test)]
 mod tests;
