@@ -104,12 +104,15 @@ impl Library {
         match query {
             Query::Catalog => {
                 let issue = runtime::app_log::capture_issue(home, instance);
-                let catalog = Catalog::load(home, instance).map_err(|e| match &issue {
-                    Some(reason) => io::Error::new(
-                        e.kind(),
-                        format!("日志采集不可用 · {reason}；读取目录失败 · {e}"),
-                    ),
-                    None => e,
+                let catalog = Catalog::load(home, instance).map_err(|e| {
+                    let message = match &issue {
+                        Some(reason) if *reason == e.to_string() => {
+                            format!("无法采集或读取日志 · {reason}")
+                        }
+                        Some(reason) => format!("采集不可用 · {reason}。读取日志目录失败 · {e}"),
+                        None => format!("读取日志目录失败 · {e}"),
+                    };
+                    io::Error::new(e.kind(), message)
                 })?;
                 Ok(
                     json!({"runs":catalog.runs,"legacy":catalog.legacy,"issue":issue,"issues":catalog.issues}),

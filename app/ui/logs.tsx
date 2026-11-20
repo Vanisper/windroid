@@ -235,7 +235,7 @@ export function LogReader(props: { instanceId: string | null }) {
       if (!f.day || !f.run) choose({ day: f.day || days()[0] || "", run: f.run || result.runs[0]?.id || "" });
       revision.update(r => r + 1);
       error.set("");
-    } catch (e) { if (active) error.set("读取日志目录失败 · " + String(e)); }
+    } catch (e) { if (active) error.set(e instanceof Error ? e.message : String(e)); }
     finally { loading.set(false); }
   }
   async function select() {
@@ -253,7 +253,7 @@ export function LogReader(props: { instanceId: string | null }) {
       <Button id="logs-by-day" label="按日期" primary={byDay()} press={() => choose({ mode: "day" })} />
       <Button id="logs-by-run" label="按启动记录" primary={filter().mode === "run"} press={() => choose({ mode: "run" })} />
       {catalog()?.legacy ? <Button id="logs-legacy" label="旧版日志" primary={filter().mode === "legacy"} press={() => choose({ mode: "legacy" })} /> : null}
-      {filter().mode !== "legacy" ? <Button id="logs-refresh" label="刷新" disabled={loading()} press={refresh} /> : null}
+      {filter().mode !== "legacy" ? <Button id="logs-refresh" label="刷新" accessibleValue={error() || catalog()?.issue || catalog()?.issues?.join("\n")} disabled={loading()} press={refresh} /> : null}
       {filter().mode !== "legacy" ? <Button id="logs-follow" label={follow() ? "暂停跟读" : "跟读"} press={() => { follow.set(!follow()); if (follow()) void refresh(); }} /> : null}
     </View>
     {error() ? <Text testID="logs-error" role="alert" style={{ color: colors().bad }}>{error()}</Text> : null}
