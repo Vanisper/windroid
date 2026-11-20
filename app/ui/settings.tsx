@@ -75,7 +75,7 @@ export function Settings() {
     </View>
     <Scroll testID="workspace-scroll" style={{ flex: 1, minHeight: 0 }}>
     {settingsTab() === "window" ? <WindowSettingsPanel /> : settingsTab() === "storage" ? <Storage /> : <View style={card()}>
-      <Heading text="应用日志" /><Detail text="Windroid 当前将运行记录写到标准错误。按启动记录浏览历史将在后续版本提供。" />
+      <Heading text="应用日志" /><Detail text="在终端直接运行 Windroid 可执行文件，可以看到写入标准错误的应用日志。" />
     </View>}
     </Scroll>
   </View>;

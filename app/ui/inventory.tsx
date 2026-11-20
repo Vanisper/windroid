@@ -69,7 +69,6 @@ export function Inventory() {
     <Title text="全部实例" />
     {instances().length ? <View style={card()}>
       <Each of={instances()} key={item => item.id}>{item => <InventoryRow item={item()} />}</Each>
-      <Detail text="批量启停将在后续版本提供。当前可在各实例的管理页启停。" />
     </View> : <View style={card()}>
       <Heading text="还没有实例" />
       <NextAction />
@@ -153,7 +152,7 @@ export function ManageInstance() {
       </View>
       <Heading text="模拟器日志" />
       {logPath() ? <Text style={{ userSelect: "text", fontSize: 13, color: colors().ink }}>{logPath()}</Text> : null}
-      <Detail text="启动模拟器时会写入本次输出。按日期和启动记录浏览历史将在后续版本提供。" />
+      <Detail text="每次启动模拟器都会覆盖上一次的日志。" />
     </View> : null}
   </View>;
 }

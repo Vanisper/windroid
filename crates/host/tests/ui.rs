@@ -800,13 +800,13 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     press(&mut ui.app, "guide-begin");
     wait(&mut ui.app, "id:image-list");
     press(&mut ui.app, "cancel-image-selection");
-    wait(&mut ui.app, "text:/Windroid 当前将运行记录/");
+    wait(&mut ui.app, "id:workspace-scroll >> text:应用日志");
     press(&mut ui.app, "show-guide");
     press(&mut ui.app, "guide-begin");
     press(&mut ui.app, "use-r34");
     wait(&mut ui.app, "id:create-form");
     press(&mut ui.app, "cancel-create");
-    wait(&mut ui.app, "text:/Windroid 当前将运行记录/");
+    wait(&mut ui.app, "id:workspace-scroll >> text:应用日志");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
     assert_eq!(ui.first_pages.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
