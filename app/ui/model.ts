@@ -67,6 +67,14 @@ export function messageText(note: Message): string {
   return "无法确认 APK 安装成功。";
 }
 type Capability = "start" | "stop" | "delete" | "launchApp" | "install" | "deviceView" | "refreshApps";
+export type BatchAction = "start" | "stop";
+export type BatchScope = "all" | "selected" | "retry";
+export interface BatchResult {
+  id: string; name: string; status: "pending" | "running" | "succeeded" | "failed" | "skipped"; message: string;
+}
+export interface BatchJob {
+  jobId: number; action: BatchAction; scope: BatchScope; items: BatchResult[]; active: boolean;
+}
 export interface Snapshot {
   id: string; state: DeviceState; summary: string; stuckAt: string | null;
   capabilities: Record<Capability, boolean>; facts: { adbVisible: boolean; services: { activity: boolean; package: boolean; window: boolean } };
@@ -74,7 +82,7 @@ export interface Snapshot {
   groups: AppSection[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
   instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string;
-  showWelcome?: boolean;
+  showWelcome?: boolean; batch?: BatchJob | null;
   storage?: { home: string; runtimeRoot: string; imageRoot: string; defaultRuntimeRoot: string; defaultImageRoot: string; runtimeIsDefault: boolean; imageIsDefault: boolean; cleanupNotes: string[]; error?: string | null };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
@@ -84,6 +92,7 @@ type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
   | { kind: "createInstance"; name: string; template: string; imageId: string; image: ImageIdentity; cpuCores: number; ramMiB: number; diskGiB: number; gpuMode: GpuMode }
   | { kind: "updateHardware"; instanceId: string; cpuCores: number; ramMiB: number; gpuMode: GpuMode }
+  | { kind: "executeBatch"; previewId: number }
   | { kind: "applyStorage"; plan: { previewId: number } }
   | { kind: "prepareCandidateImage"; previewId: number; resourceId: string; acceptedLicenses: true }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }

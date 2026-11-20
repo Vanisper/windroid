@@ -1,4 +1,6 @@
 //! 实例持久化和真实后端的边界测试。设备命令均进入临时目录里的替身。
+#[path = "instances/preview.rs"]
+mod preview;
 #[path = "instances/support.rs"]
 mod support;
 
@@ -212,6 +214,8 @@ fn bounded_device_backend_checks_ports_process_identity_and_services() {
 printf '%s\n' "$@" > "$WINDROID_BACKEND_TEST_DIR/args"
 printf '%s' "$ANDROID_AVD_HOME" > "$WINDROID_BACKEND_TEST_DIR/avd_home"
 printf '%s' "$ANDROID_EMULATOR_HOME" > "$WINDROID_BACKEND_TEST_DIR/emulator_home"
+printf '%s' "$TMPDIR" > "$WINDROID_BACKEND_TEST_DIR/emulator_tmp"
+test -z "${NETSIM_INSTANCE+x}${NETSIM_ARGS+x}" || exit 1
 while test "$1" != -datadir; do shift; done
 snapshot_dir="$2/snapshots/default_boot"
 save() {
@@ -271,6 +275,8 @@ esac
             .env("WINDROID_SDK", "/unrelated/sdk")
             .env("WINDROID_ADB", "/unrelated/adb")
             .env("WINDROID_AVD", "someone-elses-avd")
+            .env("NETSIM_INSTANCE", "8")
+            .env("NETSIM_ARGS", "--grpc-port=6402")
             .status()
             .unwrap();
         assert!(result.success());
@@ -349,6 +355,11 @@ esac
     assert!(matches!(failure, Rejection::Error { detail, .. } if detail.contains("无法启动")));
     assert!(!facts.process_alive && !pid_marker.exists());
     fs::rename(unavailable, emulator).unwrap();
+    let temp_parent = layout.instance(&a.id).join("tmp");
+    assert_eq!(fs::read_dir(&temp_parent).unwrap().count(), 0);
+    let stale = temp_parent.join("abandoned-session");
+    fs::create_dir(&stale).unwrap();
+    fs::write(stale.join("netsim.ini"), "grpc.port=6402").unwrap();
     let hardware = avd(&root, &a).join("hardware-qemu.ini");
     fs::write(&hardware, "hw.cpu.ncore=8\nhw.ramSize=8192").unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
@@ -448,6 +459,14 @@ esac
     assert_eq!(backend.desktop().default.unwrap().as_str(), "dev.desktop");
     let data = avd(&root, &a);
     let args = fs::read_to_string(root.join("args")).unwrap();
+    let temporary =
+        std::path::PathBuf::from(fs::read_to_string(root.join("emulator_tmp")).unwrap());
+    assert_eq!(temporary.parent(), Some(temp_parent.as_path()));
+    assert_ne!(temporary, stale);
+    assert_eq!(
+        fs::metadata(&temporary).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert_eq!(
         fs::read_to_string(root.join("emulator_home")).unwrap(),
         layout.instance(&a.id).to_str().unwrap()
@@ -458,6 +477,10 @@ esac
     );
     for (flag, value) in [
         ("-avd", a.avd_name()),
+        (
+            "-netsim-args",
+            "--grpc-port=0 --hci-port=0 --tcp-port=0 --ws-port=0",
+        ),
         ("-datadir", data.to_str().unwrap()),
         ("-data", data.join("userdata-qemu.img").to_str().unwrap()),
     ] {
@@ -476,6 +499,8 @@ esac
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(store.quick_boot_saved(&a.id).unwrap());
+    assert!(!temporary.exists());
+    assert!(stale.join("netsim.ini").is_file());
     assert!(facts.allocation.is_none());
     // 普通停止仍回收离线或刷盘失败的实例。未确认的快照只能先正常恢复。
     let rejected = backend

@@ -205,7 +205,7 @@ pub(super) fn recover(
         return Err(invalid(format!("原版本备份发生变化：{}", backup.display())));
     }
     if current.as_ref() == Some(&record.new) {
-        match super::manifest::check(home, dest, pkg, true, guard) {
+        match super::manifest::check(home, dest, pkg, super::Verification::Full, guard) {
             Ok(_) if previous.is_some() => {
                 let _lease = crate::storage::lock_staged_version(&backup)?;
                 super::manifest::repairable(&backup, pkg)?;
@@ -346,7 +346,7 @@ pub(super) fn install(
             return Err(e);
         }
         // 当前进程已持有备份（原目标）对象的独占锁，此处无需再次申请。
-        if let Err(e) = super::manifest::check(home, dest, pkg, true, &check) {
+        if let Err(e) = super::manifest::check(home, dest, pkg, super::Verification::Full, &check) {
             super::manifest::repairable(dest, pkg)?;
             require_object(dest, Some(&record.new), &check)?;
             crate::storage::rename_exclusive(dest, &scratch)?;

@@ -33,16 +33,16 @@ function Workspace() {
   // 页面只响应导航。下载进度与设备事件通过快照更新当前页面。
   const page = computed(() => snapshot() ? screen() : "loading");
   return <View style={{ flex: 1, minHeight: 0, minWidth: 0 }}>
-    {page() === "settings" ? <View onLayout={firstPageShown} style={{ flex: 1, minHeight: 0, gap: 12, padding: narrow() ? 14 : 24 }}>
-      <Feedback /><Settings />
+    {page() === "settings" || page() === "instances" ? <View onLayout={firstPageShown} style={{ flex: 1, minHeight: 0, gap: 12, padding: narrow() ? 14 : 24 }}>
+      <Feedback />{page() === "settings" ? <Settings /> : <Inventory />}
     </View> : <Scroll testID="workspace-scroll" style={{ flex: 1, minWidth: 0, minHeight: 0 }}
       contentStyle={{ gap: 12, padding: narrow() ? 14 : 24 }}>
       <Feedback />
       {page() === "loading" ? <Title text={loadError() ? "无法连接应用库" : "正在读取应用库…"} /> :
         <View onLayout={firstPageShown} style={{ minWidth: 0 }}>
           {page() === "environment" ? <Environment /> : page() === "create" ? <CreateInstance /> :
-            page() === "guide" ? <Guide /> : page() === "manage" ? <ManageInstance /> : page() === "library" ?
-              <Library onManage={() => { const id = currentId(); if (id) void openInstance(id, "manage"); }} /> : <Inventory />}
+            page() === "guide" ? <Guide /> : page() === "manage" ? <ManageInstance /> :
+              <Library onManage={() => { const id = currentId(); if (id) void openInstance(id, "manage"); }} />}
         </View>}
     </Scroll>}
   </View>;

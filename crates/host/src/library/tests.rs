@@ -1,5 +1,7 @@
 use super::*;
 
+mod batch;
+
 fn library() -> (Arc<Library>, mpsc::Receiver<WindowCommand>) {
     let (windows, rx) = mpsc::channel();
     let (_events, window_events) = mpsc::channel();

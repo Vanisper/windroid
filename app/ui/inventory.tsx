@@ -1,8 +1,9 @@
-import { computed, effect, signal, Text, View, windowSize } from "nsh";
+import { computed, effect, Scroll, signal, Text, View, windowSize } from "nsh";
+import { BatchActions, SelectInstance, visibleJob } from "./batch";
 import { Button, card, colors, confirmation, Detail, Heading, row, Title } from "./controls";
 import { HardwareFields, hardwareDraft, hardwareLimits, rendererName } from "./hardware";
 import { DeviceControls } from "./library";
-import { activeTransfer, busy, can, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, send, snapshot, startCreation, switching, type Instance, type InstanceConfig } from "./model";
+import { activeTransfer, busy, can, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, send, snapshot, startCreation, switching, type BatchResult, type Instance, type InstanceConfig } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -41,38 +42,61 @@ function NextAction() {
   </View>;
 }
 
-function InventoryRow(props: { item: Instance }) {
+function InventoryRow(props: { id: string; name: string; item?: Instance; result?: BatchResult }) {
   const stacked = computed(() => windowSize().width < 880);
-  return <View testID={"row-" + props.item.id} style={{ flexDirection: stacked() ? "column" : "row", gap: 12, paddingVertical: 12,
-    borderTopWidth: 1, borderColor: colors().line, alignItems: stacked() ? "stretch" : "center" }}>
-    <View style={{ flexGrow: 1, flexBasis: stacked() ? undefined : 90, minWidth: 0, gap: 4 }}>
-      <View testID={"enter-" + props.item.id} role="button" accessibilityLabel={"打开 " + props.item.name} tooltip={props.item.name}
-        disabled={switching()} onPress={() => void openInstance(props.item.id, "library")}
-        style={{ alignSelf: "flex-start", maxWidth: "100%", padding: 3, borderRadius: 4 }} focusVisibleStyle={{ backgroundColor: colors().selected }}>
-        <Text style={{ fontSize: 15, fontWeight: 650, numberOfLines: 1, color: colors().accent }}>{props.item.name}</Text>
+  const outcome = computed(() => {
+    const result = props.result;
+    if (!result) return "";
+    const labels = { pending: "等待处理", running: "进行中", succeeded: "成功", skipped: "已跳过", failed: "失败" };
+    return labels[result.status] + (result.message && result.message !== labels[result.status] ? " · " + result.message : "");
+  });
+  return <View testID={"row-" + props.id} style={{ flexDirection: "row", alignItems: "center", gap: 8,
+    paddingVertical: 10, borderTopWidth: 1, borderColor: colors().line }}>
+    {!props.result ? <SelectInstance id={props.id} name={props.name} /> : null}
+    <View style={{ flex: 1, minWidth: 0, flexDirection: stacked() ? "column" : "row", gap: 8, alignItems: stacked() ? "stretch" : "center" }}>
+      <View style={{ flexGrow: 1, flexBasis: stacked() ? undefined : 92, minWidth: 0, gap: 3 }}>
+        {props.item ? <View testID={"enter-" + props.id} role="button" accessibilityLabel={"打开 " + props.name} tooltip={props.name}
+          accessibilityValue={outcome() ? { text: outcome() } : undefined}
+          disabled={switching()} onPress={() => void openInstance(props.id, "library")}
+          style={{ alignSelf: "flex-start", maxWidth: "100%", padding: 3, borderRadius: 4 }} focusVisibleStyle={{ backgroundColor: colors().selected }}>
+          <Text style={{ fontSize: 15, fontWeight: 650, numberOfLines: 1, color: colors().accent }}>{props.name}</Text>
+        </View> : <Text style={{ fontSize: 15, color: colors().ink }}>{props.name}</Text>}
+        {!props.result && props.item ? <Detail text={instanceState(props.item)} /> : null}
       </View>
-      <Detail text={instanceState(props.item)} />
+      {props.result ? <Text testID={"outcome-" + props.id} role="text" accessibilityLabel={props.name + " · " + outcome()} style={{ flexGrow: 1, flexBasis: stacked() ? undefined : 160, minWidth: 0,
+        userSelect: "text", fontSize: 13, color: props.result.status === "failed" ? colors().bad : colors().ink }}>{outcome()}</Text> :
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10, flex: stacked() ? undefined : 3, minWidth: 0 }}>
+          <Each of={specs(props.item)} key={s => s.label}>{field => <View style={{ flexGrow: 1, flexBasis: 58, gap: 4 }}>
+            <Text style={{ fontSize: 11, color: colors().muted }}>{field().label}</Text>
+            <Text style={{ fontSize: 13, fontWeight: 550, color: colors().ink }}>{field().value}</Text>
+          </View>}</Each>
+        </View>}
     </View>
-    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12, flex: stacked() ? undefined : 3, minWidth: 0 }}>
-      <Each of={specs(props.item)} key={s => s.label}>{field => <View style={{ flexGrow: 1, flexBasis: 58, gap: 4 }}>
-        <Text style={{ fontSize: 11, color: colors().muted }}>{field().label}</Text>
-        <Text style={{ fontSize: 13, fontWeight: 550, color: colors().ink }}>{field().value}</Text>
-      </View>}</Each>
-    </View>
-    <Button id={"manage-" + props.item.id} label="设置" accessibilityLabel={"管理 " + props.item.name} tooltip={"管理实例 · " + props.item.name}
-      disabled={switching()} press={() => void openInstance(props.item.id, "manage")} />
+    {props.item ? <Button id={"manage-" + props.id} label="设置" accessibilityLabel={"管理 " + props.name} tooltip={"管理实例 · " + props.name}
+      disabled={switching()} press={() => void openInstance(props.id, "manage")} /> : null}
   </View>;
 }
 
 export function Inventory() {
-  return <View testID="inventory" style={{ gap: 18 }}>
-    <Title text="全部实例" />
-    {instances().length ? <View style={card()}>
-      <Each of={instances()} key={item => item.id}>{item => <InventoryRow item={item()} />}</Each>
-    </View> : <View style={card()}>
+  const hasJob = computed(() => !!visibleJob());
+  const populated = computed(() => instances().length > 0 || hasJob());
+  return <View testID="inventory" style={{ flex: 1, minHeight: 0, gap: 14 }}>
+    <View style={row}>
+      <Title text="全部实例" />
+      {visibleJob() ? <Detail text={visibleJob()!.action === "start" ? "批量启动" : "批量停止"} /> : null}
+    </View>
+    {populated() ? <Scroll testID="inventory-scroll" style={{ flex: 1, minHeight: 0 }} contentStyle={card()}>
+      {hasJob() ? <Each of={visibleJob()?.items} key={item => item.id}>{result =>
+        <InventoryRow id={result().id} name={result().name} result={result()} item={instances().find(instance => instance.id === result().id)} />
+      }</Each> : <View style={{ gap: 4 }}>
+        <SelectInstance />
+        <Each of={instances()} key={item => item.id}>{item => <InventoryRow id={item().id} name={item().name} item={item()} />}</Each>
+      </View>}
+    </Scroll> : <Scroll style={{ flex: 1 }} contentStyle={card()}>
       <Heading text="还没有实例" />
       <NextAction />
-    </View>}
+    </Scroll>}
+    <BatchActions />
   </View>;
 }
 

@@ -10,7 +10,7 @@ use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -45,13 +45,18 @@ pub(crate) fn live_marker(dir: &Path) -> io::Result<Option<i32>> {
     .then_some(pid))
 }
 
-pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
+pub(super) fn check_previous_exit(dir: &Path) -> io::Result<()> {
     if let Some(pid) = live_marker(dir)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!("实例上次启动的进程 {pid} 尚未确认退出，请先关闭它"),
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
+    check_previous_exit(dir)?;
     match fs::remove_file(dir.join("active.pid")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
@@ -69,13 +74,14 @@ pub(crate) struct OwnedEmulator {
     child: Child,
     launched: SystemTime,
     pid_file: PathBuf,
+    temporary: PathBuf,
     _lease: File,
     reservation: Reservation,
     pub resources: Arc<SessionResources>,
     pub record: InstanceRecord,
 }
 
-fn launch_requirements(
+pub(super) fn launch_requirements(
     store: &InstanceStore,
     record: &InstanceRecord,
     paths: &crate::provision::RuntimePaths,
@@ -93,7 +99,7 @@ fn launch_requirements(
     Ok((hardware, demand, budget))
 }
 
-fn launch_paths(
+pub(super) fn launch_paths(
     dir: &Path,
     record: &InstanceRecord,
     paths: &crate::provision::RuntimePaths,
@@ -212,8 +218,23 @@ impl OwnedEmulator {
         }
         super::quick_boot::clear(&dir)?;
         let pid_file = dir.join("active.pid");
+        // 37.2.13 的 QEMU 按 TMPDIR/netsim.ini 的 grpc.port 发现网络服务。
+        // 每轮用新目录，异常退出遗留的地址也无法指向后来复用端口的其他实例。
+        // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android/third_party/netsim/backend/packet_streamer_client.cc
+        let temp_root = dir.join("tmp");
+        super::private_dir(&temp_root)?;
+        let temporary = temp_root.join(super::nonce()?);
+        fs::DirBuilder::new().mode(0o700).create(&temporary)?;
+        cmd.env("TMPDIR", &temporary)
+            .env_remove("NETSIM_INSTANCE")
+            .env_remove("NETSIM_ARGS")
+            .args([
+                "-netsim-args",
+                "--grpc-port=0 --hci-port=0 --tcp-port=0 --ws-port=0",
+            ]);
         let launched = SystemTime::now();
         let child = cmd.spawn().map_err(|e| {
+            let _ = fs::remove_dir(&temporary);
             io::Error::new(
                 e.kind(),
                 format!("无法启动 {}：{e}", paths.emulator.display()),
@@ -224,6 +245,7 @@ impl OwnedEmulator {
             child,
             launched,
             pid_file,
+            temporary,
             _lease: lease,
             reservation,
             resources,
@@ -390,6 +412,9 @@ impl Drop for OwnedEmulator {
         match self.stop(StopMode::Force) {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
+                if let Err(e) = fs::remove_dir_all(&self.temporary) {
+                    log::warn!("无法清理实例 {} 的本轮临时目录：{e}", self.record.id);
+                }
                 let _ = self.reservation.file.unlock();
             }
             Err(e) => log::warn!("回收实例 {} 时无法确认进程退出：{e}", self.record.id),

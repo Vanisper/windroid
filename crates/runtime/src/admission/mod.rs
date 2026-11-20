@@ -2,7 +2,7 @@
 //! 每个活动端口的文件锁由启动者及模拟器继承；异常退出无需清理持久计数器。
 
 mod observation;
-use crate::instances::InstanceStore;
+use crate::instances::{InstanceRecord, InstanceStore};
 pub use observation::{MemoryObservation, MemoryPressure};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -94,13 +94,18 @@ impl Admission {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
             other => other?,
         }
+        self.check_directory()?;
+        let guard = lock_file(&self.directory.join("lock"), true)?;
+        guard.lock()?;
+        Ok(guard)
+    }
+
+    fn check_directory(&self) -> io::Result<()> {
         let meta = fs::symlink_metadata(&self.directory)?;
         if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
             return Err(io::Error::other("启动资源预留目录需要当前用户的私有目录"));
         }
-        let guard = lock_file(&self.directory.join("lock"))?;
-        guard.lock()?;
-        Ok(guard)
+        Ok(())
     }
 
     fn grants(&self) -> io::Result<Vec<Grant>> {
@@ -114,8 +119,8 @@ impl Admission {
             else {
                 continue;
             };
-            let file = lock_file(&entry.path())?;
-            match file.try_lock() {
+            let file = lock_file(&entry.path(), false)?;
+            match file.try_lock_shared() {
                 Ok(()) => {
                     // 显式解锁，避免并发 fork 短暂继承这个只用于检查的文件描述符。
                     file.unlock()?;
@@ -147,6 +152,35 @@ impl Admission {
         })
     }
 
+    /// 在同一份宿主观测上模拟预留。首次预览也无需建立全机锁目录或端口记录。
+    pub(crate) fn preview(&self, store: &InstanceStore) -> io::Result<PreviewBudget> {
+        let (grants, guard) = match self.check_directory() {
+            Ok(()) => {
+                let guard = match lock_file(&self.directory.join("lock"), false) {
+                    Ok(file) => {
+                        file.lock_shared()?;
+                        Some(file)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e),
+                };
+                (self.grants()?, guard)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(e) => return Err(e),
+        };
+        check_workspace(store, store.list_readonly()?, &grants)?;
+        let budget = PreviewBudget {
+            grants,
+            sample: self.sample()?,
+            now: observation::now()?,
+        };
+        if let Some(file) = guard {
+            file.unlock()?;
+        }
+        Ok(budget)
+    }
+
     pub(crate) fn reserve(
         &self,
         port: u16,
@@ -157,17 +191,12 @@ impl Admission {
         let _guard = self.lock()?;
         let grants = self.grants()?;
         let instance = if let Some((store, dir)) = workspace {
-            check_workspace(store, &grants)?;
+            check_workspace(store, store.list()?, &grants)?;
             Some(object(dir)?)
         } else {
             None
         };
-        if grants.iter().any(|g| g.port == port) {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("端口 {port} 已被另一次启动预留"),
-            ));
-        }
+        check_port(&grants, port)?;
         let sample = self.sample()?;
         let since = observation::now()?;
         check(&grants, None, demand, budget, sample, since)?;
@@ -178,7 +207,7 @@ impl Admission {
             demand,
             sample,
         };
-        let mut file = lock_file(&self.directory.join(port.to_string()))?;
+        let mut file = lock_file(&self.directory.join(port.to_string()), true)?;
         file.try_lock().map_err(io::Error::from)?;
         file.set_len(0)?;
         serde_json::to_writer(&mut file, &grant)?;
@@ -226,7 +255,7 @@ impl Admission {
         let _guard = self.lock()?;
         let grants = self.grants()?;
         if let Some(store) = workspace {
-            check_workspace(store, &grants)?;
+            check_workspace(store, store.list()?, &grants)?;
         }
         if !grants
             .iter()
@@ -245,14 +274,39 @@ impl Admission {
     }
 }
 
+pub(crate) struct PreviewBudget {
+    grants: Vec<Grant>,
+    sample: MemoryObservation,
+    now: u64,
+}
+
+impl PreviewBudget {
+    pub(crate) fn include(&mut self, port: u16, demand: Demand, budget: Budget) -> io::Result<()> {
+        check_port(&self.grants, port)?;
+        check(&self.grants, None, demand, budget, self.sample, self.now)?;
+        self.grants.push(Grant {
+            port,
+            since: self.now,
+            instance: None,
+            demand,
+            sample: self.sample,
+        });
+        Ok(())
+    }
+}
+
 fn object(dir: &Path) -> io::Result<(u64, u64)> {
     let meta = fs::metadata(dir)?;
     Ok((meta.dev(), meta.ino()))
 }
 
-fn check_workspace(store: &InstanceStore, grants: &[Grant]) -> io::Result<()> {
+fn check_workspace(
+    store: &InstanceStore,
+    records: Vec<InstanceRecord>,
+    grants: &[Grant],
+) -> io::Result<()> {
     // 启动前要计入仍有进程的实例。多个工作区可以同端口登记，靠实例目录对象核对活动预留。
-    for record in store.list()? {
+    for record in records {
         let dir = store.home().join("instances").join(record.id.as_str());
         if let Some(pid) = crate::instances::process::live_marker(&dir)? {
             let source = object(&dir)?;
@@ -270,11 +324,21 @@ fn check_workspace(store: &InstanceStore, grants: &[Grant]) -> io::Result<()> {
     Ok(())
 }
 
-fn lock_file(path: &Path) -> io::Result<File> {
+fn check_port(grants: &[Grant], port: u16) -> io::Result<()> {
+    if grants.iter().any(|g| g.port == port) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("端口 {port} 已被另一次启动预留"),
+        ));
+    }
+    Ok(())
+}
+
+fn lock_file(path: &Path, create: bool) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .write(true)
-        .create(true)
+        .write(create)
+        .create(create)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

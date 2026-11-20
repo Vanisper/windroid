@@ -3,6 +3,8 @@
 
 mod avd;
 mod hardware;
+mod ports;
+mod preview;
 pub(crate) mod process;
 mod quick_boot;
 mod specification;
@@ -236,17 +238,21 @@ impl InstanceStore {
         }
         self.disk_limits()?.check(spec.disk_bytes)?;
         let reserved: BTreeSet<u16> = records_in(&root)?.iter().map(|r| r.port).collect();
+        let occupied = ports::Occupied::read()?;
         let port = match at {
             Some((_, port)) => {
                 if reserved.contains(&port) {
                     return Err(in_use(port));
                 }
                 check_ports(port)?;
+                occupied.check(port)?;
                 port
             }
             None => (FIRST_PORT..=LAST_PORT)
                 .step_by(2)
-                .find(|p| !reserved.contains(p) && check_ports(*p).is_ok())
+                .find(|p| {
+                    !reserved.contains(p) && occupied.check(*p).is_ok() && check_ports(*p).is_ok()
+                })
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::AddrInUse, "实例端口已用尽（5554–5585）")
                 })?,
@@ -339,6 +345,7 @@ impl InstanceStore {
         let dir = root.join(id.as_str());
         let lease = acquire_run_lock(&dir)?;
         process::ensure_previous_exit(&dir)?;
+        ports::Occupied::read()?.check(port)?;
         check_ports(port)?;
         Ok((record, dir, lease))
     }

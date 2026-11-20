@@ -921,3 +921,20 @@ fn copied_publication_record_cannot_recover_another_stage() {
         b"official"
     );
 }
+
+#[test]
+fn read_only_verification_checks_content_without_publishing_a_receipt() {
+    let temp = Temp::new();
+    let path = temp.0.join("version");
+    fs::create_dir(&path).unwrap();
+    let bytes = b"verified payload";
+    let pkg = fixture(bytes, String::new());
+    fs::write(path.join("scrcpy-server.jar"), bytes).unwrap();
+    assert_eq!(
+        manifest::check(&temp.0, &path, pkg, Verification::ReadOnly, || Ok(())).unwrap(),
+        "verified"
+    );
+    fs::write(path.join("scrcpy-server.jar"), vec![0; bytes.len()]).unwrap();
+    assert!(manifest::check(&temp.0, &path, pkg, Verification::ReadOnly, || Ok(())).is_err());
+    assert!(!temp.0.join("cache").exists());
+}

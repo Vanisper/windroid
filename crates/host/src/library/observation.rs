@@ -23,6 +23,12 @@ impl Library {
                 ) {
                     lib.clear_stopped_instance(&id);
                 }
+                if matches!(event, contract::Event::StateChanged { .. })
+                    && let Some((watching, tx)) = &lib.state.lock().unwrap().batch_observer
+                    && watching == &id
+                {
+                    let _ = tx.send(batch::Update::Device(event));
+                }
                 lib.notify();
             }
         });
@@ -309,9 +315,11 @@ impl Library {
             self.release_quit(&data);
             return;
         };
-        if let Err(e) = i.lane.try_send(Request { data, reply: None }) {
+        if let Err(e) = i.lane.try_send(Request::Command { data, reply: None }) {
             let (mpsc::TrySendError::Full(req) | mpsc::TrySendError::Disconnected(req)) = e;
-            self.release_quit(&req.data);
+            if let Request::Command { data, .. } = req {
+                self.release_quit(&data);
+            }
             self.note(Some(id), true, "操作队列繁忙，请重试");
         }
     }

@@ -147,11 +147,18 @@ pub(super) fn full(
     Ok((content_digest(pkg), before))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Verification {
+    Cached,
+    ReadOnly,
+    Full,
+}
+
 pub(super) fn check(
     home: &Path,
     root: &Path,
     pkg: Artifact,
-    force: bool,
+    mode: Verification,
     cancel: impl Fn() -> io::Result<()>,
 ) -> io::Result<&'static str> {
     // 按实际版本位置分开缓存，候选根核验不会覆盖当前根的核验记录。
@@ -159,7 +166,7 @@ pub(super) fn check(
     let dir = home.join("cache/resource-verification");
     let cache = dir.join(key);
     let (signature, precise) = stamp(root, pkg)?;
-    if !force
+    if mode != Verification::Full
         && precise
         && let Ok(message) = super::paths::small_text(&cache)
         && let Some((cached, result)) = message.split_once('\n')
@@ -174,7 +181,7 @@ pub(super) fn check(
         }
     }
     let checked = full(root, pkg, cancel);
-    if !precise {
+    if !precise || mode == Verification::ReadOnly {
         return checked.map(|_| "verified");
     }
     let output = match &checked {

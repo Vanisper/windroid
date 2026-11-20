@@ -96,6 +96,45 @@ fn isolated(name: &str, apis: &[u32]) -> bool {
 }
 
 #[test]
+#[ignore = "需要官方运行组件、Android 13 镜像和能并行启动两台实例的余量"]
+fn stopping_the_first_guest_preserves_the_second_guest_session() {
+    if isolated(
+        "stopping_the_first_guest_preserves_the_second_guest_session",
+        &[33],
+    ) {
+        return;
+    }
+    let layout = Layout::default_root();
+    let store = InstanceStore::new(layout.clone());
+    let mut wanted = spec("phone-1080");
+    wanted.image.api = 33;
+    wanted.image.revision = 9;
+    let first = store.create("先启动", wanted.clone()).unwrap();
+    let second = store.create("保留会话", wanted).unwrap();
+    let (mut a, mut facts_a) = boot(&layout, &first);
+    let (mut b, mut facts_b) = boot(&layout, &second);
+    let boot_id = guest(&b, &second, "cat /proc/sys/kernel/random/boot_id");
+    assert!(!boot_id.is_empty());
+    stop(&mut a, &mut facts_a);
+
+    // 先启动的 Emulator 退出后，另一台的无线服务断连可能稍晚才反映为 QEMU 退出。
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_secs(1));
+        b.observe(&mut facts_b);
+        assert!(
+            facts_b.process_alive && facts_b.services.ready(),
+            "{facts_b:?}"
+        );
+        assert_eq!(
+            guest(&b, &second, "cat /proc/sys/kernel/random/boot_id"),
+            boot_id
+        );
+    }
+    assert!(guest(&b, &second, "ip -4 route get 10.0.2.2").contains("dev "));
+    stop(&mut b, &mut facts_b);
+}
+
+#[test]
 #[ignore = "需要官方运行组件和 Android 14 镜像"]
 fn real_adb_facts_drive_the_state_machine() {
     if isolated("real_adb_facts_drive_the_state_machine", &[34]) {

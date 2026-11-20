@@ -1964,3 +1964,179 @@ fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
     assert_eq!(heading, bounds(&ui.app, "show-guide"));
     check_width(&ui.app);
 }
+
+#[test]
+fn batch_selection_survives_settings_and_confirmation_keeps_reviewed_targets() {
+    let mut view = ready_view();
+    view["instances"] = json!([
+        {"id":"a","name":"工作机","state":"ready"},
+        {"id":"b","name":"阅读机","state":"ready"},
+        {"id":"c","name":"测试机","state":"stopped"}
+    ]);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd["kind"], "selectInstance");
+        view["selectedId"] = cmd["instanceId"].clone();
+        json!({"status":"accepted"})
+    });
+    let (tx, requests) = mpsc::channel();
+    ui.channel.handle("windroid.previewBatch", move |call| {
+        tx.send((call.data().clone(), call.into_reply().unwrap()))
+            .unwrap();
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "all-instances");
+    wait(&mut ui.app, "text:全部停止…");
+    press(&mut ui.app, "batch-stop");
+    let (all, reply) = requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        all,
+        json!({"scope":"all","action":"stop","ids":["a","b","c"]})
+    );
+    let plan = json!({"previewId":1,"scope":"all","action":"stop","items":[
+        {"id":"a","name":"工作机","eligible":true,"reason":"将停止","windows":["设备视图","设置"]},
+        {"id":"b","name":"阅读机","eligible":true,"reason":"将停止","windows":[]},
+        {"id":"c","name":"测试机","eligible":false,"reason":"已停止","windows":[]}
+    ]});
+    reply.resolve(plan.clone());
+    wait(&mut ui.app, "text:本机全部 3 个实例 · 可停止 2 个");
+    let targets = bounds(&ui.app, "batch-targets");
+    assert!(
+        (targets.left().0 + targets.right().0 - 1024.).abs() < 2.,
+        "{targets:?}"
+    );
+    assert!(targets.top().0 > 200., "{targets:?}");
+    wait(&mut ui.app, "id:preview-a >> text:将关闭 · 设备视图、设置");
+    wait(&mut ui.app, "id:preview-c >> text:跳过 · 已停止");
+    wait(&mut ui.app, "text:/结束这些实例的后台任务/");
+    ui.app
+        .set_viewport(Size::new(Points(420.), Points(360.)))
+        .unwrap();
+    ui.app.scroll("id:batch-targets", Points(80.)).unwrap();
+    let confirm = bounds(&ui.app, "batch-confirm");
+    assert!(confirm.left().0 >= 0. && confirm.right().0 <= 420. && confirm.bottom().0 <= 360.);
+    press(&mut ui.app, "batch-cancel");
+
+    press(&mut ui.app, "check-all");
+    wait(&mut ui.app, "text:已选 3 个实例");
+    press(&mut ui.app, "check-all");
+    wait(&mut ui.app, "text:共 3 个实例");
+    press(&mut ui.app, "check-c");
+    press(&mut ui.app, "check-a");
+    press(&mut ui.app, "manage-b");
+    wait(&mut ui.app, "id:manage-instance >> text:阅读机");
+    press(&mut ui.app, "manage-back");
+    wait(&mut ui.app, "text:已选 2 个实例");
+    press(&mut ui.app, "batch-stop");
+    let (chosen, reply) = requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        chosen,
+        json!({"scope":"selected","action":"stop","ids":["a","c"]})
+    );
+    let mut selected = plan;
+    selected["scope"] = json!("selected");
+    selected["previewId"] = json!(2);
+    selected["items"].as_array_mut().unwrap().remove(1);
+    reply.resolve(selected.clone());
+    wait(&mut ui.app, "text:已选 2 个实例 · 可停止 1 个");
+    ui.update(|view| view["instances"].as_array_mut().unwrap().reverse());
+    ui.app.idle(Duration::from_millis(80)).unwrap();
+    assert!(ui.app.screen().enabled("id:batch-recheck").unwrap());
+    press(&mut ui.app, "batch-recheck");
+    let (recheck, reply) = requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(recheck, json!({"previewId":2}));
+    selected["previewId"] = json!(3);
+    selected["items"][0]["eligible"] = json!(false);
+    selected["items"][0]["reason"] = json!("正在停止");
+    reply.resolve(selected);
+    wait(&mut ui.app, "id:preview-a >> text:跳过 · 正在停止");
+    gone(&mut ui.app, "id:batch-confirm");
+    assert!(bounds(&ui.app, "preview-a").top() < bounds(&ui.app, "preview-c").top());
+    assert_eq!(
+        ui.commands.lock().unwrap().as_slice(),
+        [json!({"kind":"selectInstance","instanceId":"b"})]
+    );
+}
+
+#[test]
+fn batch_receipt_tracks_progress_and_retries_only_the_reviewed_failures() {
+    let mut view = ready_view();
+    view["batch"] = json!({"jobId":1,"action":"start","scope":"selected","active":true,"items":[
+        {"id":"a","name":"工作机","status":"running","message":"正在启动"},
+        {"id":"b","name":"阅读机","status":"pending","message":"等待处理"},
+        {"id":"c","name":"测试机","status":"skipped","message":"已在运行"}
+    ]});
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd, &json!({"kind":"executeBatch","previewId":2}));
+        view["batch"] = json!({"jobId":2,"scope":"retry","action":"start","active":false,"items":[
+            {"id":"b","name":"阅读机","status":"succeeded","message":"已启动"}]});
+        json!({"status":"accepted"})
+    });
+    ui.channel.handle("windroid.previewBatch", |call| {
+        assert_eq!(call.data(), &json!({"retryOf":1}));
+        call.resolve(
+            json!({"previewId":2,"scope":"retry","action":"start","items":[
+                {"id":"b","name":"阅读机","eligible":true,"reason":"将启动","windows":[]}
+            ]}),
+        );
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "all-instances");
+    wait(&mut ui.app, "text:正在启动 · 1 / 3");
+    wait(&mut ui.app, "text:进行中 · 正在启动");
+    gone(&mut ui.app, "id:batch-retry");
+    gone(&mut ui.app, "id:check-all");
+    ui.update(|view| {
+        let job = &mut view["batch"];
+        job["active"] = json!(false);
+        job["items"][0]["status"] = json!("succeeded");
+        job["items"][0]["message"] = json!("已启动");
+        job["items"][1]["status"] = json!("failed");
+        job["items"][1]["message"] = json!("模拟器进程已退出");
+    });
+    wait(&mut ui.app, "text:成功 1 个 · 跳过 1 个 · 失败 1 个");
+    wait(&mut ui.app, "text:失败 · 模拟器进程已退出");
+    press(&mut ui.app, "batch-retry");
+    wait(&mut ui.app, "text:上次失败的 1 个实例 · 可启动 1 个");
+    gone(&mut ui.app, "id:preview-a");
+    gone(&mut ui.app, "id:preview-c");
+    press(&mut ui.app, "batch-confirm");
+    wait(&mut ui.app, "text:成功 1 个 · 跳过 0 个 · 失败 0 个");
+    gone(&mut ui.app, "id:outcome-a");
+    gone(&mut ui.app, "id:batch-retry");
+    press(&mut ui.app, "batch-done");
+    wait(&mut ui.app, "id:check-all");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn batch_controls_drive_the_instance_lanes_and_leave_the_unselected_guest_ready() {
+    let mut ui = LibraryUi::new();
+    let first = ui.create();
+    press(&mut ui.app, "new-instance");
+    press(&mut ui.app, "use-system-image");
+    let second = ui.create();
+    press(&mut ui.app, "all-instances");
+    press(&mut ui.app, "batch-start");
+    wait(&mut ui.app, "text:本机全部 2 个实例 · 可启动 2 个");
+    press(&mut ui.app, "batch-confirm");
+    wait(&mut ui.app, "text:成功 2 个 · 跳过 0 个 · 失败 0 个");
+    press(&mut ui.app, "batch-done");
+    press(&mut ui.app, &format!("check-{first}"));
+    press(&mut ui.app, "batch-stop");
+    wait(&mut ui.app, "text:已选 1 个实例 · 可停止 1 个");
+    gone(&mut ui.app, &format!("id:preview-{second}"));
+    press(&mut ui.app, "batch-confirm");
+    wait(&mut ui.app, "text:成功 1 个 · 跳过 0 个 · 失败 0 个");
+    let view = ui.library.snapshot();
+    assert_eq!(view["batch"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(view["batch"]["items"][0]["id"], first);
+    let guests = view["instances"].as_array().unwrap();
+    assert_eq!(
+        guests.iter().find(|d| d["id"] == first).unwrap()["state"],
+        "stopped"
+    );
+    assert_eq!(
+        guests.iter().find(|d| d["id"] == second).unwrap()["state"],
+        "ready"
+    );
+}

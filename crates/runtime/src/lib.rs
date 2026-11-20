@@ -119,12 +119,16 @@ type ResourceResolver = fn(&Path, &contract::Image) -> io::Result<(RuntimePaths,
 pub struct ActiveRuntime {
     current: Arc<Mutex<Weak<SessionResources>>>,
     resolve: ResourceResolver,
+    preview: ResourceResolver,
     admission: admission::Admission,
 }
 
 impl Default for ActiveRuntime {
     fn default() -> Self {
-        Self::new(storage::instance_lease)
+        Self {
+            preview: storage::preview_instance_versions,
+            ..Self::new(storage::instance_lease)
+        }
     }
 }
 
@@ -134,6 +138,7 @@ impl ActiveRuntime {
         Self {
             current: Default::default(),
             resolve,
+            preview: resolve,
             admission: Default::default(),
         }
     }

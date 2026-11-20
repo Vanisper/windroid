@@ -331,3 +331,55 @@ fn local_pressure_and_mach_page_statistics_are_readable() {
         value.pressure, value.additional_mib
     );
 }
+
+#[test]
+fn previews_share_live_usage_and_charge_only_accepted_guests() {
+    let temp = Temp::new();
+    let admission = temp.controller(8192);
+    let store = InstanceStore::new(crate::Layout {
+        root: temp.0.join("workspace"),
+    });
+    let budget = host(6, 12);
+    let existing = admission
+        .reserve(5554, guest(2, 2048), budget, None)
+        .unwrap();
+    let mut preview = admission.preview(&store).unwrap();
+    assert_eq!(
+        preview
+            .include(5554, guest(1, 2048), budget)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AddrInUse
+    );
+    preview.include(5556, guest(2, 2560), budget).unwrap();
+    assert!(
+        preview
+            .include(5558, guest(3, 1024), budget)
+            .unwrap_err()
+            .to_string()
+            .contains("2 核")
+    );
+    assert!(
+        preview
+            .include(5558, guest(2, 2048), budget)
+            .unwrap_err()
+            .to_string()
+            .contains("共享额度剩余 1536 MiB")
+    );
+    preview.include(5558, guest(2, 1536), budget).unwrap();
+    assert!(!temp.0.join("5556").exists() && !temp.0.join("5558").exists());
+    // 外部真实申请可以使用预览中的同一端口与整份余额；下一次预览反映新增预留。
+    let other = admission
+        .reserve(5556, guest(4, 4096), budget, None)
+        .unwrap();
+    assert!(
+        admission
+            .preview(&store)
+            .unwrap()
+            .include(5558, guest(1, 1024), budget)
+            .unwrap_err()
+            .to_string()
+            .contains("0 核")
+    );
+    drop((existing, other));
+}
