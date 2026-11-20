@@ -1,25 +1,32 @@
 use super::*;
 use crate::actions::{self, Kind};
 
+pub(super) fn start_operation(kind: Option<&str>) -> Option<&'static str> {
+    match kind? {
+        "start" => Some("启动"),
+        "restart" => Some("重新启动"),
+        "coldRestart" => Some("冷启动"),
+        _ => None,
+    }
+}
+
 impl Library {
     pub(super) fn perform(self: &Arc<Self>, data: &JsonValue) -> Reply {
         self.perform_logged(data, "实例调度")
     }
 
     pub(super) fn perform_logged(self: &Arc<Self>, data: &JsonValue, component: &str) -> Reply {
-        let operation = match data["kind"].as_str() {
-            Some("start") => "启动",
-            Some("restart") => "重新启动",
-            Some("coldRestart") => "冷启动",
-            Some("stop") => "停止",
-            _ => return self.dispatch(data),
-        };
         let id = data["instanceId"].as_str();
-        if operation != "停止"
-            && let Some(id) = id
-        {
-            runtime::app_log::start_attempt(&self.layout.root, id, None);
-        }
+        let operation = if let Some(name) = start_operation(data["kind"].as_str()) {
+            if let Some(id) = id {
+                runtime::app_log::start_attempt(&self.layout.root, id, None);
+            }
+            name
+        } else if data["kind"] == "stop" {
+            "停止"
+        } else {
+            return self.dispatch(data);
+        };
         let result = self.dispatch(data);
         let (level, message) = match &result {
             Ok(_) => (log::Level::Info, format!("{operation}请求已执行")),

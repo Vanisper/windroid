@@ -295,43 +295,7 @@ impl Library {
                 return;
             };
             let data = call.data().clone();
-            let lane = if matches!(
-                data["kind"].as_str(),
-                Some(
-                    "selectInstance"
-                        | "createInstance"
-                        | "deleteInstance"
-                        | "prepareRuntime"
-                        | "applyStorage"
-                        | "prepareCandidateImage"
-                        | "verifyResource"
-                        | "repairResource"
-                        | "importImage"
-                        | "prepareImage"
-                        | "pausePreparation"
-                        | "recheckRuntime"
-                )
-            ) {
-                None
-            } else {
-                let state = lib.state.lock().unwrap();
-                data["instanceId"]
-                    .as_str()
-                    .and_then(|id| state.instances.get(id))
-                    .map(|i| i.lane.clone())
-            };
-            if let Err(e) = lane.as_ref().unwrap_or(&global).try_send(Request::Command {
-                data,
-                reply: Some(call),
-            }) {
-                let (mpsc::TrySendError::Full(req) | mpsc::TrySendError::Disconnected(req)) = e;
-                if let Request::Command {
-                    reply: Some(call), ..
-                } = req
-                {
-                    call.reject("操作队列繁忙，请稍后再试");
-                }
-            }
+            lib.dispatch_command(&global, data, Some(call));
         });
         let weak = Arc::downgrade(self);
         self.channel.handle(names::SNAPSHOT, move |call| {
@@ -349,6 +313,78 @@ impl Library {
                 call.reject("应用库已关闭");
             }
         });
+    }
+
+    fn dispatch_command(&self, global: &Lane, data: JsonValue, reply: Option<HostCall>) {
+        let lane = if matches!(
+            data["kind"].as_str(),
+            Some(
+                "selectInstance"
+                    | "createInstance"
+                    | "deleteInstance"
+                    | "prepareRuntime"
+                    | "applyStorage"
+                    | "prepareCandidateImage"
+                    | "verifyResource"
+                    | "repairResource"
+                    | "importImage"
+                    | "prepareImage"
+                    | "pausePreparation"
+                    | "recheckRuntime"
+            )
+        ) {
+            None
+        } else {
+            let state = self.state.lock().unwrap();
+            data["instanceId"]
+                .as_str()
+                .and_then(|id| state.instances.get(id))
+                .map(|i| i.lane.clone())
+        };
+        if let Err(error) = lane
+            .as_ref()
+            .unwrap_or(global)
+            .try_send(Request::Command { data, reply })
+        {
+            self.reject_unqueued(error);
+        }
+    }
+
+    /// try_send 退回的请求尚未交给执行者。同一实例可能正在执行另一次启动。
+    fn reject_unqueued(&self, error: mpsc::TrySendError<Request>) {
+        let (request, reason) = match error {
+            mpsc::TrySendError::Full(request) => (request, "操作队列已满"),
+            mpsc::TrySendError::Disconnected(request) => (request, "操作队列已关闭"),
+        };
+        let target = match &request {
+            Request::Command { data, .. } if data["kind"] == "executeBatch" => {
+                Some(("批量调度", None, "批量确认"))
+            }
+            Request::Command { data, .. } => commands::start_operation(data["kind"].as_str())
+                .map(|name| ("实例调度", data["instanceId"].as_str(), name)),
+            Request::Batch {
+                id,
+                action: batch::Action::Start,
+                ..
+            } => Some(("批量调度", Some(id.as_str()), "启动")),
+            Request::Batch { .. } => None,
+        };
+        if let Some((component, instance, operation)) = target {
+            runtime::app_log::record(
+                &self.layout.root,
+                log::Level::Warn,
+                component,
+                instance,
+                None,
+                &format!("{operation}请求未入队：{reason}"),
+            );
+        }
+        if let Request::Command {
+            reply: Some(call), ..
+        } = request
+        {
+            call.reject("操作队列繁忙，请稍后再试");
+        }
     }
 
     fn lane(self: &Arc<Self>) -> Lane {

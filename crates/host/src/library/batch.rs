@@ -392,7 +392,8 @@ impl Library {
             action,
             reply,
         };
-        let result = if lane.try_send(request).is_err() {
+        let result = if let Err(error) = lane.try_send(request) {
+            self.reject_unqueued(error);
             Outcome::new(Status::Failed, "实例操作队列繁忙或已关闭")
         } else {
             match ack.recv() {
