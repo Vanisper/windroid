@@ -8,6 +8,7 @@ use host::surface::{CloseIntent, Window};
 use nsh_platform_macos::objc2::MainThreadMarker;
 use nsh_platform_macos::objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
+mod logging;
 mod streaming;
 mod windows;
 
@@ -17,13 +18,13 @@ fn main() -> Result<(), String> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     // 格式确认可能是首个原生窗口。先让 AppKit 完成启动，模态按钮与辅助功能才可用。
     app.finishLaunching();
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .try_init();
+    logging::install();
+    let run_id = runtime::app_log::AppLog::allocate_id().map_err(|e| e.to_string())?;
     let mut home = runtime::Layout::default_root().root;
     let mut review = host::surface::review_workspace(mtm, &home);
-    let (library_window, library) = loop {
+    let (library_window, library, logs) = loop {
         let error = match review {
-            Ok(Some(state)) => match open_library(mtm, &home, &state) {
+            Ok(Some(state)) => match open_library(mtm, &home, &state, &run_id) {
                 Ok(opened) => break opened,
                 Err(error) => error,
             },
@@ -37,25 +38,37 @@ fn main() -> Result<(), String> {
         home = path;
         review = Ok(Some(state));
     };
-    load_ui(&library_window)?;
-    library_window.show(mtm);
-    app.run();
+    let result = load_ui(&library_window);
+    if result.is_ok() {
+        library_window.show(mtm);
+        app.run();
+    }
     windows::shutdown(mtm);
     library.shutdown();
-    Ok(())
+    logs.finish(
+        result
+            .as_ref()
+            .err()
+            .map(String::as_str)
+            .unwrap_or("Windroid 正常退出"),
+    );
+    result
 }
 
 fn open_library(
     mtm: MainThreadMarker,
     home: &Path,
     state: &runtime::workspace::Workspace,
-) -> Result<(Window, Arc<host::Library>), String> {
+    run_id: &str,
+) -> Result<(Window, Arc<host::Library>, runtime::app_log::AppLog), String> {
     use runtime::workspace::{self, Workspace};
 
     if *state != Workspace::Current {
         workspace::initialize(home, state).map_err(|e| e.to_string())?;
     }
 
+    // 被拒绝的目录和取消的预放资源预览必须保持只读。
+    let logs = runtime::app_log::AppLog::open(home, run_id);
     let app_on_close = NSApplication::sharedApplication(mtm);
     let library_window = Window::new(
         mtm,
@@ -74,9 +87,15 @@ fn open_library(
         root: home.to_owned(),
     };
     let library =
-        host::Library::attach(library_window.channel(), layout, fake, commands, windows_rx)?;
+        match host::Library::attach(library_window.channel(), layout, fake, commands, windows_rx) {
+            Ok(library) => library,
+            Err(error) => {
+                logs.finish(&format!("应用库打开失败：{error}"));
+                return Err(error);
+            }
+        };
     windows::install(mtm, library_window.channel(), home.to_owned(), rx, events);
-    Ok((library_window, library))
+    Ok((library_window, library, logs))
 }
 
 fn load_ui(window: &Window) -> Result<(), String> {

@@ -7,6 +7,7 @@
 //! 状态推导不在这里——那是设备域的事。
 
 pub mod admission;
+pub mod app_log;
 pub mod catalog;
 pub mod install;
 pub mod instances;
