@@ -329,20 +329,20 @@ fn stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot() {
     }
     let layout = Layout::default_root();
     let store = InstanceStore::new(layout.clone());
-    // 第三项之前，compact-720 保存的内存小于这个镜像的要求。保留其 AVD、修订与保存值。
+    // 配置低于镜像内存下限时，启动预留量应提升，私有 AVD 仍保留保存值。
     let original = store.create("既有实例", spec("compact-720")).unwrap();
-    let legacy_path = avd(&layout.root, &original).join("config.ini");
-    let legacy = fs::read_to_string(&legacy_path)
+    let config_path = avd(&layout.root, &original).join("config.ini");
+    let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("windroid.graphics.batch=false\n", "");
-    fs::write(&legacy_path, &legacy).unwrap();
+    fs::write(&config_path, &config).unwrap();
     let saved = original.config(&layout);
     assert_eq!(
         (saved.cpu_cores, saved.ram_mib, saved.graphics),
         (Some(2), Some(1536), Some(GraphicsMode::Host))
     );
     assert_eq!(store.launch_hardware(&original).unwrap().ram_mib, 2560);
-    assert_eq!(fs::read_to_string(legacy_path).unwrap(), legacy);
+    assert_eq!(fs::read_to_string(config_path).unwrap(), config);
 
     let mut chosen = spec("phone-1080");
     chosen.disk_bytes = 6 << 30;

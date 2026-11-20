@@ -251,8 +251,7 @@ fn object(dir: &Path) -> io::Result<(u64, u64)> {
 }
 
 fn check_workspace(store: &InstanceStore, grants: &[Grant]) -> io::Result<()> {
-    // 旧版窗口能在当前工作区留下仍在运行、只有 PID 而没有额度记录的实例。
-    // 端口可被其他工作区复用，同时核对实例目录对象才能认作同一笔活动预留。
+    // 启动前要计入仍有进程的实例。多个工作区可以同端口登记，靠实例目录对象核对活动预留。
     for record in store.list()? {
         let dir = store.home().join("instances").join(record.id.as_str());
         if let Some(pid) = crate::instances::process::live_marker(&dir)? {

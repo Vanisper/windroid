@@ -1,4 +1,4 @@
-//! 已保存的实例规格。旧实例的硬件设置保存在私有 AVD，创建清单记录模板、镜像和用户空间。
+//! 实例的硬件设置保存在私有 AVD，创建清单记录模板、镜像和用户空间。
 
 use super::{
     DiskLimits, GraphicsMode, Hardware, HostCapacity, InstanceRecord, InstanceStore, SpecLimits,
@@ -111,7 +111,7 @@ impl InstanceConfig {
 }
 
 fn graphics(ini: &str) -> io::Result<GraphicsMode> {
-    // 第三项以前的 AVD 固定写入 host，没有批处理标记。
+    // host 模式只有显式启用批处理时才传入对应的 Vulkan 参数。
     match (
         field(ini, "hw.gpu.mode")?,
         field(ini, "windroid.graphics.batch")?,
@@ -196,7 +196,7 @@ impl InstanceStore {
     ) -> io::Result<Hardware> {
         let (limits, saved) = self.saved_profile(record, paths, host)?;
         let mut effective = saved.hardware()?;
-        // 早期 AVD 可以保存低于镜像下限的值。Emulator 自动提升内存，准入按提升后的值。
+        // Emulator 会将低于镜像下限的内存自动提升，启动时按实际需要预留。
         effective.ram_mib = effective.ram_mib.max(limits.min_ram_mib);
         limits.validate(effective)?;
         Ok(effective)
@@ -254,7 +254,7 @@ impl InstanceStore {
         }
         let (paths, _versions) = crate::storage::instance_lease(self.home(), &record.spec.image)?;
         let (limits, saved) = self.saved_profile(&record, &paths, HostCapacity::read()?)?;
-        // 已有实例可以只改核心数或图形并保留历史内存值。主动更换内存时须满足当前下限。
+        // 仅调整 CPU 或图形时保留原内存设置，主动调整内存时按当前下限校验。
         let mut check = hardware;
         if saved.ram_mib == Some(check.ram_mib) {
             check.ram_mib = check.ram_mib.max(limits.min_ram_mib);
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn preexisting_hardware_and_each_graphics_mode_have_unambiguous_launch_arguments() {
+    fn graphics_modes_map_to_their_emulator_arguments() {
         assert_eq!(graphics("hw.gpu.mode=host").unwrap(), GraphicsMode::Host);
         for (mode, args) in [
             (GraphicsMode::Auto, vec!["-gpu", "auto"]),
