@@ -28,10 +28,11 @@ export function Detail(props: { text: string; id?: string; accessible?: boolean 
     style={{ fontSize: 13, color: colors().muted }}>{props.text}</Text>;
 }
 export function Button(props: {
-  id: string; label: string; press: () => void; disabled?: boolean; primary?: boolean; danger?: boolean; tooltip?: string; accessibilityLabel?: string;
+  id: string; label: string; press: () => void; disabled?: boolean; primary?: boolean; danger?: boolean; tooltip?: string; accessibilityLabel?: string; accessibleValue?: string;
 }) {
   return (
-    <View testID={props.id} role="button" accessibilityLabel={props.accessibilityLabel ?? props.label} tooltip={props.tooltip}
+    <View testID={props.id} role="button" accessibilityLabel={props.accessibilityLabel ?? props.label}
+      accessibilityValue={props.accessibleValue ? { text: props.accessibleValue } : undefined} tooltip={props.tooltip}
       disabled={props.disabled === true} onPress={props.press}
       style={{ alignItems: "center", justifyContent: "center", alignSelf: "flex-start", minHeight: 32,
         paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, borderWidth: 1,

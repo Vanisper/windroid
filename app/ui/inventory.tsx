@@ -56,6 +56,7 @@ function InventoryRow(props: { id: string; name: string; item?: Instance; result
     <View style={{ flex: 1, minWidth: 0, flexDirection: stacked() ? "column" : "row", gap: 8, alignItems: stacked() ? "stretch" : "center" }}>
       <View style={{ flexGrow: 1, flexBasis: stacked() ? undefined : 92, minWidth: 0, gap: 3 }}>
         {props.item ? <View testID={"enter-" + props.id} role="button" accessibilityLabel={"打开 " + props.name} tooltip={props.name}
+          accessibilityValue={outcome() ? { text: outcome() } : undefined}
           disabled={switching()} onPress={() => void openInstance(props.id, "library")}
           style={{ alignSelf: "flex-start", maxWidth: "100%", padding: 3, borderRadius: 4 }} focusVisibleStyle={{ backgroundColor: colors().selected }}>
           <Text style={{ fontSize: 15, fontWeight: 650, numberOfLines: 1, color: colors().accent }}>{props.name}</Text>

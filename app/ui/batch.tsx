@@ -3,9 +3,10 @@ import { Checkbox, Dialog } from "nsh/base";
 import { Button, card, colors, Detail, Heading, row } from "./controls";
 import { instances, report, send, snapshot, switching, type BatchAction, type BatchScope } from "./model";
 
+interface PreviewItem { id: string; name: string; eligible: boolean; reason: string; windows: string[] }
 interface Preview {
   previewId: number; action: BatchAction; scope: BatchScope;
-  items: { id: string; name: string; eligible: boolean; reason: string; windows: string[] }[];
+  items: PreviewItem[];
 }
 type PreviewRequest = { action: BatchAction; scope: "all" | "selected"; ids: string[] } | { previewId: number } | { retryOf: number };
 const verb = { start: "启动", stop: "停止" };
@@ -44,6 +45,18 @@ export function BatchActions() {
   const preview = signal<Preview | null>(null);
   const checking = signal(false);
   const eligible = computed(() => preview()?.items.filter(item => item.eligible).length ?? 0);
+  const scope = computed(() => {
+    const shown = preview();
+    return shown ? scopeLabel[shown.scope] + " " + shown.items.length + " 个实例 · 可" + verb[shown.action] + " " + eligible() + " 个" : "";
+  });
+  const impact = computed(() => !eligible() ? "" : preview()?.action === "start" ? "启动前会逐台重新检查可用资源和状态。" :
+    "将关闭可停止实例的应用窗口和设备视图，并结束这些实例的后台任务。");
+  const decision = (item: PreviewItem) => (item.eligible ? "" : "跳过 · ") + item.reason;
+  const windows = (item: PreviewItem) => item.eligible && preview()?.action === "stop" && item.windows.length ?
+    "将关闭 · " + item.windows.join("、") : "";
+  const rowDescription = (item: PreviewItem) => [item.name, decision(item), windows(item)].filter(Boolean).join(" · ");
+  // macOS 外部 AX 客户端可从既有按钮的 AXValue 读取完整复核内容，按钮名称仍对应操作。
+  const reviewDescription = computed(() => [scope(), ...(preview()?.items.map(rowDescription) ?? []), impact()].filter(Boolean).join("\n"));
   const locked = computed(() => checking() || switching());
   const failures = computed(() => visibleJob()?.items.filter(item => item.status === "failed").length ?? 0);
   const summary = computed(() => {
@@ -92,7 +105,7 @@ export function BatchActions() {
       {visibleJob() ? <View style={row}>
         {!visibleJob()!.active && failures() ? <Button id="batch-retry" label="重试失败项…" disabled={locked()}
           press={() => { const job = visibleJob(); if (job && !job.active) void inspect({ retryOf: job.jobId }); }} /> : null}
-        {!visibleJob()!.active ? <Button id="batch-done" label="完成" disabled={locked()} press={finish} /> : null}
+        {!visibleJob()!.active ? <Button id="batch-done" label="完成" accessibleValue={summary()} disabled={locked()} press={finish} /> : null}
       </View> : <View style={row}>
         <Button id="batch-start" label={selectedIds().length ? "启动所选…" : "全部启动…"} disabled={locked()} press={() => begin("start")} />
         <Button id="batch-stop" label={selectedIds().length ? "停止所选…" : "全部停止…"} disabled={locked()} press={() => begin("stop")} />
@@ -103,23 +116,20 @@ export function BatchActions() {
       backdropStyle={{ backgroundColor: "#0A170F70" }}
       style={{ ...card(), margin: "auto", width: Math.min(460, windowSize().width - 32), maxHeight: windowSize().height - 32, padding: 18, gap: 12 }}>
       <Heading text={"确认批量" + verb[shown().action]} />
-      <Detail accessible text={scopeLabel[shown().scope] + " " + shown().items.length + " 个实例 · 可" + verb[shown().action] + " " + eligible() + " 个"} />
+      <Detail accessible text={scope()} />
       <Scroll testID="batch-targets" style={{ minHeight: 0, flexShrink: 1, maxHeight: Math.max(100, Math.floor(windowSize().height * 0.45)) }}>
         <Each of={shown().items} key={item => item.id}>{item => <View testID={"preview-" + item().id} accessible role="text"
-          accessibilityLabel={item().name + " · " + (item().eligible ? "" : "跳过 · ") + item().reason +
-            (item().eligible && shown().action === "stop" && item().windows.length ? " · 将关闭 " + item().windows.join("、") : "")}
+          accessibilityLabel={rowDescription(item())}
           style={{ gap: 4, paddingVertical: 8, borderTopWidth: 1, borderColor: colors().line }}>
           <Text style={{ fontSize: 14, fontWeight: 600, color: colors().ink }}>{item().name}</Text>
-          <Detail text={(item().eligible ? "" : "跳过 · ") + item().reason} />
-          {item().eligible && shown().action === "stop" && item().windows.length ?
-            <Detail text={"将关闭 · " + item().windows.join("、")} /> : null}
+          <Detail text={decision(item())} />
+          {windows(item()) ? <Detail text={windows(item())} /> : null}
         </View>}</Each>
       </Scroll>
-      {eligible() ? <Detail accessible text={shown().action === "start" ? "启动前会逐台重新检查可用资源和状态。" :
-        "将关闭可停止实例的应用窗口和设备视图，并结束这些实例的后台任务。"} /> : null}
+      {impact() ? <Detail accessible text={impact()} /> : null}
       <View style={row}>
         <Button id="batch-cancel" label={eligible() ? "取消" : "完成"} disabled={locked()} press={() => preview.set(null)} />
-        <Button id="batch-recheck" label={checking() ? "正在检查…" : "重新检查"} disabled={locked()}
+        <Button id="batch-recheck" accessibleValue={reviewDescription()} label={checking() ? "正在检查…" : "重新检查"} disabled={locked()}
           press={() => void inspect({ previewId: shown().previewId })} />
         {eligible() ? <Button id="batch-confirm" label={verb[shown().action] + " " + eligible() + " 个"} primary
           disabled={locked()} press={commit} /> : null}
