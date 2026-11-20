@@ -132,30 +132,37 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
                 outcome: None,
                 segments: vec![],
                 lost: false,
+                sealed: false,
             });
             m.segments.retain(|s| s.number != n);
             m.segments.push(seg);
             m.lost |= lost;
         }
     }
-    m.ok_or_else(|| invalid("日志没有可恢复的完整记录"))
+    m.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "日志没有可恢复的完整记录"))
 }
 fn load(dir: &Dir, id: &str, owner: Option<&str>) -> io::Result<(Manifest, bool)> {
     let active = active(dir)?;
-    let m = match manifest(dir, id, owner) {
-        Ok(m) if active || m.ended.is_some() => m,
-        Ok(m) => recover(dir, id, owner, Some(m))?,
-        // 只在缺失或中断的清单上重建；显式的来源不符必须拒绝。
-        Err(e)
-            if !active
-                && (e.kind() == io::ErrorKind::NotFound
-                    || e.get_ref().is_some_and(|e| e.is::<serde_json::Error>())) =>
-        {
-            recover(dir, id, owner, None)?
-        }
-        Err(e) => return Err(e),
+    let m = if active {
+        manifest(dir, id, owner)?
+    } else {
+        sealed_manifest(dir, id, owner)?
     };
     Ok((m, active))
+}
+pub(crate) fn sealed_manifest(dir: &Dir, id: &str, owner: Option<&str>) -> io::Result<Manifest> {
+    match manifest(dir, id, owner) {
+        Ok(m) if m.ended.is_some() || m.sealed => Ok(m),
+        Ok(m) => recover(dir, id, owner, Some(m)),
+        // 明确的来源不符始终拒绝。中断的 JSON 可按段内容重建。
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                || e.get_ref().is_some_and(|e| e.is::<serde_json::Error>()) =>
+        {
+            recover(dir, id, owner, None)
+        }
+        Err(e) => Err(e),
+    }
 }
 impl Catalog {
     pub fn load(home: &Path, instance: Option<&str>) -> io::Result<Self> {

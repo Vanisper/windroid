@@ -133,6 +133,8 @@ struct Manifest {
     segments: Vec<Segment>,
     #[serde(default)]
     lost: bool,
+    #[serde(default)]
+    sealed: bool,
 }
 fn parse_segment(name: &str) -> Option<(u64, &str)> {
     let (n, day) = name.strip_suffix(".jsonl")?.split_once('-')?;

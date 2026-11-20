@@ -3,18 +3,22 @@
 use crate::{
     Manifest,
     fs::{Dir, invalid, valid_instance, valid_run},
-    reader::{manifest, optional},
+    reader::{manifest, optional, sealed_manifest},
     writer::Disk,
 };
 use chrono::{SecondsFormat, Utc};
 use rustix::fs::OFlags;
-use std::{fs::File, io, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) segment: u64,
-    total: u64,
-    days: i64,
+    pub(crate) total: u64,
+    pub(crate) days: i64,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -23,6 +27,17 @@ impl Default for Limits {
             total: 256 << 20,
             days: 14,
         }
+    }
+}
+impl Limits {
+    // 小块预留使多个写者可以并行追加；每次跨过预留边界才重新计算全库预算。
+    pub(crate) fn charge(&self, bytes: u64) -> u64 {
+        const BLOCK: u64 = 256 << 10;
+        bytes
+            .div_ceil(BLOCK)
+            .saturating_mul(BLOCK)
+            .min(self.segment)
+            .max(bytes)
     }
 }
 struct Candidate {
@@ -87,8 +102,8 @@ fn coordinator(home: &Path) -> io::Result<File> {
     Ok(f)
 }
 /// 创建新段时，调用者持有返回的协调锁直到第一条记录和索引都发布。
-pub(crate) fn maintain(disk: &mut Disk, reserve: bool) -> io::Result<File> {
-    let guard = coordinator(&disk.home)?;
+pub(crate) fn maintain(disk: &mut Disk, additional: Option<u64>) -> io::Result<File> {
+    let mut guard = coordinator(&disk.home)?;
     let req = requests(&disk.dir)?;
     for n in &req {
         if disk.active_segment() != Some(*n) {
@@ -98,9 +113,20 @@ pub(crate) fn maintain(disk: &mut Disk, reserve: bool) -> io::Result<File> {
     if !req.is_empty() {
         optional(disk.dir.remove("prune.json", false))?;
     }
-    let cutoff = (chrono::DateTime::<Utc>::from(std::time::SystemTime::now())
-        - chrono::Duration::days(disk.limit.days))
-    .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = chrono::DateTime::<Utc>::from(std::time::SystemTime::now());
+    if additional.is_none() {
+        // 空闲时所有收集进程共用一次周期扫描。每个写者仍及时接收自己的清理请求。
+        let mut buf = [0; 8];
+        if guard.read_exact(&mut buf).is_ok()
+            && (0..60).contains(&now.timestamp().saturating_sub(i64::from_le_bytes(buf)))
+        {
+            return Ok(guard);
+        }
+        guard.seek(SeekFrom::Start(0))?;
+        guard.write_all(&now.timestamp().to_le_bytes())?;
+    }
+    let cutoff = (now - chrono::Duration::days(disk.limit.days))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
     let root = Dir::home(&disk.home)?;
     let mut total = 0;
     let mut candidates = Vec::new();
@@ -128,12 +154,26 @@ pub(crate) fn maintain(disk: &mut Disk, reserve: bool) -> io::Result<File> {
             // 清单尚未发布的启动没有占用段预留。已完成周期取得写者锁之后才接手。
             let m = if mine {
                 disk.manifest.clone()
-            } else {
+            } else if active {
                 let Some(m) = optional(manifest(&dir, &id, owner.as_deref()))? else {
                     continue;
                 };
                 m
+            } else {
+                // 崩溃可能发生在段创建与发布清单之间。封存索引后，后续预算检查
+                // 可以读索引计费，且失去宿主的退出结果仍保持未知。
+                let Some(mut m) = optional(sealed_manifest(&dir, &id, owner.as_deref()))? else {
+                    continue;
+                };
+                if !m.sealed && m.ended.is_none() {
+                    m.sealed = true;
+                    dir.publish("run.json", &serde_json::to_vec(&m)?)?;
+                }
+                m
             };
+            if let Some(index) = optional(dir.read("run.json"))? {
+                total += index.metadata()?.len();
+            }
             let current = if mine {
                 disk.active_segment()
             } else if active {
@@ -157,7 +197,7 @@ pub(crate) fn maintain(disk: &mut Disk, reserve: bool) -> io::Result<File> {
                     continue;
                 }
                 if current == Some(seg.number) {
-                    total += disk.limit.segment;
+                    total += disk.limit.charge(seg.bytes);
                     continue;
                 }
                 total += seg.bytes;
@@ -171,7 +211,7 @@ pub(crate) fn maintain(disk: &mut Disk, reserve: bool) -> io::Result<File> {
             }
         }
     }
-    let reservation = if reserve { disk.limit.segment } else { 0 };
+    let reservation = additional.unwrap_or_default();
     candidates.sort_unstable_by(|a, b| a.utc.cmp(&b.utc));
     for c in candidates {
         if c.utc >= cutoff && total + reservation <= disk.limit.total {
@@ -203,7 +243,7 @@ pub(crate) fn maintain(disk: &mut Disk, reserve: bool) -> io::Result<File> {
         }
         total = total.saturating_sub(c.bytes);
     }
-    if reserve && total + reservation > disk.limit.total {
+    if additional.is_some() && total + reservation > disk.limit.total {
         return Err(invalid("日志额度暂时被正在写入的段占用"));
     }
     Ok(guard)
