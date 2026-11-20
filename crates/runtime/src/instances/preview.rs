@@ -1,11 +1,12 @@
 //! 对固定的启动目标逐台检查，只在内存中累计可启动实例的资源需求。
 
-use super::{InstanceStore, check_ports, image_subdir, invalid, process, quick_boot, read_record};
+use super::{InstanceStore, image_subdir, invalid, ports, process, quick_boot, read_record};
 use crate::ActiveRuntime;
 use contract::InstanceId;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -19,6 +20,7 @@ impl InstanceStore {
     ) -> Vec<io::Result<()>> {
         // 同一批里相同修订只核验一次，避免首次缺少缓存时反复读取完整镜像。
         let mut versions = BTreeMap::new();
+        let mut ports = None;
         let candidates: Vec<io::Result<_>> = ids
             .iter()
             .map(|id| {
@@ -33,7 +35,11 @@ impl InstanceStore {
                 let dir = root.join(id.as_str());
                 check_run_lock(&dir)?;
                 process::check_previous_exit(&dir)?;
-                check_ports(record.port)?;
+                let occupied = ports
+                    .get_or_insert_with(ports::Occupied::read)
+                    .as_ref()
+                    .map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
+                occupied.check(record.port)?;
                 let (paths, _leases) = versions
                     .entry(image_subdir(&record.spec.image)?)
                     .or_insert_with(|| (runtime.preview)(self.home(), &record.spec.image))
@@ -45,6 +51,7 @@ impl InstanceStore {
                 Ok((record.port, demand, budget))
             })
             .collect();
+        drop(versions);
 
         // 大包核验可能耗时。候选项检查结束后再采样，所有模拟申请共用这份观测。
         let mut preview = None;
@@ -75,9 +82,20 @@ fn check_run_lock(dir: &Path) -> io::Result<()> {
     if !file.metadata()?.is_file() {
         return Err(invalid("实例运行锁需要普通文件"));
     }
-    file.try_lock_shared().map_err(|e| {
-        let err = io::Error::from(e);
-        io::Error::new(err.kind(), format!("实例运行锁被占用或无法读取：{err}"))
-    })?;
-    file.unlock()
+    // Darwin 的 F_GETLK 会返回与请求冲突的 BSD flock，只查询，不获取读锁。
+    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_lockf.c
+    // SAFETY: flock 全零表示从文件起点到末尾，fcntl 在调用内填充冲突锁的描述。
+    let mut query: libc::flock = unsafe { std::mem::zeroed() };
+    query.l_type = libc::F_RDLCK as _;
+    query.l_whence = libc::SEEK_SET as _;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut query) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if query.l_type != libc::F_UNLCK as libc::c_short {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "实例运行锁已被占用",
+        ));
+    }
+    Ok(())
 }

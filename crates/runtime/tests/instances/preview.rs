@@ -1,11 +1,11 @@
 use super::{TEST_PORTS, Temp, avd, spec};
-use contract::InstanceId;
+use contract::{Backend, Command, ErrorCode, Facts, InstanceId, Rejection};
 use runtime::admission::{Admission, MemoryObservation, MemoryPressure};
 use runtime::instances::InstanceStore;
 use runtime::provision::RuntimePaths;
-use runtime::{ActiveRuntime, Layout};
+use runtime::{ActiveRuntime, EmulatorBackend, Layout};
 use std::fs;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 
 #[test]
 fn preview_includes_only_eligible_guests_in_order_and_leaves_no_state() {
@@ -68,14 +68,62 @@ fn preview_includes_only_eligible_guests_in_order_and_leaves_no_state() {
             .contains("需要 2560 MiB，宿主当前预计可分配 2490 MiB")
     );
 
-    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, first.port + 1)).unwrap();
-    let retry = store.preview_starts(&ids, &runtime);
-    assert_eq!(
-        retry[0].as_ref().unwrap_err().kind(),
-        std::io::ErrorKind::AddrInUse
+    {
+        let _listener = TcpListener::bind((Ipv4Addr::LOCALHOST, first.port + 1)).unwrap();
+        let checked = store.preview_starts(&ids, &runtime);
+        assert_eq!(
+            checked[0].as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(checked[2].is_ok());
+    }
+    let mut backend = EmulatorBackend::with_runtime(
+        second.id.clone(),
+        layout.clone(),
+        second.port,
+        runtime.clone(),
     );
-    assert!(retry[2].is_ok());
-    drop(occupied);
+    for (address, offset) in [
+        (IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        (IpAddr::V6(Ipv6Addr::LOCALHOST), 1),
+        (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1),
+        (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    ] {
+        let _listener = TcpListener::bind((address, second.port + offset)).unwrap();
+        let retry = store.preview_starts(&ids, &runtime);
+        assert!(retry[0].is_ok());
+        assert_eq!(
+            retry[2].as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(matches!(
+            backend.exec(&Command::Start, &mut Facts::default()),
+            Err(Rejection::Error {
+                code: ErrorCode::NoFreePort,
+                ..
+            })
+        ));
+    }
+    // 旧监听已收回时，同端口上尚未退出的连接及随后进入的 TIME_WAIT 均允许重新启动。
+    let previous = TcpListener::bind((Ipv4Addr::LOCALHOST, second.port)).unwrap();
+    let client = TcpStream::connect(previous.local_addr().unwrap()).unwrap();
+    let (accepted, _) = previous.accept().unwrap();
+    drop(previous);
+    assert!(store.preview_starts(std::slice::from_ref(&second.id), &runtime)[0].is_ok());
+    drop(accepted);
+    drop(client);
+    assert!(store.preview_starts(std::slice::from_ref(&second.id), &runtime)[0].is_ok());
+
+    let held = fs::File::open(layout.instance(&second.id).join("run.lock")).unwrap();
+    held.lock().unwrap();
+    assert_eq!(
+        store.preview_starts(std::slice::from_ref(&second.id), &runtime)[0]
+            .as_ref()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    held.unlock().unwrap();
     assert!(store.preview_starts(std::slice::from_ref(&second.id), &runtime)[0].is_ok());
     fs::remove_file(image.join("vendor.img")).unwrap();
     assert!(
