@@ -60,7 +60,7 @@ fn prepare_prefix(version: &Component, digest: &str, source: &Path, bytes: u64) 
         .unwrap()
         .join(format!(".windroid-install-{}-{digest}", version.id));
     fs::create_dir(&stage).unwrap();
-    fs::write(stage.join("owner"), b"windroid-package-install-v2\n").unwrap();
+    fs::write(stage.join("owner"), b"windroid-package-install-v1\n").unwrap();
     let mut input = fs::File::open(source).unwrap().take(bytes);
     let mut part =
         fs::File::create_new(stage.join(format!("{}-{digest}.part", version.id))).unwrap();

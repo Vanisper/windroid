@@ -8,6 +8,8 @@ use super::integrity::invalid;
 use super::paths::small_text;
 use crate::storage::StableObject;
 
+const INSTALL_MARKER: &str = "windroid-package-install-v1\n";
+
 // 固定包的目录均为 ASCII。逐段检查原始名字，避免解包器静默「修正」路径。
 pub(super) fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
     let name = std::str::from_utf8(raw).map_err(|_| invalid("无效 ZIP 文件名"))?;
@@ -125,7 +127,6 @@ pub(super) fn stage_path(dest: &Path, pkg: Artifact) -> PathBuf {
 pub(super) fn workspace(dest: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
     let stage = stage_path(dest, pkg);
     let owner = stage.join("owner");
-    const MARKER: &str = "windroid-package-install-v2\n";
     if let Err(e) = fs::create_dir(&stage)
         && (e.kind() != io::ErrorKind::AlreadyExists || !fs::symlink_metadata(&stage)?.is_dir())
     {
@@ -148,8 +149,8 @@ pub(super) fn workspace(dest: &Path, pkg: Artifact) -> io::Result<(PathBuf, File
         && fs::read_dir(&stage)?.all(|e| e.is_ok_and(|f| f.path() == owner))
         && lock.metadata()?.nlink() == 1
     {
-        lock.write_all(MARKER.as_bytes())?;
-    } else if marker != MARKER {
+        lock.write_all(INSTALL_MARKER.as_bytes())?;
+    } else if marker != INSTALL_MARKER {
         return Err(invalid(format!(
             "安装暂存位置已被其他文件占用：{}",
             stage.display()
@@ -379,5 +380,5 @@ pub(super) fn install(
 
 pub(super) fn is_workspace(stage: &Path) -> bool {
     fs::symlink_metadata(stage).is_ok_and(|m| m.is_dir())
-        && small_text(&stage.join("owner")).is_ok_and(|s| s == "windroid-package-install-v2\n")
+        && small_text(&stage.join("owner")).is_ok_and(|s| s == INSTALL_MARKER)
 }

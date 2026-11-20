@@ -195,7 +195,8 @@ fn pause_restart_and_resume_from_exact_prefix() {
     let http = Http::new(bytes.clone(), FirstResponse::Stall, false);
     let pkg = fixture(&bytes, http.url.clone());
     let p = controller(&temp.0, pkg);
-    let part = partial(&archive::stage_path(&p.paths().destination(pkg), pkg), pkg);
+    let stage = archive::stage_path(&p.paths().destination(pkg), pkg);
+    let part = partial(&stage, pkg);
     assert_eq!(p.snapshot().phase, "missing");
     assert!(http.ranges.lock().unwrap().is_empty());
     p.start().unwrap();
@@ -207,6 +208,10 @@ fn pause_restart_and_resume_from_exact_prefix() {
     assert!(settled(&second).error.is_some());
     p.pause().unwrap();
     assert_eq!(settled(&p).phase, "paused");
+    assert_eq!(
+        fs::read(stage.join("owner")).unwrap(),
+        b"windroid-package-install-v1\n"
+    );
     assert!(!p.paths().server_jar.exists());
     let retained = fs::metadata(&part).unwrap().len();
     assert!((1..=32_768).contains(&retained));
