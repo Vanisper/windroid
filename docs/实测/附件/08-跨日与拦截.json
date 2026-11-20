@@ -239,6 +239,31 @@
             "#105  2026-11-21 00:00:03.073+02:55  stdout  INFO         | Wait for emulator (pid 82995) 20 seconds to shutdown gracefully before kill;you can set environment variable ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL(in seconds) to change the default value (20 seconds)",
             "#113  2026-11-21 00:00:05.902+02:55  windroid  模拟器进程已退出（exit status: 0）"
           ]
+        },
+        {
+          "view": "emulator-same-day-after-reopen",
+          "clientPid": 14772,
+          "windowId": 21592,
+          "day": "2026-11-21",
+          "instanceId": "wd-60fbe951cb48efafd64929ef643e7bfb",
+          "operation": "管理 Android 2 → 更多 → 模拟器日志 → 按日期，向下滚动两次，从同一份 AX 树摘录三个启动按钮与分段控件的首条记录。",
+          "buttons": [
+            {
+              "label": "2026-11-21 00:04:30.884+02:55 启动",
+              "value": "启动标识 · e9191920d35950910507753410a23d3b\nWindroid 启动标识 · 883be781a77e9213f461b7e3133b3e3f · 模拟器进程已退出（exit status: 0）",
+              "firstRecord": "#1  2026-11-21 00:04:30.888+02:55  windroid  已创建模拟器进程 PID 93055"
+            },
+            {
+              "label": "2026-11-21 00:03:17.075+02:55 启动",
+              "value": "启动标识 · 5a151a6b5678023f4a6ce81eaff700ad\nWindroid 启动标识 · 883be781a77e9213f461b7e3133b3e3f · 模拟器进程已退出（signal: 6 (SIGABRT)）",
+              "firstRecord": "#1  2026-11-21 00:03:17.077+02:55  windroid  已创建模拟器进程 PID 91298"
+            },
+            {
+              "label": "2026-11-21 00:02:40.434+02:55 启动",
+              "value": "启动标识 · 0a002aea6e7710aee3c77f8b8a6635b8\nWindroid 启动标识 · 2bf2fad10f4d46df62758d04b91d83fa · 模拟器进程已退出（exit status: 0）",
+              "firstRecord": "#1  2026-11-21 00:02:40.437+02:55  windroid  已创建模拟器进程 PID 90467"
+            }
+          ]
         }
       ]
     }
