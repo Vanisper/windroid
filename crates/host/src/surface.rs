@@ -22,6 +22,9 @@ use nsh_platform_macos::objc2_foundation::{
 };
 use nsh_platform_macos::{AppOptions, AppView};
 
+mod workspace;
+pub use workspace::{choose_another_workspace, review_workspace};
+
 /// package 为 None 时是该实例的设备视图。窗口从创建到回收始终携带同一把键。
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct WindowKey {
@@ -401,18 +404,13 @@ pub fn pick_resource(
     kind: ResourcePicker,
     chosen: impl FnOnce(Option<PathBuf>) + 'static,
 ) {
-    let panel = NSOpenPanel::openPanel(mtm);
     let directory = !matches!(kind, ResourcePicker::ImageZip);
     let title = match kind {
         ResourcePicker::ImageZip => "选择官方系统镜像 ZIP",
         ResourcePicker::RuntimeDirectory => "选择运行组件目录",
         ResourcePicker::ImageDirectory => "选择系统镜像目录",
     };
-    panel.setTitle(Some(&NSString::from_str(title)));
-    panel.setCanChooseDirectories(directory);
-    panel.setCanCreateDirectories(directory);
-    panel.setCanChooseFiles(!directory);
-    panel.setAllowsMultipleSelection(false);
+    let panel = file_panel(mtm, title, directory);
     if !directory {
         #[allow(deprecated)]
         panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[NSString::from_str(
@@ -420,6 +418,16 @@ pub fn pick_resource(
         )])));
     }
     begin_picker(&panel, chosen);
+}
+
+fn file_panel(mtm: MainThreadMarker, title: &str, directory: bool) -> Retained<NSOpenPanel> {
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setTitle(Some(&NSString::from_str(title)));
+    panel.setCanChooseDirectories(directory);
+    panel.setCanCreateDirectories(directory);
+    panel.setCanChooseFiles(!directory);
+    panel.setAllowsMultipleSelection(false);
+    panel
 }
 
 fn begin_picker(panel: &NSOpenPanel, chosen: impl FnOnce(Option<PathBuf>) + 'static) {
@@ -435,20 +443,4 @@ fn begin_picker(panel: &NSOpenPanel, chosen: impl FnOnce(Option<PathBuf>) + 'sta
         }
     });
     panel.beginWithCompletionHandler(&reply);
-}
-
-/// 工作区拒绝与预放资源确认先于应用库及文件日志。提示只使用 AppKit。
-pub fn workspace_prompt(mtm: MainThreadMarker, title: &str, detail: &str, confirm: bool) -> bool {
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str(title));
-    alert.setInformativeText(&NSString::from_str(detail));
-    alert.addButtonWithTitle(&NSString::from_str(if confirm {
-        "在此新建工作区"
-    } else {
-        "退出"
-    }));
-    if confirm {
-        alert.addButtonWithTitle(&NSString::from_str("取消"));
-    }
-    alert.runModal() == NSAlertFirstButtonReturn
 }
