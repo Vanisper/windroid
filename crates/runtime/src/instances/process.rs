@@ -45,13 +45,18 @@ pub(crate) fn live_marker(dir: &Path) -> io::Result<Option<i32>> {
     .then_some(pid))
 }
 
-pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
+pub(super) fn check_previous_exit(dir: &Path) -> io::Result<()> {
     if let Some(pid) = live_marker(dir)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!("实例上次启动的进程 {pid} 尚未确认退出，请先关闭它"),
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn ensure_previous_exit(dir: &Path) -> io::Result<()> {
+    check_previous_exit(dir)?;
     match fs::remove_file(dir.join("active.pid")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
@@ -75,7 +80,7 @@ pub(crate) struct OwnedEmulator {
     pub record: InstanceRecord,
 }
 
-fn launch_requirements(
+pub(super) fn launch_requirements(
     store: &InstanceStore,
     record: &InstanceRecord,
     paths: &crate::provision::RuntimePaths,
@@ -93,7 +98,7 @@ fn launch_requirements(
     Ok((hardware, demand, budget))
 }
 
-fn launch_paths(
+pub(super) fn launch_paths(
     dir: &Path,
     record: &InstanceRecord,
     paths: &crate::provision::RuntimePaths,

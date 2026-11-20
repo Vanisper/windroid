@@ -619,7 +619,7 @@ fn recover_locked(home: &Path) -> io::Result<()> {
             !same_location(&journal.before.runtime_root, &journal.after.runtime_root),
             !same_location(&journal.before.image_root, &journal.after.image_root),
         );
-        let _work = locks::workspace_locks(home, changed, true)?;
+        let _work = locks::workspace_locks(home, changed, locks::WorkspaceAccess::Move)?;
         settle(home, &journal, false)?;
     }
     retry_cleanup(home)
@@ -638,7 +638,11 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
     if !confirmed.blockers.is_empty() {
         return Err(invalid(confirmed.blockers.join("；")));
     }
-    let _work = locks::workspace_locks(home, confirmed.changed_roots(), true)?;
+    let _work = locks::workspace_locks(
+        home,
+        confirmed.changed_roots(),
+        locks::WorkspaceAccess::Move,
+    )?;
     let changed = confirmed.changed_roots();
     if changed.0 {
         confirmed
@@ -801,7 +805,9 @@ mod tests {
         };
         let plan = preview_switch(&home.0, &target, SwitchMode::Future, false).unwrap();
         let transaction = coordinator(&home.0).unwrap();
-        let work = locks::workspace_locks(&home.0, plan.changed_roots(), true).unwrap();
+        let work =
+            locks::workspace_locks(&home.0, plan.changed_roots(), locks::WorkspaceAccess::Move)
+                .unwrap();
         // dup 与 fork 继承同一个文件描述。让副本活过操作，确定性覆盖 exec 前的窗口。
         let inherited: Vec<_> = transaction
             .0

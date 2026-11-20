@@ -1,7 +1,7 @@
 //! 实际版本目录上的共享使用权随进程关闭释放。写方还持有同一父目录中稳定的
 //! 独占锁，覆盖原版本改名和新版本发布之间的间隔。只读方不创建任何锁文件。
 use super::{absolute, check_volume, invalid, metadata};
-use crate::provision::RuntimePaths;
+use crate::provision::{RuntimePaths, Verification};
 use contract::Image;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
@@ -21,12 +21,16 @@ impl Drop for OperationLocks {
 
 pub(super) fn lock(home: &Path, name: &str) -> io::Result<File> {
     fs::create_dir_all(home)?;
+    open_lock(home, name, true)
+}
+
+fn open_lock(home: &Path, name: &str, create: bool) -> io::Result<File> {
     let file = OpenOptions::new()
-        .create(true)
+        .create(create)
         .truncate(false)
         .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .write(create)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .mode(0o600)
         .open(home.join(name))?;
     let meta = file.metadata()?;
@@ -44,19 +48,33 @@ pub(crate) fn resource_lease(
     components: bool,
     images: bool,
 ) -> io::Result<OperationLocks> {
-    workspace_locks(home, (components, images), false)
+    workspace_locks(home, (components, images), WorkspaceAccess::Use)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum WorkspaceAccess {
+    Use,
+    Move,
+    Preview,
 }
 
 pub(super) fn workspace_locks(
     home: &Path,
     changed: (bool, bool),
-    moving: bool,
+    access: WorkspaceAccess,
 ) -> io::Result<OperationLocks> {
     let mut leases = OperationLocks(Vec::new());
     for (needed, name) in [(changed.0, ".components.lock"), (changed.1, ".images.lock")] {
         if needed {
-            let file = lock(home, name)?;
-            let acquired = if moving {
+            let file = if access == WorkspaceAccess::Preview {
+                match open_lock(home, name, false) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    result => result?,
+                }
+            } else {
+                lock(home, name)?
+            };
+            let acquired = if access == WorkspaceAccess::Move {
                 file.try_lock()
             } else {
                 file.try_lock_shared()
@@ -151,6 +169,22 @@ pub(crate) fn version_write_lease(path: &Path) -> io::Result<Vec<File>> {
 
 pub(crate) fn instance_lease(home: &Path, image: &Image) -> io::Result<(RuntimePaths, Vec<File>)> {
     let _selection = resource_lease(home, true, true)?;
+    checked_versions(home, image, Verification::Cached)
+}
+
+pub(crate) fn preview_instance_versions(
+    home: &Path,
+    image: &Image,
+) -> io::Result<(RuntimePaths, Vec<File>)> {
+    let _selection = workspace_locks(home, (true, true), WorkspaceAccess::Preview)?;
+    checked_versions(home, image, Verification::ReadOnly)
+}
+
+fn checked_versions(
+    home: &Path,
+    image: &Image,
+    mode: Verification,
+) -> io::Result<(RuntimePaths, Vec<File>)> {
     let config = super::StorageLocations::load(home)?;
     let points = super::mounts::load(home)?;
     points.check(&config.runtime_root, false)?;
@@ -165,8 +199,13 @@ pub(crate) fn instance_lease(home: &Path, image: &Image) -> io::Result<(RuntimeP
             }
             selected = true;
         }
-        leases.push(version_read_lease(&pkg.path)?);
-        pkg.check(home)?;
+        leases.push(version_read_lease(&pkg.path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("{}（{}）：{e}", pkg.label(), pkg.path.display()),
+            )
+        })?);
+        pkg.check(home, mode)?;
     }
     if !selected {
         return Err(invalid("实例绑定的确切镜像修订不在发布清单中"));

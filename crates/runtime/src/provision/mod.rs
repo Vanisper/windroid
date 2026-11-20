@@ -9,6 +9,7 @@ mod import;
 mod integrity;
 mod manifest;
 mod metadata;
+pub(crate) use manifest::Verification;
 pub use manifest::preview_seed;
 mod paths;
 #[cfg(test)]
@@ -496,7 +497,7 @@ fn component(home: &Path, paths: &RuntimePaths, pkg: Artifact) -> Component {
         let lease = crate::storage::version_read_lease(&location)?;
         let result = match manifest::empty_skeleton(&location, pkg) {
             Ok(true) => Ok("missing"),
-            Ok(false) => manifest::check(home, &location, pkg, false, || Ok(())),
+            Ok(false) => manifest::check(home, &location, pkg, Verification::Cached, || Ok(())),
             Err(e) => Err(e),
         };
         let _ = lease.unlock();
@@ -797,7 +798,9 @@ impl Shared {
         if matches!(task, Task::Verify) {
             self.phase(pkg, "verifying");
             let lease = crate::storage::version_read_lease(&dest)?;
-            let result = manifest::check(&self.home, &dest, pkg, true, || self.check_pause());
+            let result = manifest::check(&self.home, &dest, pkg, Verification::Full, || {
+                self.check_pause()
+            });
             let _ = lease.unlock();
             return result.map(|_| ());
         }
@@ -881,7 +884,11 @@ impl Shared {
         }
         let original = archive::object(&dest)?;
         if original.is_some() {
-            if manifest::check(&self.home, &dest, pkg, false, || self.check_pause()).is_ok() {
+            if manifest::check(&self.home, &dest, pkg, Verification::Cached, || {
+                self.check_pause()
+            })
+            .is_ok()
+            {
                 guard()?;
                 let part = partial(&stage, pkg);
                 if download::part_len(&part)? > 0 {

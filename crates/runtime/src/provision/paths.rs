@@ -46,8 +46,8 @@ impl ManagedPackage {
         self.artifact.unpacked
     }
     /// 调用方在整个使用期间持有版本对象的共享租约。
-    pub(crate) fn check(&self, home: &Path) -> io::Result<()> {
-        super::manifest::check(home, &self.path, self.artifact, false, || Ok(())).map(|_| ())
+    pub(crate) fn check(&self, home: &Path, mode: super::Verification) -> io::Result<()> {
+        super::manifest::check(home, &self.path, self.artifact, mode, || Ok(())).map(|_| ())
     }
     pub(crate) fn content_digest(&self) -> String {
         super::manifest::content_digest(self.artifact)

@@ -3,6 +3,7 @@
 
 mod avd;
 mod hardware;
+mod preview;
 pub(crate) mod process;
 mod quick_boot;
 mod specification;

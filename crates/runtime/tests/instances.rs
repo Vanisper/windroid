@@ -1,4 +1,6 @@
 //! 实例持久化和真实后端的边界测试。设备命令均进入临时目录里的替身。
+#[path = "instances/preview.rs"]
+mod preview;
 #[path = "instances/support.rs"]
 mod support;
 
