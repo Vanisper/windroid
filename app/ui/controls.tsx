@@ -23,8 +23,9 @@ export function Title(props: { text: string }) {
 export function Heading(props: { text: string }) {
   return <Text role="header" accessibilityLevel={2} style={{ fontSize: 16, fontWeight: 650, color: colors().ink }}>{props.text}</Text>;
 }
-export function Detail(props: { text: string; id?: string }) {
-  return <Text testID={props.id} style={{ fontSize: 13, color: colors().muted }}>{props.text}</Text>;
+export function Detail(props: { text: string; id?: string; accessible?: boolean }) {
+  return <Text testID={props.id} role={props.accessible ? "text" : undefined} accessibilityLabel={props.accessible ? props.text : undefined}
+    style={{ fontSize: 13, color: colors().muted }}>{props.text}</Text>;
 }
 export function Button(props: {
   id: string; label: string; press: () => void; disabled?: boolean; primary?: boolean; danger?: boolean; tooltip?: string; accessibilityLabel?: string;
