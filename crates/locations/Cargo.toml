@@ -7,5 +7,6 @@ license.workspace = true
 description = "Windroid 受管资源的持久化位置"
 
 [dependencies]
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true

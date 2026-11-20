@@ -14,14 +14,12 @@ use crate::{DisplayTarget, packet::invalid};
 const COMMAND_LIMIT: Duration = Duration::from_secs(10);
 const CLEANUP_LIMIT: Duration = Duration::from_secs(2);
 
-fn command(adb: &Path, serial: &str) -> Command {
-    let mut cmd = Command::new(adb);
-    cmd.arg("-s")
-        .arg(serial)
-        .stdin(Stdio::null())
+fn command(device: adb::Device<'_>, until: Instant) -> io::Result<Command> {
+    let mut cmd = device.command(until)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd
+    Ok(cmd)
 }
 
 fn wait(child: &mut Child, until: Instant) -> io::Result<ExitStatus> {
@@ -40,14 +38,14 @@ fn wait(child: &mut Child, until: Instant) -> io::Result<ExitStatus> {
 }
 
 fn run(
-    adb: &Path,
-    serial: &str,
+    device: adb::Device<'_>,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     timeout: Duration,
 ) -> io::Result<String> {
-    let mut cmd = command(adb, serial);
+    let until = Instant::now() + timeout;
+    let mut cmd = command(device, until)?;
     cmd.args(args);
-    let out = adb::output_with_timeout(cmd, timeout)?;
+    let out = adb::output_with_timeout(cmd, until.saturating_duration_since(Instant::now()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if out.status.success() {
         Ok(stdout.trim().to_owned())
@@ -102,6 +100,7 @@ fn log_pipe(
 
 pub(crate) struct Server {
     adb: PathBuf,
+    transport: adb::Transport,
     serial: String,
     scid: String,
     dir: String,
@@ -114,8 +113,7 @@ pub(crate) struct Server {
 
 impl Server {
     pub(crate) fn start(
-        adb: &Path,
-        serial: &str,
+        device: adb::Device<'_>,
         jar: &Path,
         target: &DisplayTarget,
         cancelled: &dyn Fn() -> bool,
@@ -132,15 +130,11 @@ impl Server {
         let dir = format!("/data/local/tmp/windroid-scrcpy-{scid}");
         let (display_tx, display) = mpsc::channel();
         // mkdir 是设备上该 ID 的独占操作，失败时不得接手或删除原目录。
-        run(
-            adb,
-            serial,
-            ["shell", "mkdir", "-m", "700", &dir],
-            COMMAND_LIMIT,
-        )?;
+        run(device, ["shell", "mkdir", "-m", "700", &dir], COMMAND_LIMIT)?;
         let mut me = Self {
-            adb: adb.to_owned(),
-            serial: serial.to_owned(),
+            adb: device.program.to_owned(),
+            serial: device.serial.to_owned(),
+            transport: device.transport,
             scid,
             dir,
             port: None,
@@ -152,8 +146,7 @@ impl Server {
         crate::check_cancel(cancelled)?;
         let remote = format!("{}/server.jar", me.dir);
         run(
-            adb,
-            serial,
+            device,
             [OsStr::new("push"), jar.as_os_str(), OsStr::new(&remote)],
             COMMAND_LIMIT,
         )?;
@@ -161,8 +154,7 @@ impl Server {
         let socket = me.socket();
         me.forward_requested = true;
         let port = run(
-            adb,
-            serial,
+            device,
             ["forward", "--no-rebind", "tcp:0", &socket],
             COMMAND_LIMIT,
         )?;
@@ -186,7 +178,7 @@ impl Server {
             me.scid
         );
         crate::check_cancel(cancelled)?;
-        let mut child = command(adb, serial)
+        let mut child = command(device, Instant::now() + COMMAND_LIMIT)?
             .args(["shell", "-T", &launch])
             .spawn()?;
         log_pipe(
@@ -201,6 +193,14 @@ impl Server {
         );
         me.child = Some(child);
         Ok(me)
+    }
+
+    fn device(&self) -> adb::Device<'_> {
+        adb::Device {
+            program: &self.adb,
+            serial: &self.serial,
+            transport: self.transport,
+        }
     }
 
     pub(crate) fn port(&self) -> u16 {
@@ -265,12 +265,7 @@ impl Drop for Server {
         // tcp 端口可能已被别人重新分配。只有 (serial, tcp, scid) 仍匹配才撤销。
         let socket = self.socket();
         if self.forward_requested
-            && let Ok(list) = run(
-                &self.adb,
-                &self.serial,
-                ["forward", "--list"],
-                CLEANUP_LIMIT,
-            )
+            && let Ok(list) = run(self.device(), ["forward", "--list"], CLEANUP_LIMIT)
         {
             // 返回端口前 adb 超时也可能已经建立映射。用私有 scid 找回它。
             for line in list.lines() {
@@ -284,12 +279,7 @@ impl Drop for Server {
                         .and_then(|s| s.parse::<u16>().ok())
                     && self.port.is_none_or(|known| known == port)
                 {
-                    let _ = run(
-                        &self.adb,
-                        &self.serial,
-                        ["forward", "--remove", local],
-                        CLEANUP_LIMIT,
-                    );
+                    let _ = run(self.device(), ["forward", "--remove", local], CLEANUP_LIMIT);
                 }
             }
         }
@@ -301,7 +291,7 @@ impl Drop for Server {
         if let Some(child) = &mut self.child {
             let _ = wait(child, Instant::now() + Duration::from_millis(300));
         }
-        let _ = run(&self.adb, &self.serial, ["shell", &clean], CLEANUP_LIMIT);
+        let _ = run(self.device(), ["shell", &clean], CLEANUP_LIMIT);
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();

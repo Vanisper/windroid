@@ -30,17 +30,19 @@ impl Drop for Temp {
 }
 
 fn fixture(bytes: &[u8], url: String) -> Artifact {
+    let sha = base16ct::lower::encode_string(&Sha256::digest(bytes));
     Artifact {
         kind: Kind::Server,
-        id: "server",
+        id: "scrcpy-server",
         name: "fixture",
         image_spec: None,
-        version: "1",
+        version: "5.0.1",
         url: Box::leak(url.into_boxed_str()),
         bytes: bytes.len() as u64,
-        digest: Digest::Sha256(Box::leak(
-            format!("{:x}", Sha256::digest(bytes)).into_boxed_str(),
-        )),
+        manifest: Box::leak(
+            format!("# {sha}\nf\t{}\t-\t{sha}\tscrcpy-server.jar\n", bytes.len()).into_boxed_str(),
+        ),
+        digest: Digest::Sha256(Box::leak(sha.into_boxed_str())),
         prefix: None,
         unpacked: bytes.len() as u64,
         essentials: &[],
@@ -174,56 +176,16 @@ impl Drop for Http {
 }
 
 #[test]
-fn empty_overrides_use_private_paths_and_explicit_binaries_are_read_only() {
-    use std::ffi::OsString;
+fn new_roots_are_independent_and_versioned() {
     let t = Temp::new();
-    let home = t.0.join("home");
-    let paths = RuntimePaths::resolve(&home, |_| Some(OsString::new()));
-    assert_eq!(paths.adb, home.join("runtime/sdk/platform-tools/adb"));
-    assert_eq!(paths.server_jar, home.join("runtime/scrcpy-server.jar"));
-    assert!(!paths.borrowed && !paths.read_only(Kind::Adb) && !paths.read_only(Kind::Server));
-
-    let adb = t.0.join("custom-adb");
-    fs::write(&adb, b"development binary").unwrap();
-    fs::set_permissions(&adb, fs::Permissions::from_mode(0o755)).unwrap();
-    let other_jar = t.0.join("custom.jar");
-    fs::write(&other_jar, b"incompatible version").unwrap();
-    let paths = RuntimePaths::resolve(&home, |key| match key {
-        "WINDROID_ADB" => Some(OsString::from("custom-adb")),
-        "WINDROID_SERVER_JAR" => Some(other_jar.as_os_str().into()),
-        "PATH" => Some(t.0.as_os_str().into()),
-        _ => None,
-    });
-    assert_eq!(paths.adb, adb);
-    assert_eq!(paths.server_jar, other_jar);
-    assert!(
-        paths.read_only(Kind::Adb)
-            && paths.read_only(Kind::Server)
-            && !paths.read_only(Kind::Emulator)
+    let paths = RuntimePaths::discover(&t.0);
+    assert_eq!(paths.adb, t.0.join("runtime/platform-tools/37.0.1/adb"));
+    assert_eq!(
+        paths.server_jar,
+        t.0.join("runtime/scrcpy-server/5.0.1/scrcpy-server.jar")
     );
-    let p = Provisioner::configured(home.clone(), paths, &CATALOG, true);
-    let s = p.snapshot();
-    assert!(
-        s.components
-            .iter()
-            .any(|c| c.id == "platform-tools" && c.ready && c.borrowed)
-    );
-    assert!(
-        s.components
-            .iter()
-            .any(|c| c.id == "scrcpy-server" && !c.ready && c.borrowed)
-    );
-    assert!(p.start().unwrap_err().contains("只读"));
-    assert!(!home.exists());
-    fs::set_permissions(&adb, fs::Permissions::from_mode(0o644)).unwrap();
-    p.recheck().unwrap();
-    assert!(
-        p.snapshot()
-            .components
-            .iter()
-            .any(|c| c.id == "platform-tools" && !c.ready)
-    );
-    assert_eq!(fs::read(other_jar).unwrap(), b"incompatible version");
+    assert_eq!(paths.images, t.0.join("system-images"));
+    assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
 }
 
 #[test]
@@ -233,7 +195,8 @@ fn pause_restart_and_resume_from_exact_prefix() {
     let http = Http::new(bytes.clone(), FirstResponse::Stall, false);
     let pkg = fixture(&bytes, http.url.clone());
     let p = controller(&temp.0, pkg);
-    let part = partial(&p.owner.worker.stage, pkg);
+    let stage = archive::stage_path(&p.paths().destination(pkg), pkg);
+    let part = partial(&stage, pkg);
     assert_eq!(p.snapshot().phase, "missing");
     assert!(http.ranges.lock().unwrap().is_empty());
     p.start().unwrap();
@@ -242,9 +205,13 @@ fn pause_restart_and_resume_from_exact_prefix() {
     assert!(p.recheck().is_err());
     let second = controller(&temp.0, pkg);
     second.start().unwrap();
-    assert!(settled(&second).error.unwrap().contains("独占"));
+    assert!(settled(&second).error.is_some());
     p.pause().unwrap();
     assert_eq!(settled(&p).phase, "paused");
+    assert_eq!(
+        fs::read(stage.join("owner")).unwrap(),
+        b"windroid-package-install-v1\n"
+    );
     assert!(!p.paths().server_jar.exists());
     let retained = fs::metadata(&part).unwrap().len();
     assert!((1..=32_768).contains(&retained));
@@ -292,8 +259,9 @@ fn official_platform_tools_and_server_install_into_private_home() {
 }
 
 fn stage(home: &Path, pkg: Artifact, bytes: &[u8]) -> PathBuf {
-    let stage = home.join("staging/provision-v1");
-    fs::create_dir_all(&stage).unwrap();
+    let dest = RuntimePaths::discover(home).destination(pkg);
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let (stage, _lock) = archive::workspace(&dest, pkg).unwrap();
     let file = partial(&stage, pkg);
     fs::write(&file, bytes).unwrap();
     file
@@ -319,9 +287,9 @@ fn checksum_mismatch_discards_the_partial_and_preserves_live_data() {
     let pkg = fixture(b"correct", "https://example.invalid".into());
     let input = stage(&t.0, pkg, b"corrupt");
     let p = controller(&t.0, pkg);
-    fs::create_dir(t.0.join("runtime")).unwrap();
+    fs::create_dir_all(p.paths().server_jar.parent().unwrap()).unwrap();
     fs::write(&p.paths().server_jar, b"old").unwrap();
-    p.start().unwrap();
+    p.repair(pkg.id).unwrap();
     let snap = settled(&p);
     assert_eq!(snap.phase, "failed");
     assert!(snap.error.unwrap().contains("校验和"));
@@ -329,6 +297,8 @@ fn checksum_mismatch_discards_the_partial_and_preserves_live_data() {
     assert_eq!(fs::read(&p.paths().server_jar).unwrap(), b"old");
 }
 
+const HOST_ARM64: &[u8] = b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01fixture";
+const ARM_EXECUTABLE: &[(&str, u64)] = &[("adb", HOST_ARM64.len() as u64)];
 fn zip_fixture(entries: &[(&str, &[u8], u32)]) -> (Artifact, Vec<u8>) {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for &(name, body, mode) in entries {
@@ -345,11 +315,30 @@ fn zip_fixture(entries: &[(&str, &[u8], u32)]) -> (Artifact, Vec<u8>) {
         }
     }
     let bytes = writer.finish().unwrap().into_inner();
+    let mut rows = std::collections::BTreeMap::new();
+    for &(name, body, mode) in entries {
+        let rel = name.split_once('/').unwrap().1;
+        rows.insert(
+            rel,
+            format!(
+                "f\t{}\t{}\t{}",
+                body.len(),
+                if mode & 0o111 != 0 { "x" } else { "-" },
+                base16ct::lower::encode_string(&Sha256::digest(body))
+            ),
+        );
+    }
+    let mut inventory = "# fixture\n".to_string();
+    for (path, row) in rows {
+        inventory.push_str(&format!("{row}\t{path}\n"));
+    }
     let pkg = Artifact {
+        manifest: Box::leak(inventory.into_boxed_str()),
+        version: "1",
         kind: Kind::Adb,
         id: "platform-tools",
         prefix: Some("platform-tools"),
-        essentials: &[("adb", 7)],
+        essentials: ARM_EXECUTABLE,
         unpacked: entries.iter().map(|(_, b, _)| b.len() as u64).sum(),
         ..fixture(&bytes, "https://example.invalid".into())
     };
@@ -385,17 +374,18 @@ fn staged_sdk_payload_is_checked_before_publish_and_on_each_scan() {
             b"Pkg.Revision=1\n",
             0o644,
         ),
-        ("platform-tools/adb", b"fixture", 0o755),
+        ("platform-tools/adb", HOST_ARM64, 0o755),
     ]);
     stage(&t.0, pkg, &bytes);
     let p = controller(&t.0, pkg);
     p.start().unwrap();
     let snap = settled(&p);
     assert_eq!(snap.phase, "ready", "{:?}", snap.error);
-    assert_eq!(fs::read(&p.paths().adb).unwrap(), b"fixture");
-    fs::set_permissions(&p.paths().adb, fs::Permissions::from_mode(0o644)).unwrap();
+    let adb = p.paths().destination(pkg).join("adb");
+    assert_eq!(fs::read(&adb).unwrap(), HOST_ARM64);
+    fs::set_permissions(&adb, fs::Permissions::from_mode(0o644)).unwrap();
     p.recheck().unwrap();
-    assert_eq!(p.snapshot().phase, "missing");
+    assert_eq!(p.snapshot().components[0].integrity, "damaged");
     assert!(
         p.snapshot().components[0]
             .issue
@@ -403,21 +393,21 @@ fn staged_sdk_payload_is_checked_before_publish_and_on_each_scan() {
             .unwrap()
             .contains("不可执行")
     );
-    fs::set_permissions(&p.paths().adb, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::remove_file(p.paths().sdk.join("platform-tools").join(paths::RECEIPT)).unwrap();
+    fs::set_permissions(&adb, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(&adb).unwrap();
     p.recheck().unwrap();
     assert!(
         p.snapshot().components[0]
             .issue
             .as_ref()
             .unwrap()
-            .contains("安装不完整")
+            .contains("缺少文件")
     );
 }
 
 #[test]
 fn invalid_archive_or_version_never_replaces_the_installed_directory() {
-    let adb: (&str, &[u8], u32) = ("platform-tools/adb", b"fixture", 0o755);
+    let adb: (&str, &[u8], u32) = ("platform-tools/adb", HOST_ARM64, 0o755);
     let props: (&str, &[u8], u32) = (
         "platform-tools/source.properties",
         b"Pkg.Revision=1\n",
@@ -449,7 +439,7 @@ fn invalid_archive_or_version_never_replaces_the_installed_directory() {
     ];
     for ((pkg, bytes), diagnostic) in cases {
         let t = Temp::new();
-        let dest = t.0.join("runtime/sdk/platform-tools");
+        let dest = t.0.join("runtime/unrelated-release");
         fs::create_dir_all(&dest).unwrap();
         fs::write(dest.join("existing"), b"preserve").unwrap();
         stage(&t.0, pkg, &bytes);
@@ -464,38 +454,29 @@ fn invalid_archive_or_version_never_replaces_the_installed_directory() {
             "{:?}",
             snap.error
         );
-        assert!(!partial(&p.owner.worker.stage, pkg).exists());
         assert_eq!(fs::read(dest.join("existing")).unwrap(), b"preserve");
-        assert!(!dest.join(paths::RECEIPT).exists());
-        assert!(!p.owner.worker.stage.join("bad").exists());
+        assert!(!p.paths().destination(pkg).join("bad").exists());
     }
 }
 
 #[test]
-fn staging_links_and_borrowed_mode_cannot_write_external_files() {
+fn staging_links_cannot_write_external_files() {
     let t = Temp::new();
     let outside = Temp::new();
     let pkg = fixture(b"sample", "https://example.invalid".into());
-    let stage = t.0.join("staging/provision-v1");
-    fs::create_dir_all(&stage).unwrap();
+    let part = stage(&t.0, pkg, b"");
+    fs::remove_file(&part).unwrap();
     let file = outside.0.join("keep");
     fs::write(&file, b"keep").unwrap();
-    symlink(&file, partial(&stage, pkg)).unwrap();
+    symlink(&file, &part).unwrap();
     let p = controller(&t.0, pkg);
     p.start().unwrap();
     assert_eq!(settled(&p).phase, "failed");
     assert_eq!(fs::read(&file).unwrap(), b"keep");
-    let part = partial(&stage, pkg);
     fs::remove_file(&part).unwrap();
     fs::hard_link(&file, &part).unwrap();
     p.start().unwrap();
     assert!(settled(&p).error.unwrap().contains("硬链接"));
-    assert_eq!(fs::read(&file).unwrap(), b"keep");
-    let borrowed = RuntimePaths::from_sdk(outside.0.clone(), file.clone(), true);
-    let home = outside.0.join("absent-home");
-    let p = Provisioner::configured(home.clone(), borrowed, Box::leak(Box::new([pkg])), true);
-    assert!(p.start().is_err());
-    assert!(!home.exists());
     assert_eq!(fs::read(file).unwrap(), b"keep");
 }
 
@@ -504,12 +485,19 @@ fn a_second_publisher_reuses_the_verified_destination() {
     use std::os::unix::fs::MetadataExt;
     let home = Temp::new();
     let pkg = fixture(b"server", "https://example.invalid".into());
-    let input = stage(&home.0, pkg, b"server");
-    let dest = home.0.join("runtime").join("scrcpy-server.jar");
-    let file = fs::File::open(input).unwrap();
-    archive::install(&home.0, &file, &dest, pkg, || Ok(())).unwrap();
+    stage(&home.0, pkg, b"server");
+    let p = controller(&home.0, pkg);
+    p.start().unwrap();
+    let result = settled(&p);
+    assert!(
+        result.components_ready,
+        "{:?} {:?}",
+        result.error, result.components[0].issue
+    );
+    let dest = p.paths().destination(pkg);
     let first = fs::metadata(&dest).unwrap().ino();
-    archive::install(&home.0, &file, &dest, pkg, || Ok(())).unwrap();
+    let second = controller(&home.0, pkg);
+    second.start().unwrap();
     assert_eq!(fs::metadata(dest).unwrap().ino(), first);
 }
 
@@ -540,7 +528,7 @@ fn publishes_verified_archives_in_configured_resource_directory() {
     let resources = Temp::new();
     let settings = windroid_locations::StorageLocations {
         runtime_root: resources.0.join("shared"),
-        image_root: None,
+        image_root: home.0.join("system-images"),
     };
     fs::write(
         home.0.join(windroid_locations::SETTINGS),
@@ -553,7 +541,7 @@ fn publishes_verified_archives_in_configured_resource_directory() {
             b"Pkg.Revision=1\n",
             0o644,
         ),
-        ("platform-tools/adb", b"fixture", 0o755),
+        ("platform-tools/adb", HOST_ARM64, 0o755),
     ]);
     stage(&home.0, pkg, &bytes);
     let p = controller(&home.0, pkg);
@@ -561,8 +549,8 @@ fn publishes_verified_archives_in_configured_resource_directory() {
     let snap = settled(&p);
     assert!(snap.components_ready, "{:?}", snap.error);
     assert_eq!(
-        p.paths().adb,
-        settings.runtime_root.join("sdk/platform-tools/adb")
+        p.paths().destination(pkg).join("adb"),
+        settings.runtime_root.join("platform-tools/1/adb")
     );
     assert!(!home.0.join("runtime").exists());
 }
@@ -594,7 +582,7 @@ fn import_checks_the_confirmed_copy_and_preserves_the_download_prefix_after_fail
     let preview = p.inspect_image_zip(&zip).unwrap();
     assert_eq!(preview.image.unwrap().api, 34);
     assert!(!preview.ready && !preview.location.exists());
-    assert!(!home.0.join("staging").exists());
+    assert!(!archive::stage_path(&preview.location, pkg).exists());
     let prefix = stage(&home.0, pkg, &bytes[..50]);
 
     let mut changed = bytes.clone();
@@ -673,14 +661,17 @@ fn independent_image_move_preserves_the_active_component_download() {
         });
         let p = controller(&home, pkg);
         p.start().unwrap();
-        let part = partial(&p.owner.worker.stage, pkg);
+        let part = partial(&archive::stage_path(&p.paths().destination(pkg), pkg), pkg);
         wait_for(|| fs::metadata(&part).is_ok_and(|m| m.len() > 0));
         let settings = crate::storage::StorageLocations {
             runtime_root: home.join("runtime"),
-            image_root: Some(temp.0.join("detached")),
+            image_root: temp.0.join("detached"),
         };
-        let preview = crate::storage::preview(&home, &settings).unwrap();
-        crate::storage::apply(&home, &preview).unwrap();
+        fs::write(
+            home.join(windroid_locations::SETTINGS),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
         p.refresh_locations();
         assert_eq!(p.snapshot().phase, "downloading");
         release.send(()).unwrap();
@@ -691,26 +682,242 @@ fn independent_image_move_preserves_the_active_component_download() {
 }
 
 #[test]
-fn foreign_single_file_survives_conflict_and_the_verified_prefix_can_be_retried() {
+fn conflicts_are_preserved_and_damaged_jar_needs_explicit_repair() {
     let t = Temp::new();
-    let p = fixture(b"official", "https://example.invalid".into());
-    let part = stage(&t.0, p, b"official");
-    let provision = controller(&t.0, p);
-    let dest = provision.paths().server_jar.clone();
-    fs::create_dir_all(dest.parent().unwrap().join(".windroid-install-server")).unwrap();
-    fs::write(&dest, b"other application").unwrap();
-    provision.start().unwrap();
-    assert!(settled(&provision).error.unwrap().contains("非受管文件"));
-    assert_eq!(fs::read(&dest).unwrap(), b"other application");
-    assert!(part.is_file());
+    let pkg = fixture(b"official", "https://example.invalid".into());
+    let p = controller(&t.0, pkg);
+    let dest = p.paths().destination(pkg);
+    let part = stage(&t.0, pkg, b"official");
+    fs::write(&dest, b"foreign file").unwrap();
+    p.start().unwrap();
+    assert_eq!(settled(&p).components[0].integrity, "conflict");
+    assert!(p.repair(pkg.id).is_err());
+    assert_eq!(fs::read(&dest).unwrap(), b"foreign file");
     fs::remove_file(&dest).unwrap();
-    provision.start().unwrap();
-    assert!(settled(&provision).components_ready);
+    p.start().unwrap();
+    let result = settled(&p);
+    assert!(
+        result.components_ready,
+        "{:?} {:?}",
+        result.error, result.components[0].issue
+    );
+    let jar = dest.join("scrcpy-server.jar");
+    let mtime = fs::metadata(&jar).unwrap().modified().unwrap();
+    fs::write(&jar, b"Official").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&jar)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    stage(&t.0, pkg, b"official");
+    p.start().unwrap();
+    assert_eq!(settled(&p).components[0].integrity, "damaged");
+    assert_eq!(fs::read(&jar).unwrap(), b"Official");
+    assert!(part.exists());
+    let extra = dest.join("user.txt");
+    fs::write(&extra, b"keep").unwrap();
+    assert!(p.repair(pkg.id).is_err());
+    assert_eq!(fs::read(&extra).unwrap(), b"keep");
+    fs::remove_file(extra).unwrap();
+    p.repair(pkg.id).unwrap();
+    let result = settled(&p);
+    assert!(
+        result.components_ready,
+        "{:?} {:?}",
+        result.error, result.components[0].issue
+    );
+    assert_eq!(fs::read(&jar).unwrap(), b"official");
+}
 
-    // 原地截断已安装的受管文件可通过重试修复。
-    fs::write(&dest, b"bad").unwrap();
-    stage(&t.0, p, b"official");
-    provision.start().unwrap();
-    assert!(settled(&provision).components_ready);
-    assert_eq!(fs::read(dest).unwrap(), b"official");
+#[test]
+fn interrupted_publication_restores_or_commits_only_identified_objects() {
+    let pkg = fixture(b"official", "https://example.invalid".into());
+    for step in 0..5 {
+        let t = Temp::new();
+        stage(&t.0, pkg, b"official");
+        let p = controller(&t.0, pkg);
+        let dest = p.paths().destination(pkg);
+        let work = archive::stage_path(&dest, pkg);
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("scrcpy-server.jar"), b"old").unwrap();
+        let scratch = work.join("unpack");
+        fs::create_dir(&scratch).unwrap();
+        fs::write(scratch.join("scrcpy-server.jar"), b"official").unwrap();
+        let identity = |path: &Path| crate::storage::StableObject::at(path).unwrap();
+        let old = (step != 4).then(|| identity(&dest));
+        let record =
+            serde_json::json!({"stage":identity(&work),"old":old,"new":identity(&scratch)});
+        fs::write(
+            work.join("publish.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        if step == 4 {
+            fs::remove_dir_all(&dest).unwrap();
+        } else if step >= 1 {
+            fs::rename(&dest, work.join("previous")).unwrap();
+        }
+        if step >= 2 {
+            fs::rename(&scratch, &dest).unwrap();
+            if step >= 3 {
+                fs::write(dest.join("scrcpy-server.jar"), b"damaged").unwrap();
+            }
+        }
+        p.recheck().unwrap();
+        assert_eq!(p.snapshot().components[0].integrity, "damaged");
+        p.repair_at(pkg.id, &dest).unwrap();
+        let finished = settled(&p);
+        assert!(finished.components_ready, "{step} {:?}", finished.error);
+        assert!(!work.join("previous").exists() && !work.join("publish.json").exists());
+        assert_eq!(
+            fs::read(dest.join("scrcpy-server.jar")).unwrap(),
+            b"official"
+        );
+    }
+}
+
+#[test]
+fn space_and_disconnected_volumes_are_checked_before_transferring() {
+    let home = Temp::new();
+    let http = Http::new(vec![1; 8], FirstResponse::Complete, false);
+    let pkg = Artifact {
+        unpacked: u64::MAX,
+        ..fixture(&[1; 8], http.url.clone())
+    };
+    let p = controller(&home.0, pkg);
+    p.start().unwrap();
+    let failed = settled(&p);
+    assert!(failed.error.unwrap().contains("空间不足"));
+    assert!(http.ranges.lock().unwrap().is_empty() && !p.paths().runtime_root.exists());
+    let offline = PathBuf::from(format!("/Volumes/Windroid-offline-{}", std::process::id()));
+    assert!(!offline.exists());
+    let locations = StorageLocations {
+        runtime_root: offline.clone(),
+        ..StorageLocations::defaults(&home.0)
+    };
+    fs::write(
+        home.0.join(windroid_locations::SETTINGS),
+        serde_json::to_vec(&locations).unwrap(),
+    )
+    .unwrap();
+    p.recheck().unwrap();
+    let row = &p.snapshot().components[0];
+    assert!(!row.writable && row.issue.as_deref().unwrap().contains("挂载"));
+    p.start().unwrap();
+    assert!(http.ranges.lock().unwrap().is_empty() && !offline.exists());
+}
+
+#[test]
+fn candidate_download_progress_and_prefix_stay_with_the_selected_volume() {
+    let home = Temp::new();
+    let other = Temp::new();
+    let official = CATALOG.iter().find(|p| p.id == "system-image").unwrap();
+    let prefix = official.prefix.unwrap();
+    let properties = format!(
+        "Pkg.Revision=14\nPkg.Dependencies=emulator#34.2.16\nAndroidVersion.ApiLevel=34\nSystemImage.Abi={prefix}\nSystemImage.TagId=google_apis_playstore\nAddon.VendorId=google"
+    );
+    let (fixture, bytes) = zip_fixture(&[
+        (
+            &format!("{prefix}/source.properties"),
+            properties.as_bytes(),
+            0o644,
+        ),
+        (&format!("{prefix}/system.img"), &vec![0x71; 131_072], 0o644),
+    ]);
+    let http = Http::new(bytes.clone(), FirstResponse::Stall, false);
+    let image = Artifact {
+        kind: Kind::Image,
+        id: official.id,
+        version: official.version,
+        prefix: official.prefix,
+        image_spec: official.image_spec,
+        essentials: &[],
+        url: Box::leak(http.url.clone().into_boxed_str()),
+        ..fixture
+    };
+    let p = controller(&home.0, image);
+    let settings = StorageLocations {
+        image_root: other.0.join("candidate"),
+        ..StorageLocations::defaults(&home.0)
+    };
+    let dest = RuntimePaths::for_locations(&settings).destination(image);
+    let part = partial(&archive::stage_path(&dest, image), image);
+    p.start_image_at(image.id, &settings).unwrap();
+    wait_for(|| fs::metadata(&part).is_ok_and(|m| m.len() > 0));
+    assert_eq!(p.snapshot().candidate_target.as_ref(), Some(&dest));
+    p.pause().unwrap();
+    let paused = settled(&p);
+    assert_eq!(paused.phase, "paused");
+    assert!(!paused.images[0].ready && paused.images[0].downloaded_bytes == 0);
+    let retained = fs::metadata(&part).unwrap().len();
+    drop(p);
+    let reopened = controller(&home.0, image);
+    assert_eq!(reopened.snapshot().images[0].downloaded_bytes, 0);
+    reopened.start_image_at(image.id, &settings).unwrap();
+    let done = settled(&reopened);
+    assert_eq!(done.candidate_target.as_ref(), Some(&dest));
+    assert_eq!(done.candidate_downloaded_bytes, Some(bytes.len() as u64));
+    assert!(!done.images[0].ready && !done.images[0].location.exists());
+    assert_eq!(*http.ranges.lock().unwrap(), [0, retained as usize]);
+    assert!(dest.join("system.img").is_file());
+    let reused = controller(&home.0, image);
+    reused.start_image_at(image.id, &settings).unwrap();
+    let ready = reused.snapshot();
+    assert_eq!(ready.phase, "ready");
+    assert_eq!(ready.candidate_target.as_ref(), Some(&dest));
+    assert_eq!(ready.candidate_downloaded_bytes, Some(bytes.len() as u64));
+    assert!(!ready.images[0].ready);
+    assert_eq!(http.ranges.lock().unwrap().len(), 2);
+    assert!(!home.0.join(windroid_locations::SETTINGS).exists());
+}
+
+#[test]
+fn replacing_a_damaged_version_invalidates_its_original_confirmation() {
+    let t = Temp::new();
+    let pkg = fixture(b"official", "https://example.invalid".into());
+    let p = controller(&t.0, pkg);
+    let dest = p.paths().destination(pkg);
+    let jar = dest.join("scrcpy-server.jar");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(&jar, b"Damaged!").unwrap();
+    p.recheck().unwrap();
+    let consent = p.snapshot().components[0].repair_token.clone().unwrap();
+    let saved = t.0.join("first-version");
+    fs::rename(&dest, &saved).unwrap();
+    fs::create_dir(&dest).unwrap();
+    fs::write(&jar, b"Damaged!").unwrap();
+    let part = stage(&t.0, pkg, b"official");
+    assert!(p.repair_confirmed(pkg.id, &dest, &consent).is_err());
+    assert_eq!(fs::read(&part).unwrap(), b"official");
+    assert_eq!(fs::read(&jar).unwrap(), b"Damaged!");
+    assert_eq!(
+        fs::read(saved.join("scrcpy-server.jar")).unwrap(),
+        b"Damaged!"
+    );
+}
+
+#[test]
+fn copied_publication_record_cannot_recover_another_stage() {
+    let t = Temp::new();
+    let pkg = fixture(b"official", "https://example.invalid".into());
+    let p = controller(&t.0, pkg);
+    let dest = p.paths().destination(pkg);
+    stage(&t.0, pkg, b"official");
+    let work = archive::stage_path(&dest, pkg);
+    let first = t.0.join("original-stage");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("scrcpy-server.jar"), b"official").unwrap();
+    let journal = work.join("publish.json");
+    let record = serde_json::json!({"stage":crate::storage::StableObject::at(&first).unwrap(),
+        "old":null,"new":crate::storage::StableObject::at(&dest).unwrap()});
+    let bytes = serde_json::to_vec(&record).unwrap();
+    fs::write(&journal, &bytes).unwrap();
+    assert!(archive::recover(&t.0, &work, &dest, pkg, &|| Ok(())).is_err());
+    assert_eq!(fs::read(journal).unwrap(), bytes);
+    assert_eq!(
+        fs::read(dest.join("scrcpy-server.jar")).unwrap(),
+        b"official"
+    );
 }

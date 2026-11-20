@@ -6,13 +6,21 @@ export const stateName: Record<DeviceState, string> = {
   ready: "就绪", streaming: "运行中", stopping: "正在停止", failed: "启动失败",
 };
 
+export interface ImageIdentity { api: number; tag: string; abi: string; revision: number }
+
+export function describeImage(image: ImageIdentity) {
+  const variant = image.tag === "google_apis_playstore" ? "Google Play" : image.tag;
+  return "API " + image.api + " · " + variant + " · " + image.abi + " · " + (image.revision > 0 ? "修订版 " + image.revision : "缺少修订号");
+}
+
+export type GpuMode = "host" | "batch" | "auto" | "software";
 export interface InstanceConfig {
-  template: string; image: { api: number; tag: string; abi: string };
+  template: string; image: ImageIdentity;
   cpuCores: number | null; ramMiB: number | null; screenWidth: number | null;
-  screenHeight: number | null; diskBytes: number;
+  screenHeight: number | null; diskBytes: number; graphics: GpuMode | null;
 }
 export interface Instance {
-  id: string; name: string; state: DeviceState; frozen?: boolean; summary?: string;
+  id: string; name: string; state: DeviceState; processAlive?: boolean; frozen?: boolean; summary?: string;
   config?: InstanceConfig | null; observed?: { cpuCores: number | null; ramMiB: number | null } | null;
 }
 export const instanceState = (item: Instance) => item.frozen ? "已冻结" : stateName[item.state];
@@ -23,16 +31,19 @@ export interface Action {
 export interface AppItem { package: string; label: string; system: boolean; launchable: boolean; actions: Action[] }
 interface AppSection { id: "installed" | "system"; name: string; count: number; apps: AppItem[] }
 export interface RunningApp { instanceId: string; package: string; label: string; windowOpen: boolean }
+export type Integrity = "missing" | "quick" | "verified" | "damaged" | "conflict";
 export interface Component {
   id: string; name: string; version: string; source: string; sizeBytes: number; ready: boolean;
   license: string; licenseUrl: string; licenseText?: string;
-  location: string; downloadedBytes: number; borrowed: boolean; issue: string | null;
+  location: string; downloadedBytes: number; integrity: Integrity; repairToken: string | null; issue: string | null;
+  writable: boolean; requiredBytes: number; availableBytes: number | null;
   image: InstanceConfig["image"] | null; minEmulator: string | null;
 }
 export interface Preparation {
   phase: "missing" | "downloading" | "verifying" | "installing" | "paused" | "failed" | "ready";
+  candidateTarget: string | null; candidateDownloadedBytes: number | null;
   componentsReady: boolean; components: Component[]; images: Component[]; downloadedBytes: number; totalBytes: number;
-  currentComponent: string | null; error: string | null; borrowed: boolean;
+  currentComponent: string | null; error: string | null;
 }
 interface InstallError { code: string; detail: string }
 export interface Message { instanceId: string | null; message: string; failed: boolean; seq?: number; installError?: InstallError }
@@ -62,19 +73,23 @@ export interface Snapshot {
   catalogStatus?: { kind: "pending" | "ready" | "failed"; message?: string };
   groups: AppSection[]; frozen?: boolean; desktop: { defaultPackage: string | null; candidates?: string[]; candidateLabels?: Record<string, string> } | null; streamNote: string | null;
   // 单设备 Bridge 快照没有实例列表。显式的 selectedId:null 始终表示未选中。
-  instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string; templateRamMiB?: Record<string, number>;
+  instances?: Instance[]; selectedId?: string | null; preparation?: Preparation; recommendedTemplate?: string;
   showWelcome?: boolean;
-  storage?: { home: string; sdk: string; runtimeRoot: string; images: string; imagesInherited: boolean; borrowed: boolean; error?: string | null };
+  storage?: { home: string; runtimeRoot: string; imageRoot: string; defaultRuntimeRoot: string; defaultImageRoot: string; runtimeIsDefault: boolean; imageIsDefault: boolean; cleanupNotes: string[]; error?: string | null };
   running?: RunningApp[]; tasksLoaded?: boolean; runningError?: string | null; operation?: Message | null;
 }
 
-type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "stop" | "refreshApps" | "openDevice" | "addApk";
+type DeviceCommand = "selectInstance" | "deleteInstance" | "start" | "restart" | "coldRestart" | "stop" | "refreshApps" | "openDevice" | "addApk";
 type AppCommand = Action["kind"] | "focusApp" | "backgroundApp" | "quitApp";
 type Command =
-  | { kind: "createInstance"; name: string; template: string; imageId: string }
+  | { kind: "createInstance"; name: string; template: string; imageId: string; image: ImageIdentity; cpuCores: number; ramMiB: number; diskGiB: number; gpuMode: GpuMode }
+  | { kind: "updateHardware"; instanceId: string; cpuCores: number; ramMiB: number; gpuMode: GpuMode }
   | { kind: "applyStorage"; plan: { previewId: number } }
+  | { kind: "prepareCandidateImage"; previewId: number; resourceId: string; acceptedLicenses: true }
   | { kind: "prepareImage"; imageId: string; acceptedLicenses: true }
   | { kind: "importImage"; path: string; imageId: string; acceptedLicenses: true }
+  | { kind: "repairResource"; resourceId: string; location: string; repairToken: string; acceptedLicenses: true; confirmed: true }
+  | { kind: "verifyResource"; resourceId: string }
   | { kind: "prepareRuntime"; acceptedLicenses: true }
   | { kind: "pausePreparation" | "recheckRuntime" }
   | { kind: DeviceCommand; instanceId: string }
@@ -114,6 +129,11 @@ export const guideOrigin = signal<GuideOrigin>("instances");
 export function openGuide(origin: GuideOrigin) {
   guideOrigin.set(origin);
   navigate("guide");
+}
+export const settingsTab = signal<"window" | "storage" | "logs">("window");
+export function openStorage() {
+  settingsTab.set("storage");
+  navigate("settings");
 }
 export const environmentTab = signal<"components" | "images">("components");
 export function openEnvironment(tab: "components" | "images") {

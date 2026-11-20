@@ -1,15 +1,18 @@
 use super::*;
-use std::os::unix::fs::symlink;
+use std::process::Command;
 
 struct Temp(PathBuf);
 impl Temp {
-    fn new() -> Self {
-        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+    fn at(parent: &Path) -> Self {
+        let path = parent.canonicalize().unwrap().join(format!(
             "windroid-storage-{}",
             crate::instances::nonce().unwrap()
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
+    }
+    fn new() -> Self {
+        Self::at(&std::env::temp_dir())
     }
 }
 impl Drop for Temp {
@@ -17,360 +20,494 @@ impl Drop for Temp {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn file(path: &Path, bytes: &[u8]) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, bytes).unwrap();
+fn save(home: &Path, locations: &StorageLocations) {
+    fs::create_dir_all(home).unwrap();
+    fs::write(
+        home.join(windroid_locations::SETTINGS),
+        serde_json::to_vec(locations).unwrap(),
+    )
+    .unwrap();
+}
+fn future(home: &Path, target: &StorageLocations) {
+    let plan = preview_switch(home, target, SwitchMode::Future, false).unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    apply(home, &plan).unwrap();
 }
 
-fn mark_package(settings: &StorageLocations, directory: &Path) {
-    let pkg = RuntimePaths::managed_packages(settings)
+#[test]
+fn preview_and_empty_location_selection_leave_both_resource_roots_untouched() {
+    let tmp = Temp::new();
+    let home = tmp.0.join("workspace");
+    let expected = StorageLocations::defaults(&home);
+    let separate = StorageLocations {
+        runtime_root: tmp.0.join("external"),
+        image_root: tmp.0.join("external/images"),
+    };
+    let p = preview_switch(&home, &separate, SwitchMode::Future, false).unwrap();
+    assert!(!home.exists() && !separate.runtime_root.exists());
+    assert_eq!(p.changed_roots(), (true, true));
+    assert_eq!(p.required_bytes, 0);
+    apply(&home, &p).unwrap();
+    assert!(!separate.runtime_root.exists());
+    let mut reset = separate.clone();
+    reset.runtime_root = expected.runtime_root.clone();
+    future(&home, &reset);
+    assert_eq!(
+        StorageLocations::load(&home).unwrap().image_root,
+        separate.image_root
+    );
+    reset.image_root = expected.image_root;
+    future(&home, &reset);
+    // 两个工作区可按任一顺序选择相同根和父子根。
+    for reverse in [false, true] {
+        let a = tmp.0.join(format!("a-{reverse}"));
+        let b = tmp.0.join(format!("b-{reverse}"));
+        for workspace in if reverse { [&b, &a] } else { [&a, &b] } {
+            future(workspace, &separate);
+        }
+        assert_eq!(
+            StorageLocations::load(&a).unwrap(),
+            StorageLocations::load(&b).unwrap()
+        );
+    }
+}
+
+#[test]
+fn unrelated_offline_root_does_not_block_selection_and_unknown_entries_are_preserved() {
+    let tmp = Temp::new();
+    let home = tmp.0.join("home");
+    let mut before = StorageLocations::defaults(&home);
+    before.image_root = PathBuf::from("/Volumes")
+        .join(format!(
+            "windroid-offline-{}",
+            crate::instances::nonce().unwrap()
+        ))
+        .join("images");
+    save(&home, &before);
+    let target = StorageLocations {
+        runtime_root: tmp.0.join("tools"),
+        ..before.clone()
+    };
+    let jar = target.runtime_root.join("scrcpy-server/5.0.1");
+    fs::create_dir_all(&jar).unwrap();
+    fs::write(jar.join("notes"), b"personal").unwrap();
+    let p = preview_switch(&home, &target, SwitchMode::Use, false).unwrap();
+    let row = p.versions.iter().find(|v| v.id == "scrcpy-server").unwrap();
+    assert_eq!(row.status, VersionStatus::Conflict);
+    assert!(row.detail.contains("notes"), "{}", row.detail);
+    assert!(apply(&home, &p).is_err());
+    assert_eq!(fs::read(jar.join("notes")).unwrap(), b"personal");
+    assert_eq!(StorageLocations::load(&home).unwrap(), before);
+}
+
+#[test]
+fn absent_bound_revision_is_reported_by_instance_and_only_it_is_downloadable() {
+    let tmp = Temp::new();
+    let home = tmp.0.join("home");
+    let image = RuntimePaths::managed_packages(&StorageLocations::defaults(&home))
         .into_iter()
-        .find(|pkg| pkg.path == directory)
+        .find(|p| p.id() == "system-image")
+        .unwrap()
+        .image()
         .unwrap();
-    file(
-        &directory.join(".windroid-component"),
-        pkg.receipt().unwrap().as_bytes(),
-    );
-}
-
-#[test]
-fn independent_roots_move_only_catalog_packages_and_can_restore_inheritance() {
-    let temp = Temp::new();
-    let home = temp.0.join("workspace");
-    let old = StorageLocations::defaults(&home);
-    let emulator = Path::new("sdk/emulator/emulator");
-    let img = Path::new("android-34/google_apis_playstore")
-        .join(concat!("arm64", "-v8a"))
-        .join("system.img");
-    file(&old.runtime_root.join(emulator), b"emulator");
-    file(&old.images().join(&img), b"shared-system");
-    mark_package(&old, old.runtime_root.join(emulator).parent().unwrap());
-    mark_package(&old, old.images().join(&img).parent().unwrap());
-    file(&old.runtime_root.join("scrcpy-server.jar"), b"personal jar");
-    file(&old.images().join("unknown/private-file"), b"keep");
-    file(&home.join("instances/personal/data"), b"private");
-    // 已存在的空目标目录可以选作新根，旁边无关的文件需原样保留。
-    let detached = StorageLocations {
-        runtime_root: temp.0.join("tools"),
-        image_root: Some(temp.0.join("images")),
-    };
-    file(&detached.images().join("notes"), b"user notes");
-    let plan = preview(&home, &detached).unwrap();
-    assert_eq!(plan.files.len(), 4);
-    let p = crate::provision::Provisioner::managed(&home);
-    apply(&home, &plan).unwrap();
-    p.refresh_locations();
-    assert_eq!(p.paths().sdk, detached.runtime_root.join("sdk"));
-    assert!(
-        p.snapshot()
-            .images
-            .iter()
-            .all(|row| row.location.starts_with(detached.images()))
-    );
-    assert_eq!(
-        fs::read(detached.runtime_root.join(emulator)).unwrap(),
-        b"emulator"
-    );
-    assert_eq!(
-        fs::read(detached.images().join(&img)).unwrap(),
-        b"shared-system"
-    );
-    assert_eq!(
-        fs::read(old.images().join("unknown/private-file")).unwrap(),
-        b"keep"
-    );
-    assert!(!old.runtime_root.join(emulator).exists());
-    assert_eq!(
-        fs::read(old.runtime_root.join("scrcpy-server.jar")).unwrap(),
-        b"personal jar"
-    );
-    let inherited = StorageLocations {
-        image_root: None,
-        ..detached.clone()
-    };
-    apply(&home, &preview(&home, &inherited).unwrap()).unwrap();
-    assert_eq!(StorageLocations::load(&home).unwrap(), inherited);
-    assert_eq!(
-        fs::read(inherited.images().join(&img)).unwrap(),
-        b"shared-system"
-    );
-    assert_eq!(
-        fs::read(detached.images().join("notes")).unwrap(),
-        b"user notes"
-    );
-    assert_eq!(
-        fs::read(home.join("instances/personal/data")).unwrap(),
-        b"private"
-    );
-}
-
-#[test]
-fn checks_related_leases_or_orphan_processes_and_declines_stale_previews() {
-    let temp = Temp::new();
-    let home = temp.0.join("workspace");
-    let mut changed = StorageLocations::defaults(&home);
-    changed.image_root = Some(temp.0.join("images"));
-    let plan = preview(&home, &changed).unwrap();
-    let active_tools = resource_lease(&home, true, false).unwrap();
-    let active_image = resource_lease(&home, false, true).unwrap();
-    assert_eq!(
-        apply(&home, &plan).unwrap_err().kind(),
-        ErrorKind::WouldBlock
-    );
-    drop(active_image);
-    apply(&home, &plan).unwrap();
-    let mut moved = changed.clone();
-    moved.runtime_root = temp.0.join("moved");
-    let plan = preview(&home, &moved).unwrap();
-    assert_eq!(
-        apply(&home, &plan).unwrap_err().kind(),
-        ErrorKind::WouldBlock
-    );
-    drop(active_tools);
-    let active_image = resource_lease(&home, false, true).unwrap();
-    file(&changed.runtime_root.join("sdk/emulator/new"), b"new");
-    mark_package(&changed, &changed.runtime_root.join("sdk/emulator"));
-    assert!(
-        apply(&home, &plan)
-            .unwrap_err()
-            .to_string()
-            .contains("重新预览")
-    );
-    let plan = preview(&home, &moved).unwrap();
-    apply(&home, &plan).unwrap();
-    drop(active_image);
-    file(&changed.runtime_root.join("scrcpy-server.jar"), b"foreign");
-    assert!(
-        preview(&home, &changed)
-            .unwrap_err()
-            .to_string()
-            .contains("已存在")
-    );
-    assert_eq!(
-        fs::read(changed.runtime_root.join("scrcpy-server.jar")).unwrap(),
-        b"foreign"
-    );
-    assert_eq!(StorageLocations::load(&home).unwrap(), moved);
-
-    let store = InstanceStore::new(Layout { root: home.clone() });
-    let instance = store
+    InstanceStore::new(Layout { root: home.clone() })
         .create(
-            "原有实例",
+            "Device A",
             contract::Spec {
                 template: "compact-720".into(),
-                image: contract::Image {
-                    api: 34,
-                    tag: "google_apis_playstore".into(),
-                    abi: "arm64".into(),
-                },
                 disk_bytes: 6 << 30,
+                image: image.clone(),
             },
         )
         .unwrap();
-    file(
-        &home
-            .join("instances")
-            .join(instance.id.as_str())
-            .join("active.pid"),
-        std::process::id().to_string().as_bytes(),
-    );
-    let independent = StorageLocations {
-        image_root: Some(temp.0.join("other")),
-        ..moved
+    let target = StorageLocations {
+        image_root: tmp.0.join("new images"),
+        ..StorageLocations::defaults(&home)
     };
-    assert_eq!(
-        apply(&home, &preview(&home, &independent).unwrap())
-            .unwrap_err()
-            .kind(),
-        ErrorKind::WouldBlock
-    );
+    let p = preview_switch(&home, &target, SwitchMode::Use, false).unwrap();
+    let needed: Vec<_> = p.versions.iter().filter(|v| v.downloadable).collect();
+    assert_eq!(needed.len(), 1);
+    assert_eq!(needed[0].id, "system-image");
+    assert!(p.blockers.iter().any(|line| line.contains("Device A")));
+    assert!(p.affected_instances[0].contains(&format!("r{}", image.revision)));
+    assert!(apply(&home, &p).is_err());
+    assert!(!target.image_root.exists());
 }
 
 #[test]
-fn interrupted_publish_recovers_according_to_committed_settings() {
-    for committed in [false, true] {
-        let temp = Temp::new();
-        let home = temp.0.join("workspace");
-        let before = StorageLocations::defaults(&home);
-        let after = StorageLocations {
-            runtime_root: temp.0.join("tools"),
-            image_root: None,
-        };
-        let source = before.runtime_root.join("scrcpy-server.jar");
-        let target = after.runtime_root.join("scrcpy-server.jar");
-        file(&source, b"trusted");
-        file(&target, b"trusted");
-        let journal = Journal {
-            before: before.clone(),
-            after: after.clone(),
-            nonce: crate::instances::nonce().unwrap(),
-            packages: vec![Package {
-                source: source.clone(),
-                target: target.clone(),
-                source_stamp: tree_stamp(&source).unwrap(),
-                staged_stamp: Some(tree_stamp(&target).unwrap()),
-            }],
-        };
-        if committed {
-            write_json(&home.join(SETTINGS), &after).unwrap();
-        }
-        write_json(&home.join(JOURNAL), &journal).unwrap();
-        recover(&home).unwrap();
-        recover(&home).unwrap();
-        assert_eq!(target.exists(), committed);
-        assert_eq!(source.exists(), !committed);
+fn processes_coordinate_by_version_across_rename() {
+    const TEST: &str = "storage::tests::processes_coordinate_by_version_across_rename";
+    const CHILD: &str = "WINDROID_TEST_VERSION_LOCK_CHILD";
+    if crate::rerun_in_isolated_process(TEST) {
+        return;
+    }
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = PathBuf::from(root);
+        let path = root.join("r14");
         assert_eq!(
-            StorageLocations::load(&home).unwrap(),
-            if committed { after } else { before }
+            version_write_lease(&path).unwrap_err().kind(),
+            ErrorKind::WouldBlock
         );
-        assert!(!home.join(JOURNAL).exists());
+        if root.join("after-rename").exists() {
+            assert_eq!(
+                version_read_lease(&path).unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
+        }
+        return;
     }
-}
-
-#[test]
-fn rejects_nested_roots_and_linked_packages_before_any_move() {
-    let temp = Temp::new();
-    let home = temp.0.join("workspace");
-    let before = StorageLocations::defaults(&home);
-    let pkg = before.runtime_root.join("sdk/emulator");
-    file(&pkg.join("emulator"), b"core");
-    mark_package(&before, &pkg);
-    for root in [
-        home.clone(),
-        home.join("instances/a"),
-        pkg.join("subfolder"),
-    ] {
+    let tmp = Temp::new();
+    let version = tmp.0.join("r14");
+    fs::create_dir(&version).unwrap();
+    let check = || {
         assert!(
-            preview(
-                &home,
-                &StorageLocations {
-                    runtime_root: root,
-                    image_root: None
-                }
-            )
-            .is_err()
-        );
-    }
-    let after = StorageLocations {
-        runtime_root: temp.0.join("new"),
-        image_root: None,
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST])
+                .env(CHILD, &tmp.0)
+                .status()
+                .unwrap()
+                .success()
+        )
     };
-    symlink(temp.0.join("external"), pkg.join("foreign")).unwrap();
-    assert!(preview(&home, &after).is_err());
-    assert!(!after.runtime_root.exists());
+    let reader = version_read_lease(&version).unwrap();
+    check();
+    assert_eq!(fs::read_dir(&version).unwrap().count(), 0);
+    drop(reader);
+    let writer = version_write_lease(&version).unwrap();
+    let stage = tmp.0.join("stage");
+    fs::create_dir(&stage).unwrap();
+    let staged = lock_staged_version(&stage).unwrap();
+    fs::rename(&version, tmp.0.join("old")).unwrap();
+    fs::rename(&stage, &version).unwrap();
+    fs::write(tmp.0.join("after-rename"), []).unwrap();
+    check();
+    // 同 API 的另一个修订具有独立的协调点。
+    let sibling = tmp.0.join("r15");
+    fs::create_dir(&sibling).unwrap();
+    let other = version_write_lease(&sibling).unwrap();
+    drop(other);
+    drop(staged);
+    drop(writer);
+    version_read_lease(&version).unwrap();
 }
 
-/// 在指定卷内只创建一个新临时目录，使用受控的小包验证跨卷发布。
+fn copy_official_jar(resource_root: &Path, config: &StorageLocations) {
+    let package = RuntimePaths::managed_packages(config)
+        .into_iter()
+        .find(|p| p.id() == "scrcpy-server")
+        .unwrap();
+    fs::create_dir_all(&package.path).unwrap();
+    fs::copy(
+        resource_root.join("scrcpy-server/5.0.1/scrcpy-server.jar"),
+        package.path.join("scrcpy-server.jar"),
+    )
+    .unwrap();
+}
+
 #[test]
-#[ignore = "mount a writable test volume and set WINDROID_TEST_VOLUME"]
-fn migrates_between_different_filesystems() {
+#[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME and WINDROID_TEST_VOLUME to a writable independent volume"]
+fn official_jar_round_trip_reuses_content_and_defers_busy_cleanup() {
+    let tools = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap());
+    let volume = PathBuf::from(std::env::var_os("WINDROID_TEST_VOLUME").unwrap());
     let primary = Temp::new();
-    let volume =
-        PathBuf::from(std::env::var_os("WINDROID_TEST_VOLUME").expect("set WINDROID_TEST_VOLUME"));
+    let target = Temp::at(&volume);
     assert_ne!(
         fs::metadata(&primary.0).unwrap().dev(),
-        fs::metadata(&volume).unwrap().dev()
+        fs::metadata(&target.0).unwrap().dev()
     );
-    let folder = volume.join(format!(
-        "windroid-test-{}",
-        crate::instances::nonce().unwrap()
-    ));
-    fs::create_dir(&folder).unwrap();
-    let external = Temp(folder);
-    let home = primary.0.join("workspace");
+    let home = primary.0.join("home");
     let original = StorageLocations::defaults(&home);
-    let part = Path::new("sdk/emulator/emulator");
-    file(&original.runtime_root.join(part), b"emulator-fixture");
-    mark_package(
-        &original,
-        original.runtime_root.join(part).parent().unwrap(),
-    );
-    let moved = StorageLocations {
-        runtime_root: external.0.join("core"),
-        image_root: None,
+    copy_official_jar(&tools, &original);
+    let alternate = StorageLocations {
+        runtime_root: target.0.join("arbitrary-name"),
+        ..original.clone()
     };
-    apply(&home, &preview(&home, &moved).unwrap()).unwrap();
+    let existing = RuntimePaths::managed_packages(&original)
+        .into_iter()
+        .find(|p| p.id() == "platform-tools")
+        .unwrap();
+    let platform = existing.path.strip_prefix(&original.runtime_root).unwrap();
+    for root in [&original.runtime_root, &alternate.runtime_root] {
+        fs::create_dir_all(root.join(platform).parent().unwrap()).unwrap();
+        transaction::copy_tree(&tools.join(platform), &root.join(platform), &|| Ok(())).unwrap();
+    }
+    let jar = Path::new("scrcpy-server/5.0.1");
+    fs::create_dir_all(alternate.runtime_root.join(jar)).unwrap();
+    let p = preview(&home, &alternate).unwrap();
     assert_eq!(
-        fs::read(moved.runtime_root.join(part)).unwrap(),
-        b"emulator-fixture"
+        p.versions
+            .iter()
+            .filter(|v| v.status == VersionStatus::Copy)
+            .count(),
+        1
     );
-    apply(&home, &preview(&home, &original).unwrap()).unwrap();
-    assert_eq!(
-        fs::read(original.runtime_root.join(part)).unwrap(),
-        b"emulator-fixture"
-    );
-    assert!(!moved.runtime_root.join(part).exists());
-}
-
-#[test]
-fn newly_selected_directories_have_one_owner_until_released() {
-    let temp = Temp::new();
-    let a = temp.0.join("A");
-    let b = temp.0.join("B");
-    let shared = StorageLocations {
-        runtime_root: temp.0.join("common"),
-        image_root: None,
-    };
-    let b_plan = preview(&b, &shared).unwrap();
-    apply(&a, &preview(&a, &shared).unwrap()).unwrap();
+    assert!(p.available_bytes.is_some_and(|n| n >= p.required_bytes));
     assert!(
-        apply(&b, &b_plan)
-            .unwrap_err()
-            .to_string()
-            .contains("另一个工作区")
+        p.versions
+            .iter()
+            .any(|v| v.id == "platform-tools" && v.status == VersionStatus::Reuse)
     );
-    assert!(preview(&b, &shared).is_err());
-    let nested = StorageLocations {
-        runtime_root: shared.runtime_root.join("nested"),
-        image_root: None,
-    };
-    assert!(preview(&b, &nested).is_err());
-    // 手动复制设置也不会取得另一个工作区已登记目录的写权限。
-    write_json(&b.join(SETTINGS), &shared).unwrap();
-    let paths = RuntimePaths::discover(&b);
-    assert!(paths.claim_locations(&b, true, true).is_err());
-    fs::remove_file(b.join(SETTINGS)).unwrap();
-    apply(&a, &preview(&a, &StorageLocations::defaults(&a)).unwrap()).unwrap();
-    apply(&b, &b_plan).unwrap();
-    assert_eq!(StorageLocations::load(&b).unwrap(), shared);
-}
-
-#[test]
-fn interrupted_cleanup_preserves_changed_contents_even_with_the_same_package_inode() {
-    let temp = Temp::new();
-    let home = temp.0.join("workspace");
-    let before = StorageLocations::defaults(&home);
-    let after = StorageLocations {
-        runtime_root: temp.0.join("moved"),
-        image_root: None,
-    };
-    let source = before.runtime_root.join("sdk/emulator");
-    let target = after.runtime_root.join("sdk/emulator");
-    file(&source.join("binary"), b"original");
-    file(&target.join("binary"), b"original");
-    let mut pkg = Package::planned(&source, &target).unwrap();
-    pkg.staged_stamp = Some(tree_stamp(&target).unwrap());
-    let journal = Journal {
-        before,
-        after: after.clone(),
-        nonce: crate::instances::nonce().unwrap(),
-        packages: vec![pkg],
-    };
-    write_json(&home.join(SETTINGS), &after).unwrap();
-    write_json(&home.join(JOURNAL), &journal).unwrap();
-    file(&source.join("private"), b"added after shutdown");
-    file(&source.join("binary"), b"changed");
-    let message = recover(&home).unwrap_err().to_string();
+    apply(&home, &p).unwrap();
+    assert!(original.runtime_root.join(jar).is_dir() && alternate.runtime_root.join(jar).is_dir());
+    let published = alternate.runtime_root.join(jar).join("scrcpy-server.jar");
+    assert!(p.required_bytes >= fs::metadata(&published).unwrap().blocks() * 512);
+    eprintln!(
+        "跨卷复制预估 {} 字节，已发布 JAR 分配 {} 字节",
+        p.required_bytes,
+        fs::metadata(&published).unwrap().blocks() * 512
+    );
+    let restored = original.runtime_root.join(jar).join("scrcpy-server.jar");
+    let mut bytes = fs::read(&restored).unwrap();
+    let modified = fs::metadata(&restored).unwrap().modified().unwrap();
+    bytes[0] ^= 1;
+    fs::write(&restored, &bytes).unwrap();
+    fs::File::open(&restored)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let conflict = preview_switch(&home, &original, SwitchMode::Migrate, true).unwrap();
     assert!(
-        message.contains(&*source.display().to_string()),
-        "{message}"
+        conflict
+            .versions
+            .iter()
+            .any(|v| v.id == "scrcpy-server" && v.status == VersionStatus::Conflict)
     );
-    assert_eq!(
-        fs::read(source.join("private")).unwrap(),
-        b"added after shutdown"
+    assert!(apply(&home, &conflict).is_err());
+    assert_eq!(fs::read(&restored).unwrap(), bytes);
+    assert_eq!(StorageLocations::load(&home).unwrap(), alternate);
+    fs::copy(&published, &restored).unwrap();
+    let reader = version_read_lease(&alternate.runtime_root.join(jar)).unwrap();
+    let back = preview_switch(&home, &original, SwitchMode::Migrate, true).unwrap();
+    assert_eq!(back.required_bytes, 0);
+    assert!(
+        back.versions
+            .iter()
+            .any(|v| v.id == "scrcpy-server" && v.cleanup && v.status == VersionStatus::Reuse)
     );
-    assert_eq!(fs::read(source.join("binary")).unwrap(), b"changed");
-    assert_eq!(fs::read(target.join("binary")).unwrap(), b"original");
+    apply(&home, &back).unwrap();
+    assert!(alternate.runtime_root.join(jar).is_dir());
+    assert!(!pending_cleanup(&home).unwrap().is_empty());
+    drop(reader);
     recover(&home).unwrap();
-    assert_eq!(StorageLocations::load(&home).unwrap(), after);
+    assert!(!alternate.runtime_root.join(jar).exists() && original.runtime_root.join(jar).is_dir());
+    assert!(pending_cleanup(&home).unwrap().is_empty());
+}
+
+/// 只读目标包含全部真实核心组件。源卷故意不存在，设置文件是唯一变更。
+#[test]
+#[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME to the complete runtime root on a read-only test volume"]
+fn attaches_complete_read_only_components_with_offline_source() {
+    let target = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap());
+    let home = Temp::new();
+    assert!(volume_space(&target).unwrap().2, "目标应实际挂载为只读");
+    let source = StorageLocations {
+        runtime_root: PathBuf::from("/Volumes/windroid-test-disconnected-sources/core"),
+        ..StorageLocations::defaults(&home.0)
+    };
+    save(&home.0, &source);
+    let after = StorageLocations {
+        runtime_root: target,
+        ..source
+    };
+    let plan = preview_switch(&home.0, &after, SwitchMode::Use, false).unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    assert_eq!(
+        plan.versions
+            .iter()
+            .filter(|v| v.status == VersionStatus::Reuse)
+            .count(),
+        4
+    );
+    assert_eq!(plan.required_bytes, 0);
+    apply(&home.0, &plan).unwrap();
+    assert_eq!(StorageLocations::load(&home.0).unwrap(), after);
+    let testhome = Temp::new();
+    let readonly = preview_switch(
+        &testhome.0,
+        &StorageLocations {
+            runtime_root: after.runtime_root,
+            ..StorageLocations::defaults(&testhome.0)
+        },
+        SwitchMode::Future,
+        false,
+    )
+    .unwrap();
+    assert!(readonly.blockers.iter().any(|issue| issue.contains("只读")));
+}
+
+/// 分两次执行，期间使用 hdiutil 卸载实际卷，在相同路径留下宿主卷上的空目录。
+#[test]
+#[ignore = "set WINDROID_TEST_LIFETIME_HOME and WINDROID_TEST_MOUNT_ROOT; run with mounted, then detached volume"]
+fn selected_custom_mount_cannot_fall_back_to_host_volume() {
+    let home = PathBuf::from(std::env::var_os("WINDROID_TEST_LIFETIME_HOME").unwrap());
+    let root = PathBuf::from(std::env::var_os("WINDROID_TEST_MOUNT_ROOT").unwrap());
+    if !home.join(windroid_locations::SETTINGS).exists() {
+        let new = StorageLocations {
+            runtime_root: root.join("empty-future-tools"),
+            ..StorageLocations::defaults(&home)
+        };
+        future(&home, &new);
+        assert_eq!(
+            mounts::load(&home).unwrap().runtime.as_deref(),
+            Some(root.as_path())
+        );
+        check_selected_volume(&home, &new.runtime_root).unwrap();
+        return;
+    }
+    let saved = StorageLocations::load(&home).unwrap();
+    assert!(root.is_dir());
+    assert_ne!(mounts::at(&root).unwrap(), root);
+    assert_eq!(
+        check_selected_volume(&home, &saved.runtime_root)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotConnected
+    );
+    assert!(!saved.runtime_root.exists());
+}
+
+#[test]
+#[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME to official components"]
+fn deferred_cleanup_requires_both_original_version_objects() {
+    let tools = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap());
+    for swap_source in [true, false] {
+        let tmp = Temp::new();
+        let home = tmp.0.join("workspace");
+        let before = StorageLocations::defaults(&home);
+        let after = StorageLocations {
+            runtime_root: tmp.0.join("target"),
+            ..before.clone()
+        };
+        copy_official_jar(&tools, &before);
+        copy_official_jar(&tools, &after);
+        let jar = Path::new("scrcpy-server/5.0.1");
+        let source = before.runtime_root.join(jar);
+        let hold = version_read_lease(&source).unwrap();
+        let plan = preview_switch(&home, &after, SwitchMode::Migrate, true).unwrap();
+        apply(&home, &plan).unwrap();
+        drop(hold);
+        let config = if swap_source { &before } else { &after };
+        let path = config.runtime_root.join(jar);
+        let saved = path.with_extension("saved");
+        fs::rename(&path, &saved).unwrap();
+        copy_official_jar(&tools, config);
+        recover(&home).unwrap();
+        assert!(source.exists() && path.exists() && saved.exists());
+        assert_eq!(pending_cleanup(&home).unwrap().len(), 1);
+        fs::rename(&path, path.with_extension("unrelated")).unwrap();
+        fs::rename(saved, path).unwrap();
+        recover(&home).unwrap();
+        assert!(!source.exists() && pending_cleanup(&home).unwrap().is_empty());
+    }
+}
+
+/// 两个独立创建的 APFS 卷在同一路径轮换，副本字节完全一致。原盘接回后继续同一个账本。
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "set WINDROID_TEST_VERSIONED_RUNTIME; creates and ejects two private APFS images"]
+fn replacement_volumes_cannot_authorize_migration_or_cleanup() {
+    fn disk(args: &[&std::ffi::OsStr]) {
+        let output = Command::new("/usr/bin/hdiutil")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    struct Mounted<'a>(&'a Path);
+    impl Drop for Mounted<'_> {
+        fn drop(&mut self) {
+            disk(&["detach".as_ref(), self.0.as_os_str()]);
+        }
+    }
+    let tools = PathBuf::from(std::env::var_os("WINDROID_TEST_VERSIONED_RUNTIME").unwrap());
+    let tmp = Temp::new();
+    let slot = tmp.0.join("slot");
+    let images = [
+        tmp.0.join("selected.sparseimage"),
+        tmp.0.join("other.sparseimage"),
+    ];
+    let filesystem = std::env::var_os("WINDROID_TEST_STORAGE_FS").unwrap_or("APFS".into());
+    for img in &images {
+        disk(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "96m".as_ref(),
+            "-fs".as_ref(),
+            filesystem.as_os_str(),
+            "-volname".as_ref(),
+            "Windroid Storage Test".as_ref(),
+            "-type".as_ref(),
+            "SPARSE".as_ref(),
+            img.as_os_str(),
+        ]);
+    }
+    let mount = |i: usize| {
+        fs::create_dir_all(&slot).unwrap();
+        disk(&[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noautoopen".as_ref(),
+            "-mountpoint".as_ref(),
+            slot.as_os_str(),
+            images[i].as_os_str(),
+        ]);
+        Mounted(&slot)
+    };
+    for swap_source in [true, false] {
+        let home = tmp.0.join(format!("workspace-{swap_source}"));
+        let local = StorageLocations::defaults(&home);
+        let removable = StorageLocations {
+            runtime_root: slot.join(format!("resources-{swap_source}")),
+            ..local.clone()
+        };
+        let (source, target) = if swap_source {
+            (&removable, &local)
+        } else {
+            (&local, &removable)
+        };
+        let alt = mount(1);
+        let alternate_uuid = volume_id(&slot).unwrap();
+        copy_official_jar(&tools, &removable);
+        drop(alt);
+        let original = mount(0);
+        let original_uuid = volume_id(&slot).unwrap();
+        assert_ne!(original_uuid, alternate_uuid);
+        if swap_source {
+            future(&home, &removable);
+        }
+        copy_official_jar(&tools, source);
+        let rel = Path::new("scrcpy-server/5.0.1");
+        let src = source.runtime_root.join(rel);
+        let plan = preview_switch(&home, target, SwitchMode::Migrate, true).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        drop(original);
+        let alt = mount(1);
+        assert!(apply(&home, &plan).is_err());
+        assert_eq!(StorageLocations::load(&home).unwrap(), *source);
+        assert!(removable.runtime_root.join(rel).exists());
+        drop(alt);
+        let original = mount(0);
+        assert_eq!(original_uuid, volume_id(&slot).unwrap());
+        let reader = version_read_lease(&src).unwrap();
+        apply(&home, &plan).unwrap();
+        drop(reader);
+        assert_eq!(pending_cleanup(&home).unwrap().len(), 1);
+        drop(original);
+        let alt = mount(1);
+        let other = removable.runtime_root.join(rel);
+        let original_other_object = StableObject::at(&other).unwrap();
+        recover(&home).unwrap();
+        assert!(src.is_dir() && original_other_object.matches(&other).unwrap());
+        assert_eq!(pending_cleanup(&home).unwrap().len(), 1);
+        drop(alt);
+        let original = mount(0);
+        recover(&home).unwrap();
+        assert!(target.runtime_root.join(rel).is_dir());
+        assert!(!src.exists() && pending_cleanup(&home).unwrap().is_empty());
+        drop(original);
+    }
 }

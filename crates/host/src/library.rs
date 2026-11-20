@@ -25,6 +25,7 @@ use crate::{
 
 mod commands;
 mod first_page;
+mod hardware;
 mod observation;
 mod resources;
 mod storage;
@@ -50,6 +51,7 @@ struct Instance {
     name: String,
     handle: Handle,
     record: Option<InstanceRecord>,
+    active: runtime::ActiveRuntime,
     config: Option<InstanceConfig>,
     lane: Lane,
 }
@@ -136,6 +138,7 @@ impl Library {
         let first_page = if fake {
             None
         } else {
+            runtime::workspace::open(&layout.root).map_err(|e| e.to_string())?;
             let enabled =
                 std::env::var("WINDROID_SHOW_GUIDE_ON_FIRST_LAUNCH").as_deref() == Ok("1");
             Some(first_page::FirstPage::open(&layout.root, enabled).map_err(|e| e.to_string())?)
@@ -209,20 +212,23 @@ impl Library {
             true,
         );
         let id = handle.id().to_string();
-        library.add(id.clone(), handle, events, None);
+        library.add(id.clone(), handle, events, None, Default::default());
         library.state.lock().unwrap().selected = Some(id);
         library.connect();
         library
     }
 
     fn add_record(self: &Arc<Self>, record: InstanceRecord) {
+        let backend =
+            runtime::EmulatorBackend::new(record.id.clone(), self.layout.clone(), record.port);
+        let active = backend.active_runtime();
         let (handle, events) = device::spawn(
             record.id.clone(),
             record.serial(),
-            runtime::EmulatorBackend::new(record.id.clone(), self.layout.clone(), record.port),
+            backend,
             device::Timeouts::default(),
         );
-        self.add(record.name.clone(), handle, events, Some(record));
+        self.add(record.name.clone(), handle, events, Some(record), active);
     }
 
     fn add(
@@ -231,11 +237,13 @@ impl Library {
         handle: Handle,
         events: Events,
         record: Option<InstanceRecord>,
+        active: runtime::ActiveRuntime,
     ) {
         let id = handle.id().to_string();
         let instance = Instance {
             name,
             handle,
+            active,
             lane: self.lane(),
             config: record.as_ref().map(|r| r.config(&self.layout)),
             record,
@@ -260,6 +268,7 @@ impl Library {
             let result = lib.first_page.as_ref().map(|p| p.shown()).transpose();
             call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
         });
+        self.connect_hardware();
         self.connect_resources();
         self.connect_storage();
         let global = self.lane();
@@ -278,6 +287,9 @@ impl Library {
                         | "deleteInstance"
                         | "prepareRuntime"
                         | "applyStorage"
+                        | "prepareCandidateImage"
+                        | "verifyResource"
+                        | "repairResource"
                         | "importImage"
                         | "prepareImage"
                         | "pausePreparation"
@@ -407,7 +419,7 @@ impl Library {
                 let device = instance.handle.snapshot();
                 json!({
                     "id": id, "name": instance.name, "state": device.state,
-                    "frozen": state.frozen.contains(id),
+                    "frozen": state.frozen.contains(id), "processAlive": device.facts.process_alive,
                     "summary": crate::describe(device.state, device.phase, &device.facts),
                     "config": instance.config, "observed": device.facts.allocation
                 })
@@ -427,22 +439,6 @@ impl Library {
         if let Some(runtime) = &self.runtime {
             out["storage"] = runtime.lock().unwrap().locations(&self.layout.root);
         }
-        out["templateRamMiB"] = [
-            "phone-1080",
-            "compact-720",
-            "tablet-1200",
-            "tv-1080",
-            "tv-4k",
-        ]
-        .into_iter()
-        .map(|template| {
-            (
-                template.to_owned(),
-                json!(runtime::instances::ram_mib(template)),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>()
-        .into();
         out["recommendedTemplate"] = self.recommended_template.into();
         out
     }

@@ -107,7 +107,7 @@ impl LibraryUi {
     }
 
     fn create(&mut self) -> String {
-        wait(&mut self.app, "id:create-form");
+        wait(&mut self.app, "id:hardware-fields");
         press(&mut self.app, "create");
         wait(&mut self.app, "id:start");
         gone(&mut self.app, "id:pending");
@@ -313,6 +313,7 @@ fn a_stalled_boot_reports_the_missing_service() {
     let spec = Spec {
         template: "phone-1080".into(),
         image: Image {
+            revision: 14,
             api: 34,
             tag: "google_apis_playstore".into(),
             abi: "arm64-v8a".into(),
@@ -357,6 +358,10 @@ impl Scripted {
         channel.handle("windroid.snapshot", move |call| {
             call.resolve(view.lock().unwrap().clone())
         });
+        channel.handle("windroid.hardwareLimits", |call| {
+            let limits = hardware_limits(call.data());
+            call.resolve(limits);
+        });
         let view = state.clone();
         let seen = requests.clone();
         channel.handle("windroid.command", move |call| {
@@ -382,15 +387,26 @@ impl Scripted {
 fn image(id: &str, api: u32, ready: bool) -> Value {
     json!({"id":id, "name":format!("Android API {api}"), "version":"14", "source":"https://example.org/image.zip",
         "license":"镜像许可", "licenseUrl":"https://example.org/terms", "licenseText":"镜像许可条款", "sizeBytes":1048576,
-        "ready":ready, "location":"/tmp/images", "borrowed":false, "downloadedBytes":0, "issue":null,
-        "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a"},"minEmulator":"34.0.0"})
+        "ready":ready, "location":"/tmp/images","repairToken":null, "integrity":if ready {"quick"} else {"missing"},
+        "writable":true,"requiredBytes":if ready {0} else {3145728},"availableBytes":1073741824, "downloadedBytes":0, "issue":null,
+        "image":{"api":api,"tag":"google_apis_playstore","abi":"arm64-v8a","revision":14},"minEmulator":"34.0.0"})
+}
+
+fn hardware_limits(target: &Value) -> Value {
+    let minimum = if target["template"] == "tv-4k" {
+        4096
+    } else {
+        2560
+    };
+    json!({"minRamMiB":minimum,"maxRamMiB":8192,"maxCpuCores":8,"defaultCpuCores":2,
+        "defaultRamMiB":minimum,"maxDiskGiB":40,"defaultDiskGiB":8})
 }
 
 fn ready_view() -> Value {
     json!({"id":"a","instances":[{"id":"a","name":"工作机","state":"ready"}],"selectedId":"a",
         "state":"ready","summary":"已就绪","capabilities":{"install":true,"launchApp":true,"deviceView":true,"stop":true,"refreshApps":true},
         "facts":{"services":{"activity":true,"package":true,"window":true},"adbVisible":true},"groups":[],"catalogStatus":{"kind":"ready"},"running":[],"desktop":null,"tasksLoaded":true,
-        "preparation":{"phase":"ready","componentsReady":true,"images":[image("r34",34,true)],"components":[],"currentComponent":null,"totalBytes":0,"downloadedBytes":0,"borrowed":false,"error":null}})
+        "preparation":{"phase":"ready","componentsReady":true,"images":[image("r34",34,true)],"components":[],"currentComponent":null,"totalBytes":0,"downloadedBytes":0,"candidateTarget":null,"candidateDownloadedBytes":null,"error":null}})
 }
 
 #[test]
@@ -399,8 +415,9 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
     view["instances"] = json!([]);
     view["selectedId"] = Value::Null;
     view["preparation"] = json!({"phase":"missing","components":[{"id":"image","name":"系统镜像","version":"34","source":"https://example.org/image.zip",
-        "license":"镜像许可","licenseUrl":"https://example.org/terms","licenseText":"镜像完整许可正文","sizeBytes":1048576,"ready":false}],
-        "currentComponent":null,"downloadedBytes":0,"totalBytes":1048576,"borrowed":false,"error":null});
+        "license":"镜像许可","licenseUrl":"https://example.org/terms","licenseText":"镜像完整许可正文","sizeBytes":1048576,"ready":false,
+        "location":"/tmp/runtime","integrity":"missing","repairToken":null,"writable":true,"requiredBytes":3145728,"availableBytes":1073741824}],
+        "currentComponent":null,"downloadedBytes":0,"totalBytes":1048576,"candidateTarget":null,"candidateDownloadedBytes":null,"error":null});
     let mut ui = Scripted::new(view, |cmd, view| {
         let p = &mut view["preparation"];
         match cmd["kind"].as_str().unwrap() {
@@ -470,6 +487,125 @@ fn preparation_requires_consent_and_supports_license_pause_resume_retry_and_resc
 }
 
 #[test]
+fn full_verification_then_repair_requires_consent_for_the_reviewed_version_and_location() {
+    let mut view = ready_view();
+    let mut tool = image("tool", 34, true);
+    tool["image"] = Value::Null;
+    tool["name"] = json!("Android SDK Build-Tools");
+    tool["version"] = json!("34.0.0");
+    tool["location"] = json!("/Volumes/Windroid/build-tools/34.0.0");
+    view["preparation"]["components"] = json!([tool]);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        let preparation = &mut view["preparation"];
+        match cmd["kind"].as_str().unwrap() {
+            "verifyResource" => {
+                assert_eq!(cmd["resourceId"], "tool");
+                preparation["componentsReady"] = json!(false);
+                preparation["phase"] = json!("failed");
+                let target = &mut preparation["components"][0];
+                target["integrity"] = json!("damaged");
+                target["repairToken"] = json!("original-volume-and-tree");
+                target["issue"] = json!("aapt 文件内容 SHA-256 不符");
+                target["ready"] = json!(false);
+            }
+            "repairResource" => {
+                assert_eq!(
+                    cmd,
+                    &json!({"kind":"repairResource","resourceId":"tool",
+                    "location":"/Volumes/Windroid/build-tools/34.0.0","repairToken":"replacement-volume-and-tree","confirmed":true,"acceptedLicenses":true})
+                );
+                preparation["components"][0]["integrity"] = json!("verified");
+                preparation["components"][0]["repairToken"] = Value::Null;
+                preparation["components"][0]["ready"] = json!(true);
+                preparation["components"][0]["issue"] = Value::Null;
+                preparation["componentsReady"] = json!(true);
+                preparation["phase"] = json!("ready");
+            }
+            _ => panic!("意外的版本操作 {cmd}"),
+        }
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-environment");
+    wait(&mut ui.app, "text:快速自检通过");
+    press(&mut ui.app, "verify-tool");
+    wait(&mut ui.app, "text:/aapt 文件内容/");
+    gone(&mut ui.app, "id:prepare-runtime");
+    press(&mut ui.app, "repair-tool");
+    wait(&mut ui.app, "id:repair-review-tool >> text:/Volumes/");
+    press(&mut ui.app, "cancel-repair-tool");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    press(&mut ui.app, "repair-tool");
+    // 同一挂载点直接换成第二个非空版本身份，也会撤销已经展开的确认。
+    ui.update(|s| {
+        s["preparation"]["components"][0]["repairToken"] = json!("replacement-volume-and-tree");
+    });
+    wait(&mut ui.app, "text:/目标卷或版本状态已变化/");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    press(&mut ui.app, "repair-tool");
+    ui.update(|s| {
+        s["preparation"]["components"][0]["repairToken"] = Value::Null;
+    });
+    wait(&mut ui.app, "text:/尚未确认目标卷及目录身份/");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    assert!(!ui.app.screen().enabled("id:repair-tool").unwrap());
+    ui.update(|s| {
+        s["preparation"]["components"][0]["repairToken"] = json!("replacement-volume-and-tree");
+    });
+    wait(&mut ui.app, "text:/目标卷或版本状态已变化/");
+    press(&mut ui.app, "repair-tool");
+    ui.update(|s| s["preparation"]["components"][0]["location"] = json!("/other/34.0.0"));
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    ui.update(|s| {
+        s["preparation"]["components"][0]["location"] =
+            json!("/Volumes/Windroid/build-tools/34.0.0")
+    });
+    wait(&mut ui.app, "text:/Volumes/");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    press(&mut ui.app, "repair-tool");
+    ui.update(|s| s["preparation"]["components"][0]["integrity"] = json!("conflict"));
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    ui.update(|s| s["preparation"]["components"][0]["integrity"] = json!("damaged"));
+    wait(&mut ui.app, "id:repair-tool");
+    gone(&mut ui.app, "id:confirm-repair-tool");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    press(&mut ui.app, "repair-tool");
+    press(&mut ui.app, "confirm-repair-tool");
+    wait(&mut ui.app, "text:已通过完整核验");
+    assert_eq!(ui.commands.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn image_writes_report_space_permissions_and_unknown_files_without_offering_overwrite() {
+    let mut view = ready_view();
+    let mut full = image("full", 34, false);
+    full["availableBytes"] = json!(1024);
+    let mut readonly = image("ro", 35, false);
+    readonly["writable"] = json!(false);
+    let mut unknown = image("unknown", 36, false);
+    unknown["integrity"] = json!("conflict");
+    unknown["issue"] = json!("包含未知文件 extra.img");
+    let mut resident = image("resident", 33, true);
+    resident["writable"] = json!(false);
+    view["preparation"]["images"] = json!([full, readonly, unknown, resident]);
+    let mut ui = Scripted::new(view, |_, _| unreachable!());
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-environment");
+    press(&mut ui.app, "environment-images");
+    wait(&mut ui.app, "id:image-full >> text:目标卷空间不足");
+    wait(&mut ui.app, "id:image-ro >> text:目标目录不可写");
+    wait(&mut ui.app, "id:image-unknown >> text:/extra.img/");
+    wait(&mut ui.app, "id:image-resident >> text:/只读位置/");
+    assert!(ui.app.screen().enabled("id:use-resident").unwrap());
+    assert!(ui.app.screen().enabled("id:verify-resident").unwrap());
+    for id in ["full", "ro", "unknown"] {
+        gone(&mut ui.app, &format!("id:download-{id}"));
+        gone(&mut ui.app, &format!("id:repair-{id}"));
+    }
+    assert!(ui.commands.lock().unwrap().is_empty());
+}
+
+#[test]
 fn images_require_separate_consent_selection_and_instance_creation() {
     let mut view = ready_view();
     view["instances"] = json!([]);
@@ -484,7 +620,10 @@ fn images_require_separate_consent_selection_and_instance_creation() {
                 v["preparation"]["phase"] = json!("downloading");
                 v["preparation"]["images"][1]["downloadedBytes"] = json!(524288);
             }
-            "createInstance" => assert_eq!(cmd["imageId"], "r35"),
+            "createInstance" => {
+                assert_eq!(cmd["imageId"], "r35");
+                assert_eq!(cmd["image"], image("r35", 35, true)["image"]);
+            }
             _ => panic!("意外命令 {cmd}"),
         }
         json!({"status":"accepted"})
@@ -502,6 +641,7 @@ fn images_require_separate_consent_selection_and_instance_creation() {
         v["preparation"]["phase"] = json!("ready");
         v["preparation"]["currentComponent"] = Value::Null;
         v["preparation"]["images"][1]["ready"] = json!(true);
+        v["preparation"]["images"][1]["integrity"] = json!("verified");
     });
     wait(&mut ui.app, "id:workspace-next >> text:创建实例");
     gone(&mut ui.app, "id:pending");
@@ -515,9 +655,36 @@ fn images_require_separate_consent_selection_and_instance_creation() {
     press(&mut ui.app, "use-r35");
     wait(&mut ui.app, "id:create-form >> text:/Android API 35/");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     gone(&mut ui.app, "id:pending");
     assert_eq!(ui.commands.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn selection_pins_one_of_two_revisions_of_the_same_image() {
+    let mut view = ready_view();
+    view["instances"] = json!([]);
+    view["selectedId"] = Value::Null;
+    let mut other = image("api34-r15", 34, true);
+    other["version"] = json!("15");
+    other["image"]["revision"] = json!(15);
+    view["preparation"]["images"] = json!([image("api34-r14", 34, true), other]);
+    let mut ui = Scripted::new(view, |cmd, _| {
+        assert_eq!(cmd["kind"], "createInstance");
+        assert_eq!(cmd["imageId"], "api34-r14");
+        assert_eq!(cmd["image"], image("api34-r14", 34, true)["image"]);
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:inventory");
+    press(&mut ui.app, "workspace-next");
+    wait(&mut ui.app, "id:image-api34-r15 >> text:/修订版 15/");
+    press(&mut ui.app, "use-api34-r14");
+    wait(&mut ui.app, "id:create-form >> text:/修订版 14/");
+    wait(&mut ui.app, "id:hardware-fields");
+    press(&mut ui.app, "create");
+    gone(&mut ui.app, "id:pending");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -543,6 +710,7 @@ fn selected_download_advances_only_the_current_creation_flow() {
         v["preparation"]["phase"] = json!("ready");
         v["preparation"]["currentComponent"] = Value::Null;
         v["preparation"]["images"][0]["ready"] = json!(true);
+        v["preparation"]["images"][0]["integrity"] = json!("verified");
     });
     wait(&mut ui.app, "id:create-form >> text:/Android API 35/");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
@@ -558,6 +726,7 @@ fn local_image_zip_is_reviewed_before_import_and_unknown_files_explain_why() {
             &json!({"kind":"importImage","imageId":"r34","path":"/tmp/archive.zip","acceptedLicenses":true})
         );
         view["preparation"]["images"][0]["ready"] = json!(true);
+        view["preparation"]["images"][0]["integrity"] = json!("verified");
         json!({"status":"accepted"})
     });
     ui.channel.handle("windroid.pickResource", |call| {
@@ -598,7 +767,7 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     view["preparation"]["componentsReady"] = json!(false);
     view["preparation"]["phase"] = json!("missing");
     view["preparation"]["components"] = json!([{"id":"emulator","name":"Android Emulator","version":"37",
-        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"borrowed":false}]);
+        "sizeBytes":1024, "location":"/tmp/tools", "license":"SDK", "ready":false,"integrity":"missing","repairToken":null,"requiredBytes":3072,"writable":true,"availableBytes":65536}]);
     let mut ui = Scripted::new(view, |cmd, v| {
         assert_eq!(
             cmd,
@@ -614,6 +783,7 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     press(&mut ui.app, "guide-from-inventory");
     press(&mut ui.app, "guide-begin");
     wait(&mut ui.app, "id:components");
+    assert!(bounds(&ui.app, "guide-skip-components").bottom().0 < 520.0);
     press(&mut ui.app, "prepare-runtime");
     wait(&mut ui.app, "id:component-progress");
     press(&mut ui.app, "guide-skip-components");
@@ -630,13 +800,13 @@ fn guide_skips_each_step_and_returns_to_its_origin_while_transfers_continue() {
     press(&mut ui.app, "guide-begin");
     wait(&mut ui.app, "id:image-list");
     press(&mut ui.app, "cancel-image-selection");
-    wait(&mut ui.app, "text:/Windroid 当前将运行记录/");
+    wait(&mut ui.app, "id:workspace-scroll >> text:应用日志");
     press(&mut ui.app, "show-guide");
     press(&mut ui.app, "guide-begin");
     press(&mut ui.app, "use-r34");
     wait(&mut ui.app, "id:create-form");
     press(&mut ui.app, "cancel-create");
-    wait(&mut ui.app, "text:/Windroid 当前将运行记录/");
+    wait(&mut ui.app, "id:workspace-scroll >> text:应用日志");
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
     assert_eq!(ui.first_pages.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
@@ -654,6 +824,7 @@ fn creation_reply_does_not_redirect_a_new_guide_session() {
     press(&mut ui.app, "show-guide");
     press(&mut ui.app, "guide-begin");
     press(&mut ui.app, "use-r34");
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     let request = waiting.recv_timeout(WAIT).unwrap();
     press(&mut ui.app, "show-settings");
@@ -671,14 +842,33 @@ fn creation_reply_does_not_redirect_a_new_guide_session() {
     wait(&mut ui.app, "id:guide-begin");
 }
 
+fn storage(runtime: &str, images: &str) -> Value {
+    json!({"home":"/home", "runtimeRoot":runtime, "imageRoot":images,
+        "defaultRuntimeRoot":"/home/runtime", "defaultImageRoot":"/home/system-images", "cleanupNotes":[],
+        "runtimeIsDefault":runtime=="/home/runtime", "imageIsDefault":images=="/home/system-images"})
+}
+
+fn storage_plan(change: &Value, id: usize) -> Value {
+    json!({"previewId":id, "mode":change["mode"],"cleanup":change["cleanup"],
+        "runtimeRoot":change["runtimeRoot"],"imageRoot":change["imageRoot"], "versions":[],
+        "requiredBytes":0,"availableBytes":null,"affectedInstances":[],"blockers":[]})
+}
+
 #[test]
-fn storage_changes_preview_each_file_and_recheck_occupancy_before_applying() {
+fn storage_reviews_each_version_and_cleanup_choice_then_restores_each_root_independently() {
     let mut view = ready_view();
-    view["storage"] = json!({"home":"/home","runtimeRoot":"/old","sdk":"/old/sdk","images":"/old/sdk/system-images","imagesInherited":true,"borrowed":false});
+    view["storage"] = storage("/old", "/initial-images");
     let mut ui = Scripted::new(view, |cmd, v| {
-        assert_eq!(cmd, &json!({"kind":"applyStorage","plan":{"previewId":2}}));
-        v["storage"]["imagesInherited"] = json!(false);
-        v["storage"]["images"] = json!("/images");
+        assert_eq!(cmd["kind"], "applyStorage");
+        match cmd["plan"]["previewId"].as_u64().unwrap() {
+            4 => v["storage"]["imageRoot"] = json!("/images"),
+            7 => {
+                // 同一实际目录经原生面板返回时可能采用另一种路径拼写。
+                v["storage"]["runtimeRoot"] = json!("/private/home/runtime/");
+                v["storage"]["runtimeIsDefault"] = json!(true);
+            }
+            id => panic!("无法识别此次确认的预览 {id}"),
+        }
         json!({"status":"accepted"})
     });
     ui.channel.handle("windroid.pickResource", |call| {
@@ -688,44 +878,229 @@ fn storage_changes_preview_each_file_and_recheck_occupancy_before_applying() {
     let count = std::sync::atomic::AtomicUsize::new(0);
     ui.channel.handle("windroid.previewStorage", move |call| {
         let id = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        assert_eq!(call.data()["runtimeRoot"], "/old");
-        assert_eq!(
-            call.data()["expected"],
-            json!({"runtimeRoot":"/old","imageRoot":if id == 3 {json!("/images")} else {Value::Null}})
-        );
-        assert_eq!(call.data()["imageRoot"], if id == 3 { Value::Null } else { json!("/images") });
-        let files: Vec<_> = (0..9).map(|n| json!({"source":format!("/old/file{n}"),"target":format!("/images/file{n}"),"bytes":20})).collect();
-        let image_root = call.data()["imageRoot"].clone();
-        call.resolve(json!({"previewId":id,"runtimeRoot":"/old","imageRoot":image_root, "files":files,
-            "blockers":if id == 1 {vec!["请先停止「工作机」"]} else {vec![]}}));
+        let change = call.data();
+        assert_eq!(change["expected"], json!({"runtimeRoot":"/old","imageRoot":if id >= 5 {"/images"} else {"/initial-images"}}));
+        assert_eq!(change["runtimeRoot"], if id >= 6 {"/home/runtime"} else {"/old"});
+        assert_eq!(change["imageRoot"], if id == 5 {"/home/system-images"} else {"/images"});
+        assert_eq!(change["mode"], match id {2..=4=>"migrate",7=>"future",_=>"use"});
+        assert_eq!(change["cleanup"], id == 4);
+        let mut plan = storage_plan(change, id);
+        if id <= 4 {
+            plan["versions"] = json!((0..9).map(|n| json!({"id":format!("r{n}"),"name":format!("版本 {n}"),"source":format!("/old/r{n}"),"target":format!("/images/r{n}"),"bytes":1024,
+                "status":if id==1 {"missing"} else {"copy"}, "cleanup":id==4,"downloadable":false,"detail":""})).collect::<Vec<_>>());
+            plan["affectedInstances"] = json!(["工作机 · API 34 · r14"]);
+            plan["requiredBytes"] = json!(9216); plan["availableBytes"] = json!(1048576);
+            plan["blockers"] = match id { 1=>json!(["目标缺少工作机使用的 r14"]),2=>json!(["请先停止「工作机」"]),_=>json!([]) };
+        }
+        call.resolve(plan);
     });
     wait(&mut ui.app, "id:library");
     press(&mut ui.app, "show-settings");
     press(&mut ui.app, "settings-storage");
     press(&mut ui.app, "choose-image-directory");
-    wait(&mut ui.app, "text:请先停止「工作机」");
+    wait(&mut ui.app, "text:目标缺少工作机使用的 r14");
     assert!(!ui.app.screen().enabled("id:storage-apply").unwrap());
+    press(&mut ui.app, "storage-mode-migrate");
+    wait(&mut ui.app, "text:请先停止「工作机」");
     press(&mut ui.app, "storage-next");
-    wait(&mut ui.app, "text:/file8$/");
+    wait(&mut ui.app, "text:版本 8");
     press(&mut ui.app, "storage-see-instances");
     wait(&mut ui.app, "id:inventory");
     press(&mut ui.app, "show-settings");
-    wait(&mut ui.app, "id:storage-preview");
-    gone(&mut ui.app, "text:请先停止「工作机」");
+    wait(&mut ui.app, "text:切换后保留源版本。");
+    press(&mut ui.app, "storage-toggle-cleanup");
+    wait(&mut ui.app, "text:迁移并清理已确认源版本");
+    wait(
+        &mut ui.app,
+        "id:storage-version-r0 >> text:切换成功后，复核并清理此源版本。",
+    );
     assert!(ui.commands.lock().unwrap().is_empty());
     press(&mut ui.app, "storage-apply");
-    wait(&mut ui.app, "text:单独存放");
-    press(&mut ui.app, "inherit-image-directory");
+    wait(&mut ui.app, "id:reset-image-directory");
+    press(&mut ui.app, "reset-image-directory");
     wait(&mut ui.app, "id:storage-preview");
     press(&mut ui.app, "cancel-storage");
-    wait(&mut ui.app, "text:单独存放");
+    press(&mut ui.app, "reset-runtime-directory");
+    wait(&mut ui.app, "id:storage-preview");
+    press(&mut ui.app, "storage-mode-future");
+    wait(&mut ui.app, "text:确认下载位置");
+    press(&mut ui.app, "storage-apply");
+    wait(&mut ui.app, "id:choose-runtime-directory");
+    gone(&mut ui.app, "id:reset-runtime-directory");
+    assert_eq!(ui.commands.lock().unwrap().len(), 2);
+}
+
+fn temporary_ui_dir(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "windroid-ui-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+fn real_resource_ui(home: &std::path::Path) -> (Headless, Arc<host::Library>) {
+    let config = config();
+    let (windows, _) = mpsc::channel();
+    let (_events, receiver) = mpsc::channel();
+    let library = host::Library::attach(
+        config.host.clone(),
+        runtime::Layout { root: home.into() },
+        false,
+        windows,
+        receiver,
+    )
+    .unwrap();
+    (render(config), library)
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replacing_the_directory_after_review_rejects_a_real_host_repair_without_writing() {
+    let temp = temporary_ui_dir("repair");
+    let home = temp.join("workspace");
+    runtime::workspace::open(&home).unwrap();
+    let version = home.join("runtime/scrcpy-server/5.0.1");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("scrcpy-server.jar"), b"first copy").unwrap();
+    let (mut app, library) = real_resource_ui(&home);
+    wait(&mut app, "id:show-environment");
+    press(&mut app, "show-environment");
+    press(&mut app, "repair-scrcpy-server");
+    wait(&mut app, "id:confirm-repair-scrcpy-server");
+    let previous = temp.join("saved-original");
+    std::fs::rename(&version, &previous).unwrap();
+    std::fs::create_dir(&version).unwrap();
+    std::fs::write(version.join("scrcpy-server.jar"), b"other copy").unwrap();
+    // 没有向界面发送刷新事件，确认携带的是先前看到的对象。
+    press(&mut app, "confirm-repair-scrcpy-server");
+    wait(&mut app, "text:/重新确认/");
+    gone(&mut app, "id:pending");
+    assert_eq!(
+        std::fs::read(version.join("scrcpy-server.jar")).unwrap(),
+        b"other copy"
+    );
+    assert_eq!(
+        std::fs::read(previous.join("scrcpy-server.jar")).unwrap(),
+        b"first copy"
+    );
+    assert_eq!(
+        std::fs::read_dir(version.parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+    library.shutdown();
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn restoring_a_default_through_another_spelling_uses_the_real_host_directory_identity() {
+    use runtime::storage::{StorageLocations, SwitchMode, apply, preview_switch};
+    let temp = temporary_ui_dir("default-root");
+    let physical = temp.join("physical");
+    std::fs::create_dir(&physical).unwrap();
+    std::os::unix::fs::symlink(&physical, temp.join("alias")).unwrap();
+    let home = temp.join("alias/workspace");
+    runtime::workspace::open(&home).unwrap();
+    let target = StorageLocations {
+        runtime_root: temp.join("custom"),
+        ..StorageLocations::defaults(&home)
+    };
+    apply(
+        &home,
+        &preview_switch(&home, &target, SwitchMode::Future, false).unwrap(),
+    )
+    .unwrap();
+    let (mut app, library) = real_resource_ui(&home);
+    wait(&mut app, "id:show-settings");
+    press(&mut app, "show-settings");
+    press(&mut app, "settings-storage");
+    press(&mut app, "reset-runtime-directory");
+    wait(&mut app, "id:storage-mode-future");
+    press(&mut app, "storage-mode-future");
+    wait(&mut app, "text:确认下载位置");
+    press(&mut app, "storage-apply");
+    wait(&mut app, "id:choose-runtime-directory");
+    gone(&mut app, "id:reset-runtime-directory");
+    gone(&mut app, "id:reset-image-directory");
+    let saved = StorageLocations::load(&home).unwrap();
+    assert_ne!(saved.runtime_root, home.join("runtime"));
+    assert!(runtime::storage::same_location(
+        &saved.runtime_root,
+        &home.join("runtime")
+    ));
+    assert_eq!(saved.image_root, home.join("system-images"));
+    library.shutdown();
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn candidate_download_preserves_the_bound_root_until_the_next_preview_is_confirmed() {
+    let mut view = ready_view();
+    view["storage"] = storage("/tools", "/original");
+    let mut ui = Scripted::new(view, |cmd, v| {
+        assert_eq!(
+            cmd,
+            &json!({"kind":"prepareCandidateImage","resourceId":"r34","previewId":1,"acceptedLicenses":true})
+        );
+        let p = &mut v["preparation"];
+        p["currentComponent"] = json!("r34");
+        p["phase"] = json!("downloading");
+        p["candidateTarget"] = json!("/target/r14");
+        p["candidateDownloadedBytes"] = json!(524288);
+        json!({"status":"accepted"})
+    });
+    ui.channel.handle("windroid.pickResource", |call| {
+        call.resolve(json!("/target"))
+    });
+    let first = std::sync::atomic::AtomicBool::new(true);
+    ui.channel.handle("windroid.previewStorage", move |call| {
+        let missing = first.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let mut plan = storage_plan(call.data(), if missing { 1 } else { 2 });
+        plan["versions"] = json!([{"id":"r34", "name":"Android 14 · r14", "source":"/original/r14", "target":"/target/r14",
+            "status":if missing {"missing"} else {"reuse"}, "bytes":1048576, "downloadable":missing,
+            "downloadRequiredBytes":3145728,"downloadAvailableBytes":1073741824,"downloadWritable":true, "cleanup":false, "detail":""}]);
+        plan["blockers"] = if missing {json!(["目标缺少 r14"])} else {json!([])};
+        call.resolve(plan);
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "show-settings");
+    press(&mut ui.app, "settings-storage");
+    press(&mut ui.app, "choose-image-directory");
+    wait(&mut ui.app, "id:download-candidate-r34");
+    wait(&mut ui.app, "text:/下载及安装需额外空间 · 3.0 MiB/");
+    assert!(ui.commands.lock().unwrap().is_empty());
+    press(&mut ui.app, "download-candidate-r34");
+    wait(&mut ui.app, "text:512 KiB / 1.0 MiB");
+    ui.update(|v| {
+        let p = &mut v["preparation"];
+        p["phase"] = json!("ready");
+        p["candidateDownloadedBytes"] = json!(1048576);
+    });
+    wait(&mut ui.app, "text:目标镜像已准备，请重新预览。");
+    gone(&mut ui.app, "id:download-candidate-r34");
+    gone(&mut ui.app, "id:pause-candidate");
+    assert!(!ui.app.screen().enabled("id:storage-apply").unwrap());
+    press(&mut ui.app, "storage-recheck");
+    wait(&mut ui.app, "text:可原地复用");
+    gone(&mut ui.app, "id:download-candidate-r34");
+    assert!(ui.app.screen().enabled("id:storage-apply").unwrap());
     assert_eq!(ui.commands.lock().unwrap().len(), 1);
+    assert_eq!(
+        ui.state.lock().unwrap()["storage"]["imageRoot"],
+        "/original"
+    );
 }
 
 #[test]
 fn preview_from_an_old_workspace_view_cannot_restore_another_roots_location() {
     let mut view = ready_view();
-    view["storage"] = json!({"home":"/home","runtimeRoot":"/old","sdk":"/old/sdk","images":"/old/sdk/system-images","imagesInherited":true,"borrowed":false});
+    view["storage"] = storage("/old", "/local");
     let mut ui = Scripted::new(view, |_, _| unreachable!());
     ui.channel.handle("windroid.pickResource", |call| {
         call.resolve(json!("/images"))
@@ -734,12 +1109,13 @@ fn preview_from_an_old_workspace_view_cannot_restore_another_roots_location() {
     let first = std::sync::atomic::AtomicBool::new(true);
     ui.channel.handle("windroid.previewStorage", move |call| {
         if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            assert_eq!(call.data()["expected"], json!({"runtimeRoot":"/old","imageRoot":null}));
-            state.lock().unwrap()["storage"] = json!({"home":"/home","runtimeRoot":"/fresh","sdk":"/fresh/sdk","images":"/fresh/sdk/system-images","imagesInherited":true,"borrowed":false});
+            assert_eq!(call.data()["expected"], json!({"runtimeRoot":"/old","imageRoot":"/local"}));
+            state.lock().unwrap()["storage"] = storage("/fresh","/local");
             call.reject("原存储位置已改变");
         } else {
-            assert_eq!(call.data(), &json!({"runtimeRoot":"/fresh","imageRoot":"/images","expected":{"runtimeRoot":"/fresh","imageRoot":null}}));
-            call.resolve(json!({"runtimeRoot":"/fresh","imageRoot":"/images","files":[],"blockers":[],"previewId":2}));
+            assert_eq!(call.data(), &json!({"runtimeRoot":"/fresh","imageRoot":"/images","expected":{"runtimeRoot":"/fresh","imageRoot":"/local"}, "mode":"use","cleanup":false}));
+            let plan = storage_plan(call.data(), 2);
+            call.resolve(plan);
         }
     });
     wait(&mut ui.app, "id:library");
@@ -1007,15 +1383,236 @@ fn recommended_template_can_be_overridden_before_creation() {
         .set_viewport(Size::new(Points(480.0), Points(650.0)))
         .unwrap();
     wait(&mut ui.app, "text:/平板/");
+    wait(&mut ui.app, "id:hardware-fields");
     press(&mut ui.app, "create");
     wait(&mut ui.app, "text:实例已创建");
     gone(&mut ui.app, "text:创建实例请求已受理");
     assert_eq!(
         *ui.commands.lock().unwrap(),
         [
-            json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作","imageId":"r34"})
+            json!({"kind":"createInstance","template":"tablet-1200","name":"我的 Android 工作","imageId":"r34","image":image("r34",34,true)["image"],
+                "cpuCores":2,"ramMiB":2560,"gpuMode":"host","diskGiB":8})
         ]
     );
+}
+
+#[test]
+fn create_rechecks_the_selected_template_and_accepts_exact_custom_units() {
+    let mut ui = Scripted::new(ready_view(), |cmd, _| {
+        assert_eq!(cmd["kind"], "createInstance");
+        assert_eq!(cmd["cpuCores"], 3);
+        assert_eq!(cmd["ramMiB"], 4097);
+        assert_eq!(cmd["diskGiB"], 11);
+        assert_eq!(cmd["gpuMode"], "batch");
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "new-instance");
+    press(&mut ui.app, "use-r34");
+    wait(&mut ui.app, "id:choose-ram >> text:/2.5 GiB/");
+    press(&mut ui.app, "choose-template");
+    choose(&mut ui.app, "4K 电视 · 3840 × 2160");
+    wait(&mut ui.app, "id:choose-ram >> text:/4 GiB/");
+    for (field, invalid, valid) in [
+        ("cpu", "0", "3"),
+        ("ram", "4095", "4097"),
+        ("disk", "41", "11"),
+    ] {
+        press(&mut ui.app, &format!("choose-{field}"));
+        choose(&mut ui.app, "自定义…");
+        let input = format!("id:custom-{field}");
+        ui.app.clear(&input).unwrap();
+        ui.app.type_text(&input, invalid).unwrap();
+        wait(&mut ui.app, "id:hardware-issue");
+        assert!(!ui.app.screen().enabled("id:create").unwrap());
+        ui.app.clear(&input).unwrap();
+        ui.app.type_text(&input, valid).unwrap();
+        gone(&mut ui.app, "id:hardware-issue");
+    }
+    press(&mut ui.app, "choose-graphics");
+    choose(&mut ui.app, "硬件加速（Vulkan 批处理）");
+    press(&mut ui.app, "create");
+    gone(&mut ui.app, "id:pending");
+    assert_eq!(ui.commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn late_hardware_limits_cannot_enable_a_creation_on_a_full_volume() {
+    let mut ui = Scripted::new(ready_view(), |_, _| unreachable!());
+    let (requested, replies) = mpsc::channel();
+    ui.channel.handle("windroid.hardwareLimits", move |call| {
+        requested.send(call.into_reply().unwrap()).unwrap();
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "new-instance");
+    press(&mut ui.app, "use-r34");
+    let stale = replies.recv_timeout(WAIT).unwrap();
+    press(&mut ui.app, "choose-template");
+    choose(&mut ui.app, "4K 电视 · 3840 × 2160");
+    let current = replies.recv_timeout(WAIT).unwrap();
+    let mut full = hardware_limits(&json!({"template":"tv-4k"}));
+    full["maxDiskGiB"] = json!(5);
+    full["defaultDiskGiB"] = Value::Null;
+    current.resolve(full);
+    wait(&mut ui.app, "text:/不足 6 GiB/");
+    stale.resolve(hardware_limits(&Value::Null));
+    ui.app.idle(Duration::from_millis(50)).unwrap();
+    assert!(!ui.app.screen().enabled("id:create").unwrap());
+    press(&mut ui.app, "retry-hardware");
+    let mut small = hardware_limits(&json!({"template":"tv-4k"}));
+    small["maxDiskGiB"] = json!(7);
+    small["defaultDiskGiB"] = json!(6);
+    replies.recv_timeout(WAIT).unwrap().resolve(small);
+    wait(&mut ui.app, "id:choose-disk >> text:/6 GiB/");
+    press(&mut ui.app, "choose-disk");
+    let options: Vec<_> = ui
+        .app
+        .menu()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.label)
+        .collect();
+    assert_eq!(options, ["6 GiB", "自定义…"]);
+    assert!(ui.commands.lock().unwrap().is_empty());
+}
+
+#[test]
+fn instance_settings_edit_only_after_process_exit_and_restart_the_selected_session() {
+    let mut view = ready_view();
+    view["instances"][0]["config"] = json!({
+        "template":"compact-720","image":image("r34",34,true)["image"],"cpuCores":2,"ramMiB":1536,
+        "screenWidth":1280,"screenHeight":720,"diskBytes":8589934592_u64,"graphics":"host"
+    });
+    view["instances"][0]["state"] = json!("failed");
+    view["instances"][0]["processAlive"] = json!(true);
+    let mut ui = Scripted::new(view, |cmd, view| {
+        assert_eq!(cmd["instanceId"], "a");
+        match cmd["kind"].as_str() {
+            Some("updateHardware") => {
+                assert_eq!(
+                    cmd,
+                    &json!({"kind":"updateHardware","instanceId":"a","cpuCores":4,"ramMiB":1536,"gpuMode":"software"})
+                );
+                view["instances"][0]["config"]["cpuCores"] = cmd["cpuCores"].clone();
+                view["instances"][0]["config"]["graphics"] = cmd["gpuMode"].clone();
+            }
+            Some("coldRestart") => {
+                view["state"] = json!("ready");
+                view["instances"][0]["state"] = json!("ready");
+                view["instances"][0]["processAlive"] = json!(true);
+                view["instances"][0]["observed"] = json!({"cpuCores":4,"ramMiB":2560});
+                view["capabilities"] = json!({"launchApp":true,"stop":true});
+            }
+            Some("restart") => {
+                return json!({"status":"rejected","reason":{"kind":"error","detail":"本机内存压力过高"}});
+            }
+            other => panic!("意外命令 {other:?}"),
+        }
+        json!({"status":"accepted"})
+    });
+    wait(&mut ui.app, "id:library");
+    press(&mut ui.app, "all-instances");
+    press(&mut ui.app, "manage-a");
+    gone(&mut ui.app, "id:edit-hardware");
+    ui.update(|v| {
+        v["state"] = json!("stopped");
+        v["instances"][0]["state"] = json!("stopped");
+        v["instances"][0]["processAlive"] = json!(false);
+        v["capabilities"] = json!({"start":true});
+    });
+    wait(&mut ui.app, "id:edit-hardware");
+    press(&mut ui.app, "edit-hardware");
+    wait(&mut ui.app, "id:hardware-editor >> text:/保留原设/");
+    gone(&mut ui.app, "id:choose-disk");
+    press(&mut ui.app, "choose-cpu");
+    choose(&mut ui.app, "4 核");
+    press(&mut ui.app, "choose-graphics");
+    choose(&mut ui.app, "软件渲染");
+    press(&mut ui.app, "save-hardware");
+    gone(&mut ui.app, "id:hardware-editor");
+    wait(&mut ui.app, "text:图形渲染 · 软件渲染");
+    press(&mut ui.app, "manage-more");
+    gone(&mut ui.app, "id:restart-instance");
+    press(&mut ui.app, "cold-restart");
+    press(&mut ui.app, "confirm-action");
+    wait(&mut ui.app, "text:观测到的 CPU · 4 核     内存 · 2560 MiB");
+    gone(&mut ui.app, "id:edit-hardware");
+    press(&mut ui.app, "restart-instance");
+    press(&mut ui.app, "confirm-action");
+    wait(&mut ui.app, "text:/本机内存压力过高/");
+    wait(&mut ui.app, "id:stop");
+    press(&mut ui.app, "manage-back");
+    wait(&mut ui.app, "id:row-a >> text:4 核");
+    wait(&mut ui.app, "id:row-a >> text:1536 MiB");
+    assert_eq!(ui.commands.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn spec_controls_remain_reachable_in_the_scroll_view_at_both_window_sizes() {
+    fn reach(app: &mut Headless, width: f32, height: f32, ids: &[&str]) {
+        for id in ids {
+            let before = bounds(app, id);
+            if before.top().0 < 0.0 || before.bottom().0 > height {
+                let distance = before.top().0 - height / 2.0;
+                app.scroll("id:workspace-scroll", Points(distance)).unwrap();
+            }
+            let control = bounds(app, id);
+            assert!(
+                control.top().0 >= 0.0 && control.bottom().0 <= height,
+                "{id}: {control:?}"
+            );
+            assert!(
+                control.left().0 >= 0.0 && control.right().0 <= width,
+                "{id}: {control:?}"
+            );
+        }
+    }
+    for (width, height) in [(1024.0, 720.0), (480.0, 520.0)] {
+        let mut view = ready_view();
+        view["instances"][0]["state"] = json!("stopped");
+        view["instances"][0]["config"] = json!({"cpuCores":3,"ramMiB":3136,"graphics":"host"});
+        let mut ui = Scripted::new(view, |_, _| unreachable!());
+        wait(&mut ui.app, "id:library");
+        ui.app
+            .set_viewport(Size::new(Points(width), Points(height)))
+            .unwrap();
+        press(&mut ui.app, "new-instance");
+        press(&mut ui.app, "use-r34");
+        wait(&mut ui.app, "id:hardware-fields");
+        reach(
+            &mut ui.app,
+            width,
+            height,
+            &[
+                "instance-name",
+                "choose-template",
+                "change-image",
+                "choose-cpu",
+                "choose-ram",
+                "choose-graphics",
+                "choose-disk",
+                "create",
+                "cancel-create",
+            ],
+        );
+        press(&mut ui.app, "cancel-create");
+        press(&mut ui.app, "manage-a");
+        reach(&mut ui.app, width, height, &["edit-hardware"]);
+        press(&mut ui.app, "edit-hardware");
+        wait(&mut ui.app, "id:hardware-fields");
+        reach(
+            &mut ui.app,
+            width,
+            height,
+            &[
+                "choose-cpu",
+                "choose-ram",
+                "choose-graphics",
+                "save-hardware",
+                "cancel-hardware",
+            ],
+        );
+    }
 }
 
 /// HOME 清单晚于库首帧到达；一次进入应用库即可选择只声明 HOME 的包。
@@ -1299,24 +1896,26 @@ fn window_settings_share_the_native_close_choice() {
 fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
     let mut view = ready_view();
     let root = "/Volumes/Studio External Drive/开发与测试/Windroid/运行资源".to_string();
-    let long_path = format!("{root}/sdk/system-images/android-35/google_apis_playstore/arm64-v8a");
+    let long_path = format!("{root}/system-images/android-35/google_apis_playstore/arm64-v8a/r9");
     view["preparation"]["images"] = json!([
         image("r33", 33, false),
         image("r35", 35, false),
         image("r34", 34, true),
-        image("external", 30, false)
+        image("conflicting", 30, false)
     ]);
-    view["preparation"]["images"][3]["borrowed"] = json!(true);
+    view["preparation"]["images"][3]["integrity"] = json!("conflict");
+    view["preparation"]["images"][3]["issue"] = json!("包含未知文件 extra.img");
     view["preparation"]["images"][1]["location"] = json!(long_path);
-    view["storage"] = json!({"home":"/tmp/home","runtimeRoot":root,"sdk":format!("{root}/sdk"),
-        "images":long_path,"imagesInherited":false,"borrowed":false});
+    view["storage"] = storage(&root, &long_path);
     let mut ui = Scripted::new(view, |_, _| unreachable!());
     ui.channel
         .handle("windroid.pickResource", |call| call.resolve(json!("/new")));
     ui.channel.handle("windroid.previewStorage", move |call| {
-        let files: Vec<_> = (0..16).map(|i| json!({"source":format!("{long_path}/source-{i}.img"),
-            "target":format!("/Volumes/Another External Volume/Relocated Images/android-35/google_apis_playstore/arm64-v8a/source-{i}.img"),"bytes":2048})).collect();
-        call.resolve(json!({"runtimeRoot":"/new","imageRoot":null,"previewId":1,"blockers":[],"files":files}));
+        let mut plan = storage_plan(call.data(),1);
+        plan["versions"] = json!((0..16).map(|i| json!({"id":format!("id-{i}"),"name":format!("版本 {i}"), "source":format!("{long_path}/r{i}"),
+            "target":format!("/Volumes/Another External Volume/Relocated Images/android-35/google_apis_playstore/arm64-v8a/r{i}"),"bytes":2048,
+            "cleanup":false,"downloadable":false,"status":"reuse","detail":""})).collect::<Vec<_>>());
+        call.resolve(plan);
     });
     ui.app
         .set_viewport(Size::new(Points(420.0), Points(520.0)))
@@ -1325,8 +1924,8 @@ fn narrow_resource_pages_wrap_paths_and_keep_settings_navigation_visible() {
     press(&mut ui.app, "show-environment");
     press(&mut ui.app, "environment-images");
     wait(&mut ui.app, "id:download-r35");
-    wait(&mut ui.app, "text:需在指定的 SDK 中准备");
-    gone(&mut ui.app, "id:download-external");
+    wait(&mut ui.app, "text:需要处理");
+    gone(&mut ui.app, "id:download-conflicting");
     assert!(bounds(&ui.app, "image-r34").top() < bounds(&ui.app, "image-r35").top());
     assert!(bounds(&ui.app, "image-r35").top() < bounds(&ui.app, "image-r33").top());
     let long_location = ui

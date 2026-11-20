@@ -1,116 +1,107 @@
-//! 用显式开发 SDK 在临时实例库中依次启动 A、B、A，验证真实 adb、数据隔离和 Quick Boot。
-//! 指定 WINDROID_SDK，然后运行 cargo test -p runtime --test real_emulator -- --ignored --nocapture。
+//! Apple 芯片实测。WINDROID_TEST_RESOURCES 指向展开后的 runtime 与 system-images 的父目录。
+//! 每个用例克隆所需官方版本，使用独立的工作区、Android 用户目录和 adb 服务。
+#![cfg(target_os = "macos")]
 
+#[path = "instances/guest.rs"]
+mod guest;
 #[path = "instances/support.rs"]
 mod support;
+use guest::{boot, guest, stop};
 
-use contract::{Backend, Command, Facts, State};
-use runtime::{
-    EmulatorBackend, Layout,
-    instances::{InstanceRecord, InstanceStore},
-};
+use contract::{Backend, Command, Facts};
+use runtime::{EmulatorBackend, Layout, instances::InstanceStore};
 use std::fs;
 use std::process::Command as ChildCommand;
 use std::time::{Duration, Instant};
 use support::{Temp, avd, spec};
 
-fn guest(record: &InstanceRecord, cmd: &str) -> String {
-    record.verify_device().unwrap();
-    let out = adb::shell(&record.serial(), cmd).unwrap();
-    assert_eq!(out.code, Some(0), "{}", out.stderr);
-    out.stdout.trim().to_owned()
-}
-
-const TEST: &str = "real_adb_facts_drive_the_state_machine";
-const CHILD: &str = "WINDROID_INSTANCE_REAL_CHILD";
-
-fn boot(layout: &Layout, record: &InstanceRecord) -> (EmulatorBackend, Facts) {
-    let mut backend = EmulatorBackend::new(record.id.clone(), layout.clone(), record.port);
-    let mut facts = Facts::default();
-    backend.observe(&mut facts);
-    assert_eq!(State::of(&facts), State::Stopped);
-    backend
-        .exec(&Command::Start, &mut facts)
-        .expect("启动私有 AVD");
-    assert_eq!(State::of(&facts), State::Starting);
-    println!(
-        "已启动实例 {}，端口 {}，私有 AVD {}",
-        record.name,
-        record.port,
-        record.avd_name()
-    );
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(240) {
-        backend.observe(&mut facts);
-        if facts.boot_completed && State::of(&facts) == State::Ready {
-            match record.verify_device() {
-                Ok(()) => {
-                    println!("{} 在 {:?} 后就绪", record.name, started.elapsed());
-                    return (backend, facts);
-                }
-                // 系统首次启动期间 adbd 会暂时离线，下一轮重新核对三个服务和设备身份。
-                Err(e) if e.kind() == std::io::ErrorKind::NotConnected => (),
-                Err(e) => panic!("核对 {} 私有 AVD 名失败：{e}", record.name),
-            }
-        }
-        assert!(
-            facts.process_alive,
-            "模拟器提前退出，日志在 {}",
-            layout.instance(&record.id).join("emulator.log").display()
-        );
-        std::thread::sleep(Duration::from_millis(500));
+fn isolated(name: &str, apis: &[u32]) -> bool {
+    use std::path::{Path, PathBuf};
+    if std::env::var_os("WINDROID_REAL_EMULATOR_CHILD").is_some() {
+        return false;
     }
-    panic!("实例 {} 启动未完成，事实为 {facts:?}", record.name);
-}
-
-fn stop(backend: &mut EmulatorBackend, facts: &mut Facts) {
-    backend.exec(&Command::Stop, facts).expect("优雅关闭");
-    backend.observe(facts);
-    assert_eq!(State::of(facts), State::Stopped);
-    assert!(!facts.adb_visible && !facts.services.ready());
+    let source =
+        PathBuf::from(std::env::var_os("WINDROID_TEST_RESOURCES").expect("请提供官方整包展开目录"));
+    let temp = Temp::create();
+    let root = &temp.0;
+    let home = root.join("workspace");
+    runtime::workspace::open(&home).unwrap();
+    let clone = |relative: &Path| {
+        let target = home.join(relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        assert!(
+            ChildCommand::new("/bin/cp")
+                .arg("-cR")
+                .arg(source.join(relative))
+                .arg(target)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    clone(Path::new("runtime"));
+    for api in apis {
+        clone(&PathBuf::from(format!("system-images/android-{api}")));
+    }
+    for dir in ["android-user", "user", "tmp", "poison"] {
+        fs::create_dir(root.join(dir)).unwrap();
+    }
+    // PATH 和旧变量指向会留下证据的替身。所有产品命令都应使用绑定版本。
+    let trap = root.join("poison/adb");
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(&trap, "#!/bin/sh\ntouch \"$WINDROID_REAL_TRAP\"\nexit 91\n").unwrap();
+    fs::set_permissions(&trap, fs::Permissions::from_mode(0o755)).unwrap();
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+        .to_string();
+    let result = ChildCommand::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--ignored", "--nocapture"])
+        .env("WINDROID_REAL_EMULATOR_CHILD", name)
+        .env("WINDROID_HOME", &home)
+        .env("HOME", root.join("user"))
+        .env("ANDROID_USER_HOME", root.join("android-user"))
+        .env("TMPDIR", root.join("tmp"))
+        // 每个测试服务只接收 Emulator 的显式登记，避免它探测其他工作区的模拟器端口。
+        .env("ADB_LOCAL_TRANSPORT_MAX_PORT", "5553")
+        .env("ANDROID_ADB_SERVER_PORT", &port)
+        .env("ADB_SERVER_SOCKET", format!("tcp:localhost:{port}"))
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                root.join("poison").display()
+            ),
+        )
+        .env("WINDROID_SDK", root.join("poison"))
+        .env("WINDROID_ADB", &trap)
+        .env("WINDROID_SERVER_JAR", root.join("poison/server.jar"))
+        .env("WINDROID_GPU", "invalid-test-value")
+        .env("ANDROID_HOME", root.join("poison"))
+        .env("ANDROID_SDK_ROOT", root.join("poison"))
+        .env("WINDROID_REAL_TRAP", root.join("trap-used"))
+        .status()
+        .unwrap();
+    // 只回收本用例创建在随机端口的服务。
+    let adb = home.join("runtime/platform-tools/37.0.1/adb");
+    let _ = ChildCommand::new(adb)
+        .args(["-P", &port, "kill-server"])
+        .env_remove("ADB_SERVER_SOCKET")
+        .output();
+    assert!(result.success(), "{name}");
+    assert!(!root.join("trap-used").exists());
+    true
 }
 
 #[test]
-#[ignore = "需要显式 WINDROID_SDK、API 34 Google Play 镜像与模拟器资源"]
+#[ignore = "需要官方运行组件和 Android 14 镜像"]
 fn real_adb_facts_drive_the_state_machine() {
-    if std::env::var_os(CHILD).is_none() {
-        assert!(
-            std::env::var_os("WINDROID_SDK").is_some_and(|p| !p.is_empty()),
-            "请通过 WINDROID_SDK 指定只读 SDK"
-        );
-        let temp = Temp::create();
-        for dir in ["android-user", "emulator", "avd", "tmp"] {
-            fs::create_dir(temp.0.join(dir)).unwrap();
-        }
-        let result = ChildCommand::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--ignored", "--nocapture"])
-            .env(CHILD, "1")
-            .env("WINDROID_HOME", &temp.0)
-            .env("ANDROID_USER_HOME", temp.0.join("android-user"))
-            .env("ANDROID_EMULATOR_HOME", temp.0.join("emulator"))
-            .env("ANDROID_AVD_HOME", temp.0.join("avd"))
-            .env("TMPDIR", temp.0.join("tmp"))
-            .env_remove("WINDROID_AVD")
-            .env_remove("WINDROID_SERIAL")
-            .env_remove("WINDROID_ADB")
-            .status()
-            .unwrap();
-        assert!(result.success());
+    if isolated("real_adb_facts_drive_the_state_machine", &[34]) {
         return;
     }
     let layout = Layout::default_root();
-    assert_eq!(
-        layout.root.join("tmp"),
-        std::env::temp_dir().canonicalize().unwrap()
-    );
-    assert!(
-        layout
-            .root
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("windroid-instance-test-")
-    );
     let store = InstanceStore::new(layout.clone());
     let a = store.create("A", spec("compact-720")).unwrap();
     let b = store.create("B", spec("phone-1080")).unwrap();
@@ -119,12 +110,16 @@ fn real_adb_facts_drive_the_state_machine() {
     let (mut backend, mut facts) = boot(&layout, &a);
     // Android 每次完成系统启动都会增加 BOOT_COUNT。内存快照恢复保留已运行的 framework。
     // https://developer.android.com/reference/android/provider/Settings.Global#BOOT_COUNT
-    let boot_count = guest(&a, "settings get global boot_count");
+    let boot_count = guest(&backend, &a, "settings get global boot_count");
     assert!(
         boot_count.parse::<u64>().is_ok_and(|n| n > 0),
         "设备启动次数无效：{boot_count:?}"
     );
-    guest(&a, "echo instance-a > /data/local/tmp/windroid-isolation");
+    guest(
+        &backend,
+        &a,
+        "echo instance-a > /data/local/tmp/windroid-isolation",
+    );
     stop(&mut backend, &mut facts);
     assert!(store.quick_boot_saved(&a.id).unwrap());
     let snapshot = avd(&layout.root, &a).join("snapshots/default_boot/snapshot.pb");
@@ -134,19 +129,19 @@ fn real_adb_facts_drive_the_state_machine() {
     );
     store.select(&b.id).unwrap();
     let (mut backend, mut facts) = boot(&layout, &b);
-    guest(&b, "test ! -e /data/local/tmp/windroid-isolation");
+    guest(&backend, &b, "test ! -e /data/local/tmp/windroid-isolation");
     stop(&mut backend, &mut facts);
     let reopened = InstanceStore::new(layout.clone());
     assert_eq!(reopened.selected().unwrap(), Some(b.id.clone()));
     reopened.select(&a.id).unwrap();
     let (mut backend, mut facts) = boot(&layout, &a);
     assert_eq!(
-        guest(&a, "settings get global boot_count"),
+        guest(&backend, &a, "settings get global boot_count"),
         boot_count,
         "应从 A 的内存快照恢复"
     );
     assert_eq!(
-        guest(&a, "cat /data/local/tmp/windroid-isolation"),
+        guest(&backend, &a, "cat /data/local/tmp/windroid-isolation"),
         "instance-a"
     );
     stop(&mut backend, &mut facts);
@@ -155,57 +150,13 @@ fn real_adb_facts_drive_the_state_machine() {
     assert!(reopened.list().unwrap().is_empty());
 }
 
-/// 从一份已准备的受管 API 34 环境克隆到临时目录，验证发布包和真实数据盘跨目录重开。
+/// 从预置官方组件和 API 34 创建实例，再导入 API 33，迁移后核对两个私有盘。
 #[test]
-#[cfg(target_os = "macos")]
-#[ignore = "需要受管运行组件、API 34 镜像、官方 API 33 ZIP 和 Apple 芯片 Mac"]
+#[ignore = "需要官方运行组件、API 34 及 WINDROID_TEST_API33_ZIP"]
 fn migrated_images_keep_private_guest_data() {
     use runtime::provision::Provisioner;
     use runtime::storage::{StorageLocations, apply, preview};
-    const CHILD: &str = "WINDROID_MIGRATION_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let runtime =
-            std::env::var_os("WINDROID_TEST_RUNTIME").expect("指定含受管 API 34 的运行组件目录");
-        let temp = Temp::create();
-        let home = temp.0.join("home");
-        fs::create_dir(&home).unwrap();
-        let source = std::path::PathBuf::from(runtime);
-        // 按包克隆，测试库独立登记目录归属，避免复制原工作区的目录标记。
-        for relative in [
-            "sdk/emulator",
-            "sdk/platform-tools",
-            "sdk/build-tools/34.0.0",
-            "sdk/system-images/android-34/google_apis_playstore/arm64-v8a",
-            "scrcpy-server.jar",
-        ] {
-            let target = home.join("runtime").join(relative);
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            assert!(
-                ChildCommand::new("cp")
-                    .arg("-cR")
-                    .arg(source.join(relative))
-                    .arg(target)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let exit = ChildCommand::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "migrated_images_keep_private_guest_data",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("WINDROID_HOME", home)
-            .env("ANDROID_USER_HOME", temp.0.join("android"))
-            .env_remove("WINDROID_SDK")
-            .env_remove("WINDROID_ADB")
-            .env_remove("WINDROID_SERVER_JAR")
-            .status()
-            .unwrap();
-        assert!(exit.success());
+    if isolated("migrated_images_keep_private_guest_data", &[34]) {
         return;
     }
     let layout = Layout::default_root();
@@ -231,105 +182,71 @@ fn migrated_images_keep_private_guest_data() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(store.list().unwrap().is_empty());
-    let a = store.create("A", spec("compact-720")).unwrap();
-    let b = store.create("B", a.spec.clone()).unwrap();
-    let mut spec = b.spec.clone();
-    spec.image = alternate;
-    let c = store.create("C", spec).unwrap();
-    let target = StorageLocations {
-        runtime_root: root.join("components"),
-        image_root: Some(root.join("images")),
+    let create = |name: &str, port, spec| {
+        let id = contract::InstanceId::new(name);
+        let mut backend = EmulatorBackend::new(id.clone(), layout.clone(), port);
+        backend
+            .exec(&Command::Create { spec }, &mut Facts::default())
+            .unwrap();
+        store.get(&id).unwrap()
     };
-
+    let a = create("A", 5562, spec("compact-720"));
+    let b = create("B", 5564, a.spec.clone());
+    let mut alternate_spec = b.spec.clone();
+    alternate_spec.image = alternate;
+    let c = create("C", 5566, alternate_spec);
+    let mounted = std::env::var_os("WINDROID_TEST_MIGRATION_VOLUME").map(std::path::PathBuf::from);
+    let external = mounted.as_deref().map(Temp::in_directory);
+    let destination = external.as_ref().map_or(root, |t| t.0.as_path());
+    if mounted.is_some() {
+        use std::os::unix::fs::MetadataExt;
+        let from = fs::metadata(root).unwrap().dev();
+        let to = fs::metadata(destination).unwrap().dev();
+        assert_ne!(from, to, "必须是另一个实际卷");
+        println!("跨卷迁移 dev={from} → dev={to}");
+    }
+    let target = StorageLocations {
+        runtime_root: destination.join("components"),
+        image_root: destination.join("images"),
+    };
     let (mut vm, mut facts) = boot(&layout, &a);
-    guest(&a, "echo A > /data/local/tmp/windroid-private");
+    guest(&vm, &a, "echo A > /data/local/tmp/windroid-private");
     let moving = preview(&layout.root, &target).unwrap();
-    assert!(apply(&layout.root, &moving).is_err());
-    stop(&mut vm, &mut facts);
-    let moving = preview(&layout.root, &target).unwrap();
-    assert!(!moving.files.is_empty());
+    assert!(moving.required_bytes > 0);
     apply(&layout.root, &moving).unwrap();
+    assert!(
+        vm.active_runtime()
+            .current()
+            .unwrap()
+            .paths
+            .adb
+            .starts_with(layout.root.join("runtime"))
+    );
+    assert_eq!(guest(&vm, &a, "cat /data/local/tmp/windroid-private"), "A");
+    stop(&mut vm, &mut facts);
     let (mut vm, mut facts) = boot(&layout, &a);
-    assert_eq!(guest(&a, "cat /data/local/tmp/windroid-private"), "A");
+    assert_eq!(guest(&vm, &a, "cat /data/local/tmp/windroid-private"), "A");
     stop(&mut vm, &mut facts);
     let (mut vm, mut facts) = boot(&layout, &b);
-    guest(&b, "test ! -e /data/local/tmp/windroid-private");
+    guest(&vm, &b, "test ! -e /data/local/tmp/windroid-private");
     stop(&mut vm, &mut facts);
     let target = StorageLocations {
-        image_root: None,
+        image_root: layout.root.join("system-images"),
         ..target
     };
     apply(&layout.root, &preview(&layout.root, &target).unwrap()).unwrap();
     let (mut vm, mut facts) = boot(&layout, &c);
-    assert_eq!(guest(&c, "getprop ro.build.version.sdk"), "33");
+    assert_eq!(guest(&vm, &c, "getprop ro.build.version.sdk"), "33");
     stop(&mut vm, &mut facts);
 }
 
 #[test]
-#[ignore = "set WINDROID_TEST_RESOURCE_CONFIG to storage settings with managed tools and the official API 35 image"]
+#[ignore = "需要官方运行组件与 API 35 镜像"]
 fn api35_initializes_private_userdata_from_a_separate_image_directory() {
-    const NAME: &str = "api35_initializes_private_userdata_from_a_separate_image_directory";
-    const MARKER: &str = "WINDROID_TEST_API35_CHILD";
-    if std::env::var_os(MARKER).is_none() {
-        let config = std::env::var_os("WINDROID_TEST_RESOURCE_CONFIG")
-            .expect("set WINDROID_TEST_RESOURCE_CONFIG");
-        let temp = Temp::create();
-        for dir in ["android-user", "emulator", "avd", "tmp"] {
-            fs::create_dir(temp.0.join(dir)).unwrap();
-        }
-        let sources: windroid_locations::StorageLocations =
-            serde_json::from_reader(fs::File::open(config).unwrap()).unwrap();
-        let home = temp.0.join("home");
-        let target = windroid_locations::StorageLocations {
-            runtime_root: temp.0.join("tools"),
-            image_root: Some(temp.0.join("images")),
-        };
-        let plan = runtime::storage::preview(&home, &target).unwrap();
-        runtime::storage::apply(&home, &plan).unwrap();
-        let snap = runtime::provision::Provisioner::managed(&home).snapshot();
-        let image = snap
-            .images
-            .into_iter()
-            .find(|row| row.id == "system-image-35")
-            .unwrap();
-        // 逐包复制到本次工作区，独立保留 SDK、镜像根目录各自的归属记录。
-        for row in snap.components.into_iter().chain([image]) {
-            let source = if row.image.is_some() {
-                sources
-                    .images()
-                    .join(row.location.strip_prefix(target.images()).unwrap())
-            } else {
-                sources
-                    .runtime_root
-                    .join(row.location.strip_prefix(&target.runtime_root).unwrap())
-            };
-            fs::create_dir_all(row.location.parent().unwrap()).unwrap();
-            assert!(
-                ChildCommand::new("cp")
-                    .arg("-cR")
-                    .arg(source)
-                    .arg(&row.location)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let result = ChildCommand::new(std::env::current_exe().unwrap())
-            .args(["--exact", NAME, "--ignored", "--nocapture"])
-            .env(MARKER, "1")
-            .env("WINDROID_HOME", &home)
-            .env("ANDROID_USER_HOME", temp.0.join("android-user"))
-            .env("ANDROID_EMULATOR_HOME", temp.0.join("emulator"))
-            .env("ANDROID_AVD_HOME", temp.0.join("avd"))
-            .env("TMPDIR", temp.0.join("tmp"))
-            .env_remove("WINDROID_SDK")
-            .env_remove("WINDROID_ADB")
-            .env_remove("WINDROID_SERVER_JAR")
-            .env_remove("WINDROID_SERIAL")
-            .env_remove("WINDROID_AVD")
-            .status()
-            .unwrap();
-        assert!(result.success());
+    if isolated(
+        "api35_initializes_private_userdata_from_a_separate_image_directory",
+        &[35],
+    ) {
         return;
     }
     let layout = Layout::default_root();
@@ -342,7 +259,7 @@ fn api35_initializes_private_userdata_from_a_separate_image_directory() {
         .find(|row| row.id == "system-image-35")
         .unwrap();
     assert!(snap.components_ready && row.ready, "{:?}", row.issue);
-    assert!(!row.location.starts_with(&p.paths().sdk));
+    assert!(!row.location.starts_with(&p.paths().runtime_root));
     assert!(!row.location.join("userdata.img").exists());
     wanted.image = row.image.clone().unwrap();
     let id = contract::InstanceId::new("isolated-api35");
@@ -353,10 +270,17 @@ fn api35_initializes_private_userdata_from_a_separate_image_directory() {
     let store = InstanceStore::new(layout.clone());
     let record = store.get(&id).unwrap();
     let (mut backend, mut facts) = boot(&layout, &record);
-    assert_eq!(guest(&record, "getprop ro.build.version.sdk"), "35");
-    guest(&record, "echo api35 > /data/local/tmp/windroid-image-test");
     assert_eq!(
-        guest(&record, "cat /data/local/tmp/windroid-image-test"),
+        guest(&backend, &record, "getprop ro.build.version.sdk"),
+        "35"
+    );
+    guest(
+        &backend,
+        &record,
+        "echo api35 > /data/local/tmp/windroid-image-test",
+    );
+    assert_eq!(
+        guest(&backend, &record, "cat /data/local/tmp/windroid-image-test"),
         "api35"
     );
     assert!(
@@ -366,4 +290,119 @@ fn api35_initializes_private_userdata_from_a_separate_image_directory() {
     );
     stop(&mut backend, &mut facts);
     store.delete(&id).unwrap();
+}
+
+#[test]
+#[ignore = "需要官方运行组件与 API 33/34/35 镜像"]
+fn resource_limits_use_each_installed_revision_and_its_final_display() {
+    if isolated(
+        "resource_limits_use_each_installed_revision_and_its_final_display",
+        &[33, 34, 35],
+    ) {
+        return;
+    }
+    let layout = Layout::default_root();
+    let store = InstanceStore::new(layout);
+    for (api, revision, minimum) in [(33, 9, 2048), (34, 14, 2560), (35, 9, 2560)] {
+        let mut image = spec("phone-1080").image;
+        image.api = api;
+        image.revision = revision;
+        let phone = store.spec_limits("phone-1080", &image).unwrap();
+        let large = store.spec_limits("tv-4k", &image).unwrap();
+        assert_eq!((phone.min_ram_mib, large.min_ram_mib), (minimum, 4096));
+        println!(
+            "API {api} r{revision}：手机 {} MiB，4K {} MiB，单台最高 {} 核、{} MiB",
+            phone.min_ram_mib, large.min_ram_mib, phone.max_cpu_cores, phone.max_ram_mib
+        );
+    }
+}
+
+#[test]
+#[ignore = "使用全新 WINDROID_HOME、受管运行组件与 Android 14 镜像验证冷重启与改配后开机"]
+fn stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot() {
+    use runtime::instances::{GraphicsMode, Hardware};
+    if isolated(
+        "stopped_hardware_edits_preserve_the_private_disk_and_bind_the_next_boot",
+        &[34],
+    ) {
+        return;
+    }
+    let layout = Layout::default_root();
+    let store = InstanceStore::new(layout.clone());
+    // 配置低于镜像内存下限时，启动预留量应提升，私有 AVD 仍保留保存值。
+    let original = store.create("既有实例", spec("compact-720")).unwrap();
+    let config_path = avd(&layout.root, &original).join("config.ini");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("windroid.graphics.batch=false\n", "");
+    fs::write(&config_path, &config).unwrap();
+    let saved = original.config(&layout);
+    assert_eq!(
+        (saved.cpu_cores, saved.ram_mib, saved.graphics),
+        (Some(2), Some(1536), Some(GraphicsMode::Host))
+    );
+    assert_eq!(store.launch_hardware(&original).unwrap().ram_mib, 2560);
+    assert_eq!(fs::read_to_string(config_path).unwrap(), config);
+
+    let mut chosen = spec("phone-1080");
+    chosen.disk_bytes = 6 << 30;
+    let first = Hardware {
+        cpu_cores: 1,
+        ram_mib: 2560,
+        graphics: GraphicsMode::Host,
+    };
+    let second = Hardware {
+        cpu_cores: 2,
+        ram_mib: 3072,
+        graphics: GraphicsMode::Batch,
+    };
+    let record = store
+        .create_with_hardware("规格验证", chosen.clone(), first)
+        .unwrap();
+    let (mut backend, mut facts) = boot(&layout, &record);
+    let allocated = facts.allocation.as_ref().unwrap();
+    assert_eq!(
+        (allocated.cpu_cores, allocated.ram_mib),
+        (Some(1), Some(2560))
+    );
+    assert!(store.update_hardware(&record.id, second).is_err());
+    guest(
+        &backend,
+        &record,
+        "echo retained > /data/local/tmp/windroid-hardware",
+    );
+    let retained = "cat /data/local/tmp/windroid-hardware";
+    assert_eq!(guest(&backend, &record, retained), "retained");
+    guest::start_and_wait(
+        &layout,
+        &record,
+        &mut backend,
+        &mut facts,
+        Command::Restart { cold: true },
+    );
+    assert_eq!(guest(&backend, &record, retained), "retained");
+    guest(
+        &backend,
+        &record,
+        "echo edited > /data/local/tmp/windroid-hardware",
+    );
+    assert_eq!(guest(&backend, &record, retained), "edited");
+    stop(&mut backend, &mut facts);
+    store.update_hardware(&record.id, second).unwrap();
+    let reopened = InstanceStore::new(layout.clone());
+    let saved = reopened.get(&record.id).unwrap();
+    assert_eq!(saved.spec, chosen);
+    assert_eq!(saved.config(&layout).graphics, Some(GraphicsMode::Batch));
+    assert_eq!(reopened.launch_hardware(&saved).unwrap(), second);
+    let (mut backend, mut facts) = boot(&layout, &saved);
+    let allocated = facts.allocation.as_ref().unwrap();
+    assert_eq!(
+        (allocated.cpu_cores, allocated.ram_mib),
+        (Some(2), Some(3072))
+    );
+    assert_eq!(
+        guest(&backend, &saved, "cat /data/local/tmp/windroid-hardware"),
+        "edited"
+    );
+    stop(&mut backend, &mut facts);
 }

@@ -38,6 +38,15 @@ impl Library {
         ) {
             return;
         }
+        self.clear_session_locked(&mut s, id);
+    }
+
+    /// 已成功替换进程，即使新一轮已开始引导，也要关闭属于上一轮的窗口。
+    pub(super) fn clear_replaced_session(&self, id: &str) {
+        self.clear_session_locked(&mut self.state.lock().unwrap(), id);
+    }
+
+    fn clear_session_locked(&self, s: &mut ViewState, id: &str) {
         s.tasks.remove(id);
         s.task_errors.remove(id);
         let had_window = s.open.iter().chain(&s.opening).any(|k| k.0 == id);
@@ -90,16 +99,19 @@ impl Library {
                 let observed = i.handle.snapshot();
                 if let Some(record) = &i.record
                     && observed.state.accepts_stream()
+                    && let Some(resources) = i.active.current()
                 {
+                    let serial = record.serial();
+                    let device = resources.device(&serial);
                     let result = record
-                        .verify_device()
+                        .verify_device(&resources.paths.adb)
                         .map_err(|e| e.to_string())
-                        .and_then(|_| runtime::running::snapshot(&record.serial()));
+                        .and_then(|_| runtime::running::snapshot(device));
                     for package in lib.observe_tasks(&id, observed.seq, result) {
                         if i.handle.snapshot().seq == observed.seq
-                            && record.verify_device().is_ok()
+                            && record.verify_device(&resources.paths.adb).is_ok()
                             && let Err(reason) =
-                                runtime::running::clear_inactive_recents(&record.serial(), &package)
+                                runtime::running::clear_inactive_recents(device, &package)
                         {
                             lib.note(Some(&id), true, reason);
                         }

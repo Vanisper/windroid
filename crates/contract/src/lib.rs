@@ -275,6 +275,8 @@ pub struct Spec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Image {
+    /// 官方系统镜像包修订号，与 API 等字段共同标识不可变资源。
+    pub revision: u32,
     pub api: u32,
     pub tag: String,
     pub abi: String,
@@ -293,7 +295,9 @@ pub enum Command {
     Delete,
     /// 启动模拟器进程并进入就绪等待。
     Start,
-    /// 优雅停止：先关流会话，再 emu kill。
+    /// 先按替换当前会话预检，再停止并重新启动。冷启动跳过已保存的内存快照。
+    Restart { cold: bool },
+    /// 请求优雅停止，退出后释放本轮会话和资源预留。
     Stop,
     /// 安装 APK。路径为主机侧文件。
     Install { apk_path: String },

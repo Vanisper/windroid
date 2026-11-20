@@ -1,28 +1,29 @@
-//! 预览保留在宿主。确认只引用上一次预览的编号，文件与目录归属由运行时重新核对。
+//! 切换资源目录前由宿主保留完整预览。确认和候选目录下载只接受上次预览编号。
 use super::*;
-use runtime::storage::{self, MigrationPlan, StorageLocations};
+use runtime::storage::{self, MigrationPlan, StorageLocations, SwitchMode};
 use std::path::Path;
 
 pub(super) struct Resources {
     pub provisioner: Provisioner,
     pub error: Option<String>,
     paths: RuntimePaths,
-    inherited: bool,
+    cleanup: Vec<String>,
+    defaults: (bool, bool),
     preview: Option<(u64, MigrationPlan)>,
 }
 
 impl Resources {
+    /// 调用者已经只读确认这是可打开的新格式工作区。
     pub fn open(home: &Path) -> Self {
-        let config = storage::recover(home).and_then(|_| StorageLocations::load(home));
+        let result = storage::recover(home).and_then(|_| StorageLocations::load(home));
         let provisioner = Provisioner::new(home);
+        let paths = provisioner.paths();
         Self {
-            paths: provisioner.paths(),
+            defaults: default_state(home, &paths),
+            paths,
             provisioner,
-            error: config
-                .as_ref()
-                .err()
-                .map(|e| format!("读取或恢复存储位置失败，请核对目录后重新检查：{e}")),
-            inherited: config.is_ok_and(|value| value.image_root.is_none()),
+            error: result.err().map(|e| e.to_string()),
+            cleanup: storage::pending_cleanup(home).unwrap_or_default(),
             preview: None,
         }
     }
@@ -31,47 +32,55 @@ impl Resources {
         let mut view = crate::to_json(&self.provisioner.snapshot());
         if let Some(error) = &self.error {
             view["error"] = json!(error);
-            view["componentsReady"] = false.into();
             view["phase"] = "failed".into();
+            view["componentsReady"] = false.into();
         }
         view
     }
 
     pub fn locations(&self, home: &Path) -> JsonValue {
-        let paths = &self.paths;
-        json!({"home":home, "sdk":paths.sdk, "runtimeRoot":paths.runtime_root, "images":paths.images,
-               "imagesInherited": self.inherited, "borrowed": paths.borrowed, "error": self.error})
+        let defaults = StorageLocations::defaults(home);
+        json!({"home":home,"runtimeRoot":self.paths.runtime_root,"imageRoot":self.paths.images,
+               "defaultRuntimeRoot":defaults.runtime_root,"defaultImageRoot":defaults.image_root,
+               "runtimeIsDefault":self.defaults.0,"imageIsDefault":self.defaults.1,
+               "error":self.error,"cleanupNotes":self.cleanup})
     }
 }
 
+fn default_state(home: &Path, paths: &RuntimePaths) -> (bool, bool) {
+    let defaults = StorageLocations::defaults(home);
+    (
+        storage::same_location(&defaults.runtime_root, &paths.runtime_root),
+        storage::same_location(&defaults.image_root, &paths.images),
+    )
+}
+
 fn transfer_uses(plan: &MigrationPlan, p: &Provisioner) -> bool {
-    let (components, images) = plan.changed_roots();
+    let (cores, images) = plan.changed_roots();
     let snapshot = p.snapshot();
     let active = matches!(snapshot.phase, "downloading" | "installing" | "verifying");
-    let preparing_image = snapshot
+    let image = snapshot
         .images
         .iter()
         .any(|row| Some(row.id) == snapshot.current_component);
-    active && if preparing_image { images } else { components }
+    active && if image { images } else { cores }
 }
 
 impl Library {
     pub(super) fn reload_resources(&self) -> Result<(), String> {
         let runtime = self.runtime.as_ref().ok_or("演示环境已就绪")?;
-        let provisioner = runtime.lock().unwrap().provisioner.clone();
-        let config = storage::recover(&self.layout.root)
+        let p = runtime.lock().unwrap().provisioner.clone();
+        let result = storage::recover(&self.layout.root)
             .and_then(|_| StorageLocations::load(&self.layout.root))
+            .and_then(|_| storage::pending_cleanup(&self.layout.root))
             .map_err(|e| e.to_string());
-        provisioner.refresh_locations();
-        let paths = provisioner.paths();
-        let mut resources = runtime.lock().unwrap();
-        resources.paths = paths;
-        resources.preview = None;
-        resources.inherited = config
-            .as_ref()
-            .is_ok_and(|config| config.image_root.is_none());
-        resources.error = config.as_ref().err().cloned();
-        config.map(|_| ())
+        p.refresh_locations();
+        let mut res = runtime.lock().unwrap();
+        res.preview = None;
+        res.paths = p.paths();
+        res.defaults = default_state(&self.layout.root, &res.paths);
+        res.error = result.as_ref().err().cloned();
+        result.map(|notes| res.cleanup = notes)
     }
 
     pub(super) fn connect_storage(self: &Arc<Self>) {
@@ -80,8 +89,8 @@ impl Library {
             let Some(lib) = weak.upgrade() else {
                 return call.reject("应用库已关闭");
             };
-            let requested = call.data().clone();
-            thread::spawn(move || call.reply(lib.preview_storage(&requested)));
+            let data = call.data().clone();
+            thread::spawn(move || call.reply(lib.preview_storage(&data)));
         });
     }
 
@@ -90,47 +99,73 @@ impl Library {
             serde_json::from_value(data.clone()).map_err(|e| e.to_string())?;
         let expected: StorageLocations = serde_json::from_value(data["expected"].clone())
             .map_err(|_| "请重新读取当前存储位置")?;
-        let runtime = self.runtime.as_ref().ok_or("演示环境没有受管目录")?;
-        if runtime.lock().unwrap().paths.borrowed {
-            return Err("开发者指定的 SDK 由外部管理".into());
-        }
-        // 窗口打开期间，另一个进程可能已移动用户并未要求修改的目录。
-        // 预览前后均检查，确认时运行时还会复核实际清单与起点。
+        let mode: SwitchMode =
+            serde_json::from_value(data["mode"].clone()).map_err(|_| "请选择切换方式")?;
+        let cleanup = data["cleanup"].as_bool().ok_or("请选择是否清理原版本")?;
+        let runtime = self.runtime.as_ref().ok_or("演示环境没有资源目录")?;
         let stale = || {
             let _ = self.reload_resources();
-            self.notify();
-            "存储位置已变化，请按最新位置重新选择目标目录".to_owned()
+            "存储位置已更改，请重新选择目标目录".to_owned()
         };
         if StorageLocations::load(&self.layout.root).map_err(|e| e.to_string())? != expected {
             return Err(stale());
         }
-        let plan = storage::preview(&self.layout.root, &requested).map_err(|e| e.to_string())?;
-        if plan.before != expected {
+        let mut plan = storage::preview_switch(&self.layout.root, &requested, mode, cleanup)
+            .map_err(|e| e.to_string())?;
+        if plan.before != expected
+            || StorageLocations::load(&self.layout.root).map_err(|e| e.to_string())? != expected
+        {
             return Err(stale());
         }
-        let mut blockers: Vec<String> = self
-            .state
-            .lock()
-            .unwrap()
-            .instances
-            .values()
-            .filter(|i| {
-                plan.changed_roots() != (false, false) && i.handle.snapshot().facts.process_alive
-            })
-            .map(|i| format!("请先停止「{}」", i.name))
-            .collect();
         let id = self.revision();
         let mut resources = runtime.lock().unwrap();
         if transfer_uses(&plan, &resources.provisioner) {
-            blockers.push("请等待当前下载或安装完成".into());
+            plan.blockers.push("请等待相关下载或安装完成".into());
         }
-        if let Some(failure) = &resources.error {
-            blockers.push(failure.clone());
-        }
-        let result = json!({"previewId":id, "runtimeRoot":plan.after.runtime_root, "imageRoot":plan.after.image_root,
-            "files":plan.files, "blockers":blockers});
+        let mut result = crate::to_json(&plan);
+        result["runtimeRoot"] = json!(plan.after.runtime_root);
+        result["imageRoot"] = json!(plan.after.image_root);
+        result["previewId"] = json!(id);
         resources.preview = Some((id, plan));
         Ok(result)
+    }
+
+    pub(super) fn prepare_candidate_image(&self, data: &JsonValue) -> Reply {
+        if data["acceptedLicenses"] != true {
+            return Err(error("请先阅读并同意所选镜像许可"));
+        }
+        let id = data["previewId"]
+            .as_u64()
+            .ok_or_else(|| error("请先预览目标目录"))?;
+        let package = data["resourceId"]
+            .as_str()
+            .ok_or_else(|| error("请选择所缺镜像"))?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| error("演示环境没有资源目录"))?;
+        let (provisioner, plan) = {
+            let resources = runtime.lock().unwrap();
+            let (_, plan) = resources
+                .preview
+                .as_ref()
+                .filter(|(selected, _)| *selected == id)
+                .ok_or_else(|| error("预览已过期，请重新核验"))?;
+            (resources.provisioner.clone(), plan.clone())
+        };
+        if plan.before != StorageLocations::load(&self.layout.root).map_err(error)?
+            || !plan
+                .versions
+                .iter()
+                .any(|v| v.id == package && v.downloadable)
+        {
+            return Err(error("请重新预览并选择目标目录所缺的镜像"));
+        }
+        plan.check_candidate_image_root().map_err(error)?;
+        provisioner
+            .start_image_at(package, &plan.after)
+            .map_err(error)?;
+        Ok(self.revision())
     }
 
     pub(super) fn apply_storage(&self, data: &JsonValue) -> Reply {
@@ -140,22 +175,21 @@ impl Library {
         let runtime = self
             .runtime
             .as_ref()
-            .ok_or_else(|| error("演示环境没有受管目录"))?;
+            .ok_or_else(|| error("演示环境没有资源目录"))?;
         let _admission = self.starting.lock().unwrap();
         let plan = {
             let resources = runtime.lock().unwrap();
             let (_, plan) = resources
                 .preview
                 .as_ref()
-                .filter(|(preview, _)| *preview == id)
-                .ok_or_else(|| error("预览已过期，请重新查看迁移文件"))?;
+                .filter(|(selected, _)| *selected == id)
+                .ok_or_else(|| error("预览已过期，请重新核验目录"))?;
             if transfer_uses(plan, &resources.provisioner) {
-                return Err(error("请等待相关下载或安装完成"));
+                return Err(error("请等待相关资源准备完成"));
             }
             plan.clone()
         };
         let result = storage::apply(&self.layout.root, &plan);
-        // 提交后如旧卷失联，设置可能已经切换。以事务恢复后的配置重建自检快照。
         let reload = self.reload_resources();
         result.map_err(error)?;
         reload.map_err(error)?;
@@ -167,15 +201,14 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn a_stale_window_cannot_move_an_unselected_root_back() {
-        let dir = std::env::temp_dir()
+    fn stale_preview_cannot_restore_a_different_resource_root() {
+        let temp = std::env::temp_dir()
             .canonicalize()
             .unwrap()
-            .join(format!("windroid-stale-storage-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let home = dir.join("home");
+            .join(format!("windroid-storage-host-{}", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        let home = temp.join("home");
         let (windows, _) = mpsc::channel();
         let library = Library::new(
             HostChannel::new(),
@@ -184,13 +217,14 @@ mod tests {
             windows,
             false,
         );
-        let expected = StorageLocations::defaults(&home);
+        let defaults = StorageLocations::defaults(&home);
         let new = StorageLocations {
-            runtime_root: dir.join("components"),
-            image_root: None,
+            runtime_root: temp.join("tools"),
+            ..defaults.clone()
         };
-        storage::apply(&home, &storage::preview(&home, &new).unwrap()).unwrap();
-        let request = json!({"runtimeRoot":expected.runtime_root, "imageRoot":dir.join("images"), "expected":expected});
+        let plan = storage::preview_switch(&home, &new, SwitchMode::Future, false).unwrap();
+        storage::apply(&home, &plan).unwrap();
+        let request = json!({"runtimeRoot":defaults.runtime_root,"imageRoot":temp.join("images"),"mode":"future","cleanup":false,"expected":defaults});
         assert!(
             library
                 .preview_storage(&request)
@@ -201,14 +235,12 @@ mod tests {
             library.snapshot()["storage"]["runtimeRoot"],
             json!(new.runtime_root)
         );
-        assert_eq!(StorageLocations::load(&home).unwrap(), new);
-        let request =
-            json!({"runtimeRoot":new.runtime_root, "imageRoot":dir.join("images"), "expected":new});
+        let request = json!({"runtimeRoot":new.runtime_root,"imageRoot":temp.join("images"),"mode":"future","cleanup":false,"expected":new});
         let plan = library.preview_storage(&request).unwrap();
         library.apply_storage(&json!({"plan":plan})).unwrap();
-        let installed = StorageLocations::load(&home).unwrap();
-        assert_eq!(installed.runtime_root, new.runtime_root);
-        assert_eq!(installed.image_root, Some(dir.join("images")));
-        std::fs::remove_dir_all(dir).unwrap();
+        let saved = StorageLocations::load(&home).unwrap();
+        assert_eq!(saved.runtime_root, new.runtime_root);
+        assert_eq!(saved.image_root, temp.join("images"));
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }

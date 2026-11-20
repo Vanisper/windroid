@@ -1,33 +1,49 @@
 //! 运行时与 adb 共用的目录设置。实例、日志和设置始终归属原工作区。
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, ErrorKind};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-pub const SETTINGS: &str = "storage-locations.json";
+pub const SETTINGS: &str = "storage.json";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageLocations {
     pub runtime_root: PathBuf,
-    /// None 随受管 SDK 迁移。显式目录直接存放 android-* 版本。
-    pub image_root: Option<PathBuf>,
+    /// 直接存放 android-* 及其修订目录，位置独立于运行组件。
+    pub image_root: PathBuf,
 }
 
 impl StorageLocations {
     pub fn defaults(home: &Path) -> Self {
         Self {
             runtime_root: home.join("runtime"),
-            image_root: None,
+            image_root: home.join("system-images"),
         }
     }
 
     pub fn load(home: &Path) -> io::Result<Self> {
-        match File::open(home.join(SETTINGS)) {
+        let path = home.join(SETTINGS);
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
             Ok(file) => {
+                let meta = file.metadata()?;
+                if !meta.is_file() || meta.len() > 32 * 1024 {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "资源位置设置必须为普通 JSON 文件",
+                    ));
+                }
                 let locations: Self = serde_json::from_reader(file)?;
-                for path in std::iter::once(&locations.runtime_root).chain(&locations.image_root) {
+                for path in [&locations.runtime_root, &locations.image_root] {
                     if !path.is_absolute()
+                        || path
+                            .to_str()
+                            .is_none_or(|name| name.chars().any(char::is_control))
                         || path
                             .components()
                             .any(|p| p == std::path::Component::ParentDir)
@@ -46,8 +62,6 @@ impl StorageLocations {
     }
 
     pub fn images(&self) -> PathBuf {
-        self.image_root
-            .clone()
-            .unwrap_or_else(|| self.runtime_root.join("sdk/system-images"))
+        self.image_root.clone()
     }
 }

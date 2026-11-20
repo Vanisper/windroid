@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{error_line, valid_package};
-use crate::provision::RuntimePaths;
 
 const INDEX: &str = "pm list packages -f --show-versioncode --user 0";
 const REFRESH_BUDGET: Duration = Duration::from_secs(15);
@@ -35,27 +34,30 @@ struct CachedLabel {
 
 pub struct Labels {
     dir: PathBuf,
-    paths: RuntimePaths,
 }
 
 impl Labels {
     pub fn new(home: &Path, instance: &InstanceId) -> Self {
         // 实例 ID 随清单持久化。模拟器端口在删除实例后可能分配给其他设备。
-        let key = format!("{:x}", Sha256::digest(instance.as_str().as_bytes()));
+        let key = base16ct::lower::encode_string(&Sha256::digest(instance.as_str().as_bytes()));
         Self {
             dir: home.join("cache/labels").join(key),
-            paths: RuntimePaths::discover(home),
         }
     }
 
     /// 返回成功核验的包名与展示名。单轮预算覆盖索引、APK 拉取及资源解析。
-    pub fn resolve(&mut self, serial: &str, packages: &[String]) -> BTreeMap<String, String> {
+    pub fn resolve(
+        &mut self,
+        device: adb::Device<'_>,
+        aapt: &Path,
+        packages: &[String],
+    ) -> BTreeMap<String, String> {
         let deadline = Instant::now() + REFRESH_BUDGET;
         let mut names = BTreeMap::new();
         if packages.is_empty() {
             return names;
         }
-        let Some(index) = self.index(serial, deadline) else {
+        let Some(index) = self.index(device, deadline) else {
             return names;
         };
         let mut missing = Vec::new();
@@ -72,7 +74,7 @@ impl Labels {
                 missing.push((package, apk));
             }
         }
-        if missing.is_empty() || !self.paths.aapt.is_file() {
+        if missing.is_empty() || !aapt.is_file() {
             return names;
         }
         let Ok(scratch) = Scratch::create(&self.dir) else {
@@ -88,7 +90,7 @@ impl Labels {
             }
             // 每个批次独占暂存目录，每次只保留一个 APK，数百 MB 的拉取也不累计磁盘占用。
             let local = scratch.0.join(format!("{package}.apk"));
-            let name = self.fetch(serial, package, apk, &local, fetch_until);
+            let name = self.fetch(device, aapt, package, apk, &local, fetch_until);
             let _ = fs::remove_file(&local);
             if let Some(name) = name {
                 fetched.push((package, apk, name));
@@ -98,7 +100,7 @@ impl Labels {
             return names;
         }
         // 拉取期间应用可能更新。只发布结束时仍对应同一版本、同一路径的名称。
-        let Some(current) = self.index(serial, deadline) else {
+        let Some(current) = self.index(device, deadline) else {
             return BTreeMap::new();
         };
         names.retain(|package, _| current.get(package) == index.get(package));
@@ -123,13 +125,19 @@ impl Labels {
 
     fn cache_file(&self, package: &str) -> PathBuf {
         // macOS 文件系统通常忽略大小写，摘要使大小写不同的 Android 包名仍有各自的缓存。
-        self.dir
-            .join(format!("{:x}.json", Sha256::digest(package.as_bytes())))
+        self.dir.join(format!(
+            "{}.json",
+            base16ct::lower::encode_string(&Sha256::digest(package.as_bytes()))
+        ))
     }
 
-    fn index(&self, serial: &str, deadline: Instant) -> Option<BTreeMap<String, InstalledApk>> {
-        let mut cmd = Command::new(&self.paths.adb);
-        cmd.args(["-s", serial, "shell", INDEX]);
+    fn index(
+        &self,
+        device: adb::Device<'_>,
+        deadline: Instant,
+    ) -> Option<BTreeMap<String, InstalledApk>> {
+        let mut cmd = device.command(deadline).ok()?;
+        cmd.args(["shell", INDEX]);
         let text = stdout(cmd, deadline)?;
         let mut packages = BTreeMap::new();
         // -f 取 applicationInfo.sourceDir，--show-versioncode 取 longVersionCode。
@@ -156,21 +164,22 @@ impl Labels {
 
     fn fetch(
         &self,
-        serial: &str,
+        device: adb::Device<'_>,
+        aapt: &Path,
         package: &str,
         apk: &InstalledApk,
         local: &Path,
         deadline: Instant,
     ) -> Option<String> {
-        let mut pull = Command::new(&self.paths.adb);
-        pull.args(["-s", serial, "pull", &apk.path]).arg(local);
+        let mut pull = device.command(deadline).ok()?;
+        pull.args(["pull", &apk.path]).arg(local);
         stdout(pull, deadline)?;
         let metadata = fs::metadata(local).ok()?;
         if !metadata.is_file() || metadata.len() == 0 {
             return None;
         }
 
-        let mut badging = Command::new(&self.paths.aapt);
+        let mut badging = Command::new(aapt);
         badging.args(["dump", "badging"]).arg(local);
         let text = stdout(badging, deadline)?;
         // aapt 的 badging 只报告低 32 位，完整版本在两次设备索引中核对。
@@ -198,7 +207,7 @@ impl Labels {
             }
         }
         // 没有资源表的 APK 可能只有清单里的字面量标签，badging 不会列出它。
-        let mut tree = Command::new(&self.paths.aapt);
+        let mut tree = Command::new(aapt);
         tree.args(["dump", "xmltree"])
             .arg(local)
             .arg("AndroidManifest.xml");

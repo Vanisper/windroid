@@ -22,7 +22,7 @@ fn create(h: &device::Handle) -> Ack {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     })

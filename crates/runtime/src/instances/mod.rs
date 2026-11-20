@@ -5,13 +5,12 @@ mod avd;
 mod hardware;
 pub(crate) mod process;
 mod quick_boot;
+mod specification;
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -20,8 +19,9 @@ pub(crate) use avd::{data_dir, image_subdir};
 use contract::{InstanceId, Spec};
 pub use hardware::InstanceConfig;
 use serde::{Deserialize, Serialize};
+pub use specification::{DiskLimits, GraphicsMode, Hardware, HostCapacity, SpecLimits};
 
-/// 各模板分配的客户机内存，用于 AVD 配置与设备域资源准入。
+/// 新格式首版模板的保存值。创建时提升至当前镜像下限，已有 AVD 保留原值。
 pub fn ram_mib(template: &str) -> u64 {
     match template {
         "compact-720" => 1536,
@@ -85,9 +85,12 @@ impl InstanceRecord {
 
     /// Android Studio 使用的只读 AVD 身份属性。serial 只是会被重用的传输地址。
     /// https://android.googlesource.com/platform/tools/base/+/HEAD/adblib/src/com/android/adblib/DevicePropertyNames.kt
-    pub fn verify_device(&self) -> io::Result<()> {
+    pub fn verify_device(&self, program: &Path) -> io::Result<()> {
         let serial = self.serial();
-        let output = adb::shell(&serial, "getprop ro.boot.qemu.avd_name")?;
+        let output = adb::shell(
+            adb::Device::new(program, &serial),
+            "getprop ro.boot.qemu.avd_name",
+        )?;
         if output.code != Some(0) {
             let detail = output.stderr.lines().next().unwrap_or("adb 未返回诊断");
             return Err(io::Error::new(
@@ -135,15 +138,14 @@ impl InstanceStore {
         Ok((root, lock))
     }
 
-    /// 老版本启动的模拟器或宿主异常退出后留下的进程仍可能占用资源。
-    pub(crate) fn ensure_stopped(&self) -> io::Result<()> {
-        let (root, _lock) = self.locked()?;
-        for record in records_in(&root)? {
-            let dir = root.join(record.id.as_str());
-            let _lease = acquire_run_lock(&dir)?;
-            process::ensure_previous_exit(&dir)?;
+    pub(crate) fn list_readonly(&self) -> io::Result<Vec<InstanceRecord>> {
+        let root = self.layout.root.join("instances");
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => records_in(&root),
+            Ok(_) => Err(invalid("实例注册目录类型异常")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     pub fn list(&self) -> io::Result<Vec<InstanceRecord>> {
@@ -157,7 +159,43 @@ impl InstanceStore {
     }
 
     pub fn create(&self, name: &str, spec: Spec) -> io::Result<InstanceRecord> {
-        self.create_inner(None, name, spec)
+        self.create_inner(None, name, Hardware::original(&spec.template), spec)
+    }
+
+    /// 在根设置读锁内核对将要持久化的修订。跨工作区切换或准备与创建相交时，
+    /// 界面此前显示的就绪快照不能替代提交前的本地核验。
+    pub fn create_prepared(&self, name: &str, spec: Spec) -> io::Result<InstanceRecord> {
+        self.create_checked(name, spec, None)
+    }
+
+    pub fn create_with_hardware(
+        &self,
+        name: &str,
+        spec: Spec,
+        hardware: Hardware,
+    ) -> io::Result<InstanceRecord> {
+        self.create_checked(name, spec, Some(hardware))
+    }
+
+    fn create_checked(
+        &self,
+        name: &str,
+        spec: Spec,
+        hardware: Option<Hardware>,
+    ) -> io::Result<InstanceRecord> {
+        avd::validate(&spec)?;
+        let _selection = crate::storage::resource_lease(self.home(), true, true)?;
+        let (paths, _versions) = crate::storage::instance_lease(self.home(), &spec.image)?;
+        let name_in_image = specification::product_name(&paths, &spec.image)?;
+        let limits = SpecLimits::for_template(
+            HostCapacity::read()?,
+            &spec.template,
+            spec.image.api,
+            &name_in_image,
+        )?;
+        let hardware = hardware.unwrap_or_else(|| limits.defaults());
+        limits.validate(hardware)?;
+        self.create_inner(None, name, hardware, spec)
     }
 
     // Backend::Create 的旧调用者提供自己的 id 和端口，走同一套发布与校验流程。
@@ -167,13 +205,19 @@ impl InstanceStore {
         port: u16,
         spec: Spec,
     ) -> io::Result<InstanceRecord> {
-        self.create_inner(Some((id, port)), id.as_str(), spec)
+        self.create_inner(
+            Some((id, port)),
+            id.as_str(),
+            Hardware::original(&spec.template),
+            spec,
+        )
     }
 
     fn create_inner(
         &self,
         at: Option<(&InstanceId, u16)>,
         name: &str,
+        hardware: Hardware,
         spec: Spec,
     ) -> io::Result<InstanceRecord> {
         let name = valid_name(name)?.trim();
@@ -181,6 +225,7 @@ impl InstanceStore {
         let avd_name = format!("wd-{}", nonce()?);
         let id = at.map_or_else(|| InstanceId::new(&avd_name), |(id, _)| id.clone());
         valid_id(&id)?;
+        let _resources = crate::storage::resource_lease(self.home(), true, true)?;
         let (root, _lock) = self.locked()?;
         let final_dir = root.join(id.as_str());
         if final_dir.try_exists()? {
@@ -189,7 +234,7 @@ impl InstanceStore {
                 "实例目录已存在",
             ));
         }
-        check_space(&root, spec.disk_bytes)?;
+        self.disk_limits()?.check(spec.disk_bytes)?;
         let reserved: BTreeSet<u16> = records_in(&root)?.iter().map(|r| r.port).collect();
         let port = match at {
             Some((_, port)) => {
@@ -217,7 +262,7 @@ impl InstanceStore {
         fs::DirBuilder::new().mode(0o700).create(&stage)?;
         let result = (|| {
             let paths = crate::provision::RuntimePaths::discover(&self.layout.root);
-            avd::generate(&stage, &final_dir, &record, &paths)?;
+            avd::generate(&stage, &final_dir, &record, &paths, hardware)?;
             let mut manifest = File::create_new(stage.join(MANIFEST))?;
             serde_json::to_writer_pretty(&mut manifest, &record)?;
             manifest.sync_all()?;
@@ -316,6 +361,44 @@ fn lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.as_encoded_bytes().starts_with(b".") {
+            let kind = entry.file_type()?;
+            let name = name.to_str().ok_or_else(|| invalid("注册表文件名无效"))?;
+            let known = match name {
+                ".registry.lock" => {
+                    crate::workspace::access(&entry.path(), libc::R_OK | libc::W_OK)?;
+                    use std::os::unix::fs::MetadataExt;
+                    let meta = entry.metadata()?;
+                    kind.is_file() && meta.len() == 0 && meta.nlink() == 1
+                }
+                ".selected" => kind.is_file(),
+                _ if name.starts_with(".new-") || name.starts_with(".deleted-") => kind.is_dir(),
+                _ if name.starts_with(".selection-") => kind.is_file(),
+                _ => false,
+            };
+            if !known {
+                return Err(invalid(format!("注册表内存在未知文件或类型：{name}")));
+            }
+        } else if !entry.file_type()?.is_dir() || !entry.path().join(MANIFEST).try_exists()? {
+            return Err(invalid(format!(
+                "实例目录缺少有效记录：{}",
+                entry.path().display()
+            )));
+        }
+    }
+    let records = records_in(root)?;
+    selected_in(root, &records).map(|_| ()).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("{}：{e}", root.join(".selected").display()),
+        )
+    })
+}
+
 fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
     let mut records = Vec::new();
     let mut used = BTreeSet::new();
@@ -324,17 +407,16 @@ fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
         if !entry.file_type()?.is_dir() || entry.file_name().as_encoded_bytes().starts_with(b".") {
             continue;
         }
-        // 早期版本的空目录没有发行记录，保留用户数据，同时把它排除在可操作列表外。
-        if !entry.path().join(MANIFEST).try_exists()? {
-            continue;
-        }
         let id = InstanceId::new(
             entry
                 .file_name()
                 .into_string()
                 .map_err(|_| invalid("实例目录名称无效"))?,
         );
-        let record = read_record(root, &id)?;
+        let record = read_record(root, &id).map_err(|e| {
+            let path = entry.path().join(MANIFEST);
+            io::Error::new(e.kind(), format!("{}：{e}", path.display()))
+        })?;
         if !used.insert(record.port) {
             return Err(invalid("已有实例占用相同的端口对"));
         }
@@ -352,7 +434,7 @@ fn read_record(root: &Path, id: &InstanceId) -> io::Result<InstanceRecord> {
     }
     let manifest = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join(MANIFEST))?;
     if !manifest.metadata()?.is_file() || manifest.metadata()?.len() > 8192 {
         return Err(invalid("实例记录类型或长度无效"));
@@ -372,9 +454,20 @@ fn read_record(root: &Path, id: &InstanceId) -> io::Result<InstanceRecord> {
 }
 
 fn selected_in(root: &Path, records: &[InstanceRecord]) -> io::Result<Option<InstanceId>> {
-    match fs::read_to_string(root.join(".selected")) {
-        Ok(id) => {
-            if let Some(record) = records.iter().find(|r| r.id.as_str() == id) {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root.join(".selected"))
+    {
+        Ok(file) => {
+            if !file.metadata()?.is_file() {
+                return Err(invalid("实例选择记录类型无效"));
+            }
+            let mut text = String::new();
+            file.take(81).read_to_string(&mut text)?;
+            let id = InstanceId::new(text);
+            valid_id(&id)?;
+            if let Some(record) = records.iter().find(|r| r.id == id) {
                 return Ok(Some(record.id.clone()));
             }
         }
@@ -446,26 +539,6 @@ pub(crate) fn check_ports(port: u16) -> io::Result<()> {
             Err(e) => return Err(e),
             Ok(_) => (),
         }
-    }
-    Ok(())
-}
-
-fn check_space(root: &Path, bytes: u64) -> io::Result<()> {
-    let path = CString::new(root.as_os_str().as_bytes())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: path 为 NUL 结尾的字节串，成功时 statvfs 填充整个结构。
-    let stat = unsafe {
-        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        stat.assume_init()
-    };
-    let available = stat.f_bavail as u128 * stat.f_frsize as u128;
-    if (bytes as u128) * 10 > available * 7 {
-        return Err(io::Error::new(
-            io::ErrorKind::StorageFull,
-            "数据盘超过当前可用空间的 70%",
-        ));
     }
     Ok(())
 }

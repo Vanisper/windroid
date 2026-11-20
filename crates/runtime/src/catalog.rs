@@ -35,10 +35,10 @@ impl HomeState {
 }
 
 /// 读一次应用清单。
-pub fn snapshot(serial: &str) -> Result<Vec<AppEntry>, String> {
-    let user = packages(serial, "-3")?;
-    let system = packages(serial, "-s")?;
-    let launcher = component_packages(serial, LAUNCHER)?;
+pub fn snapshot(device: adb::Device<'_>) -> Result<Vec<AppEntry>, String> {
+    let user = packages(device, "-3")?;
+    let system = packages(device, "-s")?;
+    let launcher = component_packages(device, LAUNCHER)?;
 
     let mut out = Vec::new();
     for (pkgs, is_system) in [(user, false), (system, true)] {
@@ -64,9 +64,9 @@ pub fn snapshot(serial: &str) -> Result<Vec<AppEntry>, String> {
 }
 
 /// 读桌面候选与默认桌面。系统选择器是占位解析结果，只有候选可以成为默认桌面。
-pub fn home_state(serial: &str) -> Result<HomeState, String> {
-    let candidates = component_packages(serial, HOME)?;
-    let default = default_home_package(serial)?.filter(|package| candidates.contains(package));
+pub fn home_state(device: adb::Device<'_>) -> Result<HomeState, String> {
+    let candidates = component_packages(device, HOME)?;
+    let default = default_home_package(device)?.filter(|package| candidates.contains(package));
     Ok(HomeState {
         candidates,
         default,
@@ -96,8 +96,8 @@ pub(crate) fn require_package(package: &str) -> Result<(), String> {
 }
 
 /// adb 或 Android shell 可能在输出错误时仍退出 0。错误不能变成空目录或任务消失。
-pub(crate) fn checked_shell(serial: &str, cmd: &str) -> Result<adb::AdbOutput, String> {
-    check_output(adb::shell(serial, cmd))
+pub(crate) fn checked_shell(device: adb::Device<'_>, cmd: &str) -> Result<adb::AdbOutput, String> {
+    check_output(adb::shell(device, cmd))
 }
 
 fn check_output(output: std::io::Result<adb::AdbOutput>) -> Result<adb::AdbOutput, String> {
@@ -150,8 +150,8 @@ pub(crate) fn diagnostic(out: &adb::AdbOutput) -> String {
         .unwrap_or_else(|| format!("adb 未返回诊断（退出码 {:?}）", out.code))
 }
 
-fn packages(serial: &str, kind: &str) -> Result<Vec<String>, String> {
-    let out = checked_shell(serial, &format!("pm list packages {kind} --user 0"))?;
+fn packages(device: adb::Device<'_>, kind: &str) -> Result<Vec<String>, String> {
+    let out = checked_shell(device, &format!("pm list packages {kind} --user 0"))?;
     let mut packages = Vec::new();
     for line in out.lines() {
         let pkg = line
@@ -177,11 +177,11 @@ fn component_package(component: &str) -> Option<&str> {
 }
 
 /// --brief 的组件行独占一行，旁边是优先级、计数等元数据。
-fn components(serial: &str, category: &str) -> Result<Vec<String>, String> {
+fn components(device: adb::Device<'_>, category: &str) -> Result<Vec<String>, String> {
     let cmd = format!(
         "cmd package query-activities --brief --user 0 -a android.intent.action.MAIN -c {category}"
     );
-    let out = checked_shell(serial, &cmd)?;
+    let out = checked_shell(device, &cmd)?;
     let result: Vec<_> = out
         .lines()
         .filter(|l| component_package(l).is_some())
@@ -198,16 +198,20 @@ fn components(serial: &str, category: &str) -> Result<Vec<String>, String> {
 }
 
 fn component_packages(
-    serial: &str,
+    device: adb::Device<'_>,
     category: &str,
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    Ok(components(serial, category)?
+    Ok(components(device, category)?
         .iter()
         .filter_map(|l| component_package(l).map(str::to_owned))
         .collect())
 }
 
-fn resolve(serial: &str, category: &str, package: Option<&str>) -> Result<Option<String>, String> {
+fn resolve(
+    device: adb::Device<'_>,
+    category: &str,
+    package: Option<&str>,
+) -> Result<Option<String>, String> {
     let mut cmd = format!(
         "cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c {category}"
     );
@@ -215,7 +219,7 @@ fn resolve(serial: &str, category: &str, package: Option<&str>) -> Result<Option
         require_package(package)?;
         cmd.push_str(&format!(" -p {package}"));
     }
-    let out = checked_shell(serial, &cmd)?;
+    let out = checked_shell(device, &cmd)?;
     if let Some(component) = out.lines().find(|line| component_package(line).is_some()) {
         return Ok(Some(component.to_owned()));
     }
@@ -227,17 +231,17 @@ fn resolve(serial: &str, category: &str, package: Option<&str>) -> Result<Option
 }
 
 /// 返回当前 HOME 解析到的包。home_state 会再按候选集合剔除系统选择器。
-pub fn default_home_package(serial: &str) -> Result<Option<String>, String> {
-    Ok(resolve(serial, HOME, None)?
+pub fn default_home_package(device: adb::Device<'_>) -> Result<Option<String>, String> {
+    Ok(resolve(device, HOME, None)?
         .as_deref()
         .and_then(component_package)
         .map(str::to_owned))
 }
 
 /// 确认是 HOME 候选，并以同一用户再次解析 HOME，得到目标包后才完成。
-pub fn set_default_home(serial: &str, package: &str) -> Result<bool, String> {
+pub fn set_default_home(device: adb::Device<'_>, package: &str) -> Result<bool, String> {
     require_package(package)?;
-    let Some(component) = components(serial, HOME)?
+    let Some(component) = components(device, HOME)?
         .into_iter()
         .find(|line| component_package(line) == Some(package))
     else {
@@ -245,10 +249,10 @@ pub fn set_default_home(serial: &str, package: &str) -> Result<bool, String> {
     };
     // 单引号保护 class 名中合法的 '$'；component_package 已拒绝引号。
     checked_shell(
-        serial,
+        device,
         &format!("cmd package set-home-activity --user 0 '{component}'"),
     )?;
-    let actual = default_home_package(serial)?;
+    let actual = default_home_package(device)?;
     if actual.as_deref() != Some(package) {
         return Err(format!(
             "设备未确认默认桌面 {package}（当前为 {}）",
@@ -259,9 +263,9 @@ pub fn set_default_home(serial: &str, package: &str) -> Result<bool, String> {
 }
 
 /// 在默认显示启动一个 LAUNCHER 组件。应用独立窗口由 scrcpy 的目标显示会话启动。
-pub fn launch(serial: &str, package: &str) -> Result<bool, String> {
+pub fn launch(device: adb::Device<'_>, package: &str) -> Result<bool, String> {
     require_package(package)?;
-    let Some(component) = resolve(serial, LAUNCHER, Some(package))? else {
+    let Some(component) = resolve(device, LAUNCHER, Some(package))? else {
         return Ok(false);
     };
     if component_package(&component) != Some(package) {
@@ -272,11 +276,11 @@ pub fn launch(serial: &str, package: &str) -> Result<bool, String> {
     );
     // -W 等待首帧。冷启动可能超过普通 adb 探测的时间预算。
     check_output(adb::run_with_timeout(
-        serial,
+        device,
         &["shell", &start],
         std::time::Duration::from_secs(20),
     ))?;
-    let resumed = crate::running::snapshot(serial)?
+    let resumed = crate::running::snapshot(device)?
         .iter()
         .any(|t| t.package == package && t.display_id == 0 && t.resumed);
     if !resumed {

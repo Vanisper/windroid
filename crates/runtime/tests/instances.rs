@@ -34,6 +34,7 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
     let a = store.create("  工作 A  ", spec("compact-720")).unwrap();
     let mut wide = spec("tv-4k");
     wide.disk_bytes = 9 << 30;
+    wide.image.revision = 15;
     let b = store.create("工作 B", wide.clone()).unwrap();
     assert_eq!(a.name, "工作 A");
     assert_ne!(a.id, b.id);
@@ -66,6 +67,12 @@ fn selection_and_avds_survive_reopening_and_deleting_the_selected_instance() {
             format!("hw.ramSize={}", ram_mib(template)),
             format!("disk.dataPartition.size={}", record.spec.disk_bytes),
             format!("AvdId={}", record.avd_name()),
+            format!(
+                "image.sysdir.1={}/system-images/android-34/google_apis_playstore/{}/r{}/",
+                root.0.display(),
+                record.spec.image.abi,
+                record.spec.image.revision
+            ),
         ] {
             assert!(config.lines().any(|l| l == expected), "缺少 {expected}");
         }
@@ -169,10 +176,12 @@ fn bounded_device_backend_checks_ports_process_identity_and_services() {
     const ROOT: &str = "WINDROID_BACKEND_TEST_DIR";
     let Some(path) = std::env::var_os(ROOT) else {
         let dir = Temp::create();
-        let sdk = dir.0.join("explicit SDK");
-        let image = sdk
-            .join("system-images/android-34/google_apis_playstore")
-            .join(concat!("arm64", "-v8a"));
+        let paths = runtime::provision::RuntimePaths::discover(&dir.0);
+        let image = paths
+            .images
+            .join("android-34/google_apis_playstore")
+            .join(concat!("arm64", "-v8a"))
+            .join("r14");
         fs::create_dir_all(&image).unwrap();
         for part in [
             "system.img",
@@ -183,8 +192,22 @@ fn bounded_device_backend_checks_ports_process_identity_and_services() {
         ] {
             fs::write(image.join(part), part).unwrap();
         }
+        fs::write(
+            image.join("build.prop"),
+            concat!(
+                "ro.build.version.sdk=34\nro.product.cpu.abi=arm64",
+                "-v8a\nro.build.flavor=sdk_gphone64_arm64-user\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(paths.emulator.parent().unwrap()).unwrap();
+        fs::write(
+            paths.emulator.parent().unwrap().join("source.properties"),
+            "Pkg.Revision=37.2.13\nPkg.BuildId=16740729\n",
+        )
+        .unwrap();
         executable(
-            &sdk.join("emulator/emulator"),
+            &paths.emulator,
             r#"#!/bin/sh
 printf '%s\n' "$@" > "$WINDROID_BACKEND_TEST_DIR/args"
 printf '%s' "$ANDROID_AVD_HOME" > "$WINDROID_BACKEND_TEST_DIR/avd_home"
@@ -201,12 +224,18 @@ trap save TERM
 while :; do sleep 60; done
 "#,
         );
-        let adb = sdk.join("platform-tools/adb");
+        fs::create_dir_all(paths.aapt.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.server_jar.parent().unwrap()).unwrap();
+        let adb = paths.adb;
         executable(
             &adb,
             r#"#!/bin/sh
+if [ "$1" = version ]; then echo "Android Debug Bridge version 1.0.41"; exit; fi
 printf '%s\n' "$4" >> "$WINDROID_BACKEND_TEST_DIR/calls"
 case "$4" in
+  *windroid-disk-synced*)
+    if test -e "$WINDROID_BACKEND_TEST_DIR/sync-error"; then exit 1; fi
+    echo windroid-disk-synced ;;
   'getprop ro.boot.qemu.avd_name') cat "$WINDROID_BACKEND_TEST_DIR/identity" ;;
   'getprop ro.boot.qemu.avd_name; getprop sys.boot_completed; service list')
     cat "$WINDROID_BACKEND_TEST_DIR/identity"; echo; echo 1; cat "$WINDROID_BACKEND_TEST_DIR/services" ;;
@@ -221,12 +250,26 @@ case "$4" in
 esac
 "#,
         );
+        let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let service_port = socket.local_addr().unwrap().port().to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for connection in socket.incoming() {
+                let mut stream = connection.unwrap();
+                let mut cmd = [0; 16];
+                stream.read_exact(&mut cmd).unwrap();
+                assert_eq!(&cmd, b"000chost:version");
+                stream.write_all(b"OKAY00040029").unwrap();
+            }
+        });
         let result = ChildCommand::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env(ROOT, &dir.0)
             .env("WINDROID_HOME", &dir.0)
-            .env("WINDROID_SDK", &sdk)
-            .env("WINDROID_ADB", &adb)
+            .env("ANDROID_ADB_SERVER_PORT", service_port)
+            .env_remove("ADB_SERVER_SOCKET")
+            .env("WINDROID_SDK", "/unrelated/sdk")
+            .env("WINDROID_ADB", "/unrelated/adb")
             .env("WINDROID_AVD", "someone-elses-avd")
             .status()
             .unwrap();
@@ -237,7 +280,27 @@ esac
     let layout = Layout { root: root.clone() };
     let store = InstanceStore::new(layout.clone());
     let a = store.create("工作 A", spec("compact-720")).unwrap();
-    let mut backend = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
+    let fixture = runtime::ActiveRuntime::new(|home, _| {
+        if home.join("next-lease-unavailable").exists() {
+            return Err(std::io::Error::other("新的资源根不可用"));
+        }
+        Ok((runtime::provision::RuntimePaths::discover(home), Vec::new()))
+    });
+    let pressure_path = root.join("pressure-critical");
+    let empty_headroom = root.join("no-headroom");
+    let fixture = fixture.with_admission(runtime::admission::Admission::new(
+        root.join("admission"),
+        move || {
+            use runtime::admission::{MemoryObservation, MemoryPressure};
+            let pressure = if pressure_path.exists() {
+                MemoryPressure::Critical
+            } else {
+                MemoryPressure::Normal
+            };
+            MemoryObservation::current(pressure, if empty_headroom.exists() { 0 } else { 16 << 10 })
+        },
+    ));
+    let mut backend = EmulatorBackend::with_runtime(a.id.clone(), layout.clone(), a.port, fixture);
     let mut facts = Facts::default();
     backend.observe(&mut facts);
     assert_eq!(State::of(&facts), State::Stopped);
@@ -267,11 +330,50 @@ esac
     assert!(backend.exec(&Command::Start, &mut facts).is_err());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(pid_marker.exists());
-    fs::remove_file(pid_marker).unwrap();
+    fs::remove_file(&pid_marker).unwrap();
+    let old = store.create("此前启动的实例", spec("compact-720")).unwrap();
+    let unknown_pid = layout.instance(&old.id).join("active.pid");
+    fs::write(&unknown_pid, std::process::id().to_string()).unwrap();
+    let failure = backend.exec(&Command::Start, &mut facts).unwrap_err();
+    assert!(
+        matches!(failure, Rejection::Error { detail, .. } if detail.contains("此前启动的实例") && detail.contains("原有会话"))
+    );
+    assert!(!facts.process_alive && unknown_pid.exists());
+    fs::remove_file(unknown_pid).unwrap();
+    store.delete(&old.id).unwrap();
+    // 在已经预留后制造 spawn 失败。恢复可执行文件后同一实例应能立即再次申请。
+    let emulator = runtime::provision::RuntimePaths::discover(&root).emulator;
+    let unavailable = emulator.with_extension("disabled");
+    fs::rename(&emulator, &unavailable).unwrap();
+    let failure = backend.exec(&Command::Start, &mut facts).unwrap_err();
+    assert!(matches!(failure, Rejection::Error { detail, .. } if detail.contains("无法启动")));
+    assert!(!facts.process_alive && !pid_marker.exists());
+    fs::rename(unavailable, emulator).unwrap();
     let hardware = avd(&root, &a).join("hardware-qemu.ini");
     fs::write(&hardware, "hw.cpu.ncore=8\nhw.ramSize=8192").unwrap();
     backend.exec(&Command::Start, &mut facts).unwrap();
     assert!(store.delete(&a.id).is_err());
+    // 重启替换预检失败必须让旧子进程、私有运行锁和会话路径继续有效。
+    let original_pid = fs::read_to_string(&pid_marker).unwrap();
+    fs::write(root.join("pressure-critical"), b"1").unwrap();
+    let rejection = backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap_err();
+    assert!(matches!(rejection, Rejection::Error { detail, .. } if detail.contains("内存压力")));
+    assert!(facts.process_alive);
+    assert_eq!(fs::read_to_string(&pid_marker).unwrap(), original_pid);
+    assert!(backend.active_runtime().current().is_some());
+    fs::remove_file(root.join("pressure-critical")).unwrap();
+    fs::write(root.join("next-lease-unavailable"), b"1").unwrap();
+    let rejection = backend
+        .exec(&Command::Restart { cold: false }, &mut facts)
+        .unwrap_err();
+    assert!(
+        matches!(rejection, Rejection::Error { detail, .. } if detail.contains("资源根不可用"))
+    );
+    assert_eq!(fs::read_to_string(&pid_marker).unwrap(), original_pid);
+    assert!(backend.active_runtime().current().is_some());
+    fs::remove_file(root.join("next-lease-unavailable")).unwrap();
     let mut another = EmulatorBackend::new(a.id.clone(), layout.clone(), a.port);
     assert!(
         another
@@ -286,7 +388,10 @@ esac
     .unwrap();
     backend.observe(&mut facts);
     assert!(facts.process_alive && !facts.adb_visible && !facts.services.ready());
-    assert!(a.verify_device().is_err());
+    assert!(
+        a.verify_device(&runtime::provision::RuntimePaths::discover(&root).adb)
+            .is_err()
+    );
     assert!(
         backend
             .exec(
@@ -359,18 +464,57 @@ esac
         assert!(args.contains(&format!("{flag}\n{value}\n")));
     }
     assert!(!args.contains("someone-elses-avd") && !args.contains("-no-snapshot"));
+    // 没有任何旧快照时，运行中的冷重启也不能丢掉尚未刷盘的当前会话。
+    let pid_before_sync = fs::read_to_string(&pid_marker).unwrap();
+    fs::write(root.join("sync-error"), "").unwrap();
+    let rejected = backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap_err();
+    assert!(matches!(rejected, Rejection::Error { detail, .. } if detail.contains("刷盘")));
+    assert_eq!(fs::read_to_string(&pid_marker).unwrap(), pid_before_sync);
     fs::write(root.join("save-on-exit"), "").unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     backend.exec(&Command::Stop, &mut facts).unwrap();
     assert!(store.quick_boot_saved(&a.id).unwrap());
     assert!(facts.allocation.is_none());
+    // 普通停止仍回收离线或刷盘失败的实例。未确认的快照只能先正常恢复。
+    let rejected = backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap_err();
+    assert!(matches!(rejected, Rejection::Error { detail, .. } if detail.contains("先正常启动")));
+    assert!(!pid_marker.exists());
+    fs::remove_file(root.join("sync-error")).unwrap();
+    backend.exec(&Command::Start, &mut facts).unwrap();
+    await_observation(&mut backend, &mut facts, |f| f.services.ready());
+    backend.exec(&Command::Stop, &mut facts).unwrap();
     // 下一次退出时若没有写入，磁盘上残留的旧快照不能让界面误报“已冻结”。
     fs::remove_file(root.join("save-on-exit")).unwrap();
-    backend.exec(&Command::Start, &mut facts).unwrap();
+    // 从已停止状态明确要求冷启动；启动仍需重新申请整笔预留。
+    backend
+        .exec(&Command::Restart { cold: true }, &mut facts)
+        .unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     await_observation(&mut backend, &mut facts, |f| f.services.ready());
     assert!(facts.allocation.is_none());
-    backend.exec(&Command::Stop, &mut facts).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !fs::read_to_string(root.join("args"))
+        .unwrap()
+        .lines()
+        .any(|s| s == "-no-snapshot-load")
+    {
+        assert!(Instant::now() < deadline, "冷启动参数未交给子进程");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 替换同规格在旧会话占用的额度内可行；真正退出后，按新的宿主页数再查整笔申请。
+    fs::write(root.join("no-headroom"), "").unwrap();
+    let rejection = backend
+        .exec(&Command::Restart { cold: false }, &mut facts)
+        .unwrap_err();
+    assert!(
+        matches!(rejection, Rejection::Error { detail, .. } if detail.contains("预计可分配 0 MiB"))
+    );
+    assert!(!facts.process_alive && facts.stop_requested);
+    fs::remove_file(root.join("no-headroom")).unwrap();
     assert!(!store.quick_boot_saved(&a.id).unwrap());
     assert_eq!(backend.catalog_status(), CatalogStatus::Pending);
     assert_eq!(State::of(&facts), State::Stopped);

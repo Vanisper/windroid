@@ -113,7 +113,7 @@ fn version_part(value: &str) -> Option<u32> {
 }
 
 /// `aapt` 由实例的 RuntimePaths 提供。读清单失败时尚未向设备提交安装。
-pub fn install(serial: &str, apk_path: &str, aapt: &Path) -> Result<Outcome, String> {
+pub fn install(device: adb::Device<'_>, apk_path: &str, aapt: &Path) -> Result<Outcome, String> {
     // 绝对路径既支持空格，也保证以 '-' 开头的本地文件名不会被 adb/aapt 当成选项。
     let apk = match Path::new(apk_path).canonicalize() {
         Ok(path) if path.is_file() => path,
@@ -136,7 +136,7 @@ pub fn install(serial: &str, apk_path: &str, aapt: &Path) -> Result<Outcome, Str
     };
     let path = apk.to_str().ok_or("APK 的实际路径不能转换为 UTF-8")?;
     let out = match adb::run(
-        serial,
+        device,
         &["install", "--no-incremental", "-r", "--user", "0", path],
     ) {
         Ok(out) => out,
@@ -154,7 +154,7 @@ pub fn install(serial: &str, apk_path: &str, aapt: &Path) -> Result<Outcome, Str
         .lines()
         .chain(out.stderr.lines())
         .any(|l| l.trim() == "Success");
-    let detail = match installed_version(serial, &identity.package) {
+    let detail = match installed_version(device, &identity.package) {
         Ok(Some(actual)) if actual == identity.version && acknowledged => {
             return Ok(Outcome::Installed);
         }
@@ -219,8 +219,8 @@ fn install_failure(out: &adb::AdbOutput) -> Option<Outcome> {
 
 /// 查询用户 0 的已安装包（含无 LAUNCHER 的应用，排除卸载后仅保留数据的记录）。
 /// 整表应含基础框架包 android，从而可以区分包确实不存在和包服务返回空输出。
-fn installed_version(serial: &str, package: &str) -> Result<Option<u64>, String> {
-    let out = checked_shell(serial, "pm list packages --show-versioncode --user 0")?;
+fn installed_version(device: adb::Device<'_>, package: &str) -> Result<Option<u64>, String> {
+    let out = checked_shell(device, "pm list packages --show-versioncode --user 0")?;
     let mut framework = false;
     let mut version = None;
     for line in out.lines() {
@@ -248,16 +248,16 @@ fn installed_version(serial: &str, package: &str) -> Result<Option<u64>, String>
 }
 
 /// 保留数据时使用 pm uninstall -k，彻底删除时使用 adb uninstall。两者均回读包索引。
-pub fn uninstall(serial: &str, package: &str, keep_data: bool) -> Result<bool, String> {
+pub fn uninstall(device: adb::Device<'_>, package: &str, keep_data: bool) -> Result<bool, String> {
     require_package(package)?;
     let out = if keep_data {
-        adb::shell(serial, &format!("pm uninstall -k {package}"))
+        adb::shell(device, &format!("pm uninstall -k {package}"))
     } else {
-        adb::run(serial, &["uninstall", package])
+        adb::run(device, &["uninstall", package])
     }
     .map_err(|e| format!("执行卸载失败：{e}"))?;
     if out.has("DELETE_FAILED_INTERNAL_ERROR") {
-        if installed_version(serial, package)?.is_none() {
+        if installed_version(device, package)?.is_none() {
             return Ok(false);
         }
         return Err(format!(
@@ -278,7 +278,7 @@ pub fn uninstall(serial: &str, package: &str, keep_data: bool) -> Result<bool, S
             crate::catalog::diagnostic(&out)
         ));
     }
-    if installed_version(serial, package)?.is_some() {
+    if installed_version(device, package)?.is_some() {
         return Err(format!("卸载后仍然查到 {package}"));
     }
     Ok(true)

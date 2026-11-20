@@ -3,7 +3,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -11,9 +10,8 @@ use std::thread::{self, JoinHandle};
 use stream::{DisplayTarget, Frame, InputEvent, SessionControl, VideoSession};
 
 pub struct Source {
-    pub adb: PathBuf,
+    pub resources: Arc<runtime::SessionResources>,
     pub serial: String,
-    pub jar: PathBuf,
     pub package: Option<String>,
 }
 
@@ -169,10 +167,9 @@ impl Worker {
                         Some(package) => DisplayTarget::App { package },
                         None => DisplayTarget::Device,
                     };
-                    let session = VideoSession::start_cancellable(
-                        &source.adb,
-                        &source.serial,
-                        &source.jar,
+                    let session = VideoSession::start_on(
+                        source.resources.device(&source.serial),
+                        &source.resources.paths.server_jar,
                         target,
                         || conn.stopped.load(Ordering::Acquire),
                     )?;

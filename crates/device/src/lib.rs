@@ -308,17 +308,26 @@ impl Actor {
 
         // 保留上次诊断，直到后端实际受理本次请求。拒绝时也不泄露半写的事实。
         let mut facts = self.facts.clone();
-        if matches!(cmd, Command::Start) {
+        if matches!(cmd, Command::Start | Command::Restart { .. }) {
             facts.stop_requested = false;
             facts.aborted = false;
             facts.boot_stalled = false;
         }
         if let Err(reason) = backend.exec(cmd, &mut facts) {
+            // 重启先替换预检，旧进程退出后再按当下余量复核。后一步拒绝时，
+            // 已完成的停止仍须发布，让原窗口关闭，也让用户可以直接重试启动。
+            if matches!(cmd, Command::Restart { .. })
+                && self.facts.process_alive && !facts.process_alive && facts.stop_requested
+            {
+                self.boot = None;
+                self.facts = facts;
+                self.observe(backend);
+            }
             return Ack::Rejected { reason };
         }
         self.facts = facts;
         match cmd {
-            Command::Start => {
+            Command::Start | Command::Restart { .. } => {
                 self.boot = Some(BootAttempt {
                     started: Instant::now(),
                     adb_seen: None,
@@ -394,6 +403,10 @@ fn guard(cmd: &Command, state: State) -> Option<&'static str> {
         Command::Create { .. } => (!caps.create).then_some("不存在的实例"),
         Command::Delete => (!caps.delete).then_some("已停止"),
         Command::Start => (!caps.start).then_some("已停止"),
+        Command::Restart { cold } => {
+            (!(caps.launch_app || state == State::Stalled || (*cold && caps.start)))
+                .then_some("已就绪、启动较慢或可冷启动的实例")
+        }
         Command::Stop => (!caps.stop).then_some("运行中的实例"),
         Command::Install { .. } => (!caps.install).then_some("系统就绪"),
         Command::Uninstall { .. } => (!caps.install).then_some("系统就绪"),
@@ -494,16 +507,18 @@ impl Backend for FakeBackend {
                 *facts = Facts::default();
                 self.step = 0;
             }
-            Command::Start => {
-                facts.process_alive = true;
-                facts.ever_launched = true;
-                facts.stop_requested = false;
-                facts.boot_stalled = false;
+            Command::Start | Command::Restart { .. } => {
+                *facts = Facts {
+                    dir_exists: true,
+                    process_alive: true,
+                    ever_launched: true,
+                    ..Default::default()
+                };
                 self.step = 1;
                 self.counter = 0;
             }
             Command::Stop => {
-                // 优雅停止：进程退出。真实后端会先关流会话，再 emu kill。
+                // 假后端立即完成停止。真实后端等待模拟器退出后发布相同的事实。
                 facts.process_alive = false;
                 facts.adb_visible = false;
                 facts.services = Default::default();

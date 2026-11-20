@@ -1,5 +1,8 @@
 //! 将原生应用库、实例协调器与按需创建的显示会话装配在同一进程中。
-use std::{path::PathBuf, sync::mpsc};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+};
 
 use host::surface::{CloseIntent, Window};
 use nsh_platform_macos::objc2::MainThreadMarker;
@@ -9,12 +12,51 @@ mod streaming;
 mod windows;
 
 fn main() -> Result<(), String> {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .try_init();
     let mtm = MainThreadMarker::new().expect("必须在主线程启动");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    let app_on_close = app.clone();
+    // 格式确认可能是首个原生窗口。先让 AppKit 完成启动，模态按钮与辅助功能才可用。
+    app.finishLaunching();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
+    let mut home = runtime::Layout::default_root().root;
+    let mut review = host::surface::review_workspace(mtm, &home);
+    let (library_window, library) = loop {
+        let error = match review {
+            Ok(Some(state)) => match open_library(mtm, &home, &state) {
+                Ok(opened) => break opened,
+                Err(error) => error,
+            },
+            Ok(None) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some((path, state)) = host::surface::choose_another_workspace(mtm, &home, &error)
+        else {
+            return Ok(());
+        };
+        home = path;
+        review = Ok(Some(state));
+    };
+    load_ui(&library_window)?;
+    library_window.show(mtm);
+    app.run();
+    windows::shutdown(mtm);
+    library.shutdown();
+    Ok(())
+}
+
+fn open_library(
+    mtm: MainThreadMarker,
+    home: &Path,
+    state: &runtime::workspace::Workspace,
+) -> Result<(Window, Arc<host::Library>), String> {
+    use runtime::workspace::{self, Workspace};
+
+    if *state != Workspace::Current {
+        workspace::initialize(home, state).map_err(|e| e.to_string())?;
+    }
+
+    let app_on_close = NSApplication::sharedApplication(mtm);
     let library_window = Window::new(
         mtm,
         "Windroid",
@@ -25,20 +67,16 @@ fn main() -> Result<(), String> {
         }),
     );
 
-    let layout = runtime::Layout::default_root();
-    let home = layout.root.clone();
     let (commands, rx) = mpsc::channel();
     let (events, windows_rx) = mpsc::channel();
     let fake = std::env::var("WINDROID_FAKE").as_deref() == Ok("1");
+    let layout = runtime::Layout {
+        root: home.to_owned(),
+    };
     let library =
         host::Library::attach(library_window.channel(), layout, fake, commands, windows_rx)?;
-    windows::install(mtm, library_window.channel(), home, rx, events);
-    load_ui(&library_window)?;
-    library_window.show(mtm);
-    app.run();
-    windows::shutdown(mtm);
-    library.shutdown();
-    Ok(())
+    windows::install(mtm, library_window.channel(), home.to_owned(), rx, events);
+    Ok((library_window, library))
 }
 
 fn load_ui(window: &Window) -> Result<(), String> {

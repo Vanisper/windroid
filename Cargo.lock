@@ -5,9 +5,6 @@ version = 4
 [[package]]
 name = "adb"
 version = "0.1.0"
-dependencies = [
- "windroid-locations",
-]
 
 [[package]]
 name = "adler2"
@@ -5300,13 +5297,15 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "adb",
+ "base16ct",
  "contract",
  "libc",
  "log",
+ "objc2-core-foundation",
  "serde",
  "serde_json",
- "sha1 0.10.7",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
  "windroid-locations",
  "zip",
 ]
@@ -7351,6 +7350,7 @@ dependencies = [
 name = "windroid-locations"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
 ]

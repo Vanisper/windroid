@@ -5,9 +5,8 @@
 //! `adb install` 在磁盘满时退出 0，`am start` 失败也退出 0。
 //! 判断留给调用方，通过回读实际状态完成。
 
-use std::env;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,33 +14,40 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_PER_STREAM: usize = 8 * 1024 * 1024;
 
-/// 所有 adb 客户端（包括流域的长驻进程）使用同一路径。
-/// 显式覆盖优先于 SDK，默认使用 Windroid 私有 SDK。
-pub fn program() -> io::Result<PathBuf> {
-    if let Some(path) = env::var_os("WINDROID_ADB").filter(|value| !value.is_empty()) {
-        return Ok(path.into());
-    }
-    let exe = format!("adb{}", env::consts::EXE_SUFFIX);
-    if let Some(sdk) = env::var_os("WINDROID_SDK").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(sdk).join("platform-tools").join(exe));
-    }
-    let tool = PathBuf::from("sdk/platform-tools").join(&exe);
-    if let Some(home) = env::var_os("WINDROID_HOME").filter(|value| !value.is_empty()) {
-        return Ok(windroid_locations::StorageLocations::load(home.as_ref())?
-            .runtime_root
-            .join(tool));
-    }
-    let home = env::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定 Windroid 运行时目录"))?;
-    let managed = windroid_locations::StorageLocations::load(&home.join(".windroid"))?
-        .runtime_root
-        .join(tool);
-    // 单独指定 serial 是现有的只读 real_catalog 手工入口。在有私有 SDK 时仍优先用它。
-    if !managed.exists() && env::var_os("WINDROID_SERIAL").is_some_and(|s| !s.is_empty()) {
-        return Ok(exe.into());
-    }
-    Ok(managed)
+/// 一个设备命令同时绑定工具和传输地址，跟随发起该命令的运行会话。
+#[derive(Clone, Copy, Debug)]
+pub struct Device<'a> {
+    pub program: &'a Path,
+    pub serial: &'a str,
+    pub transport: Transport,
 }
+
+impl<'a> Device<'a> {
+    pub fn new(program: &'a Path, serial: &'a str) -> Self {
+        Self {
+            program,
+            serial,
+            transport: Transport::Local,
+        }
+    }
+
+    pub fn injected(program: &'a Path, serial: &'a str) -> Self {
+        Self {
+            program,
+            serial,
+            transport: Transport::Injected,
+        }
+    }
+
+    pub fn command(self, until: Instant) -> io::Result<Command> {
+        let mut cmd = self.transport.command(self.program, until)?;
+        cmd.args(["-s", self.serial]);
+        Ok(cmd)
+    }
+}
+
+mod service;
+pub use service::{Transport, ensure_server};
 
 /// 短命令的输出截止时间覆盖进程退出和两个输出流的 EOF。超时会终止并回收直接子进程。
 /// cmd 的参数、工作目录和环境保持原样。stdin 关闭，stdout 与 stderr 分别最多捕获 8 MiB。
@@ -236,19 +242,24 @@ impl AdbOutput {
 }
 
 /// 对某台设备执行 adb 子命令。安装与文件传输有独立的较长预算。
-pub fn run(serial: &str, args: &[&str]) -> io::Result<AdbOutput> {
+pub fn run(device: Device<'_>, args: &[&str]) -> io::Result<AdbOutput> {
     let timeout = match args.first().copied() {
         Some("install" | "install-multiple" | "uninstall" | "push" | "pull") => TRANSFER_TIMEOUT,
         _ => PROBE_TIMEOUT,
     };
-    run_with_timeout(serial, args, timeout)
+    run_with_timeout(device, args, timeout)
 }
 
 /// 对某台设备执行有明确时间预算的 adb 子命令。
-pub fn run_with_timeout(serial: &str, args: &[&str], timeout: Duration) -> io::Result<AdbOutput> {
-    let mut cmd = Command::new(program()?);
-    cmd.args(["-s", serial]).args(args);
-    let out = output_with_timeout(cmd, timeout)?;
+pub fn run_with_timeout(
+    device: Device<'_>,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<AdbOutput> {
+    let until = Instant::now() + timeout;
+    let mut cmd = device.command(until)?;
+    cmd.args(args);
+    let out = output_with_timeout(cmd, service::remaining(until)?)?;
     Ok(AdbOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -257,51 +268,59 @@ pub fn run_with_timeout(serial: &str, args: &[&str], timeout: Duration) -> io::R
 }
 
 /// 执行 adb shell 命令。
-pub fn shell(serial: &str, cmd: &str) -> io::Result<AdbOutput> {
-    run(serial, &["shell", cmd])
+pub fn shell(device: Device<'_>, cmd: &str) -> io::Result<AdbOutput> {
+    run(device, &["shell", cmd])
 }
 
 /// 当前所有设备的 serial 列表，附带连接状态。
 ///
 /// 只解析 `adb devices` 的正文：首行是标题，其余每行 `serial\tstate`。
-pub fn devices() -> io::Result<Vec<(String, String)>> {
-    let mut cmd = Command::new(program()?);
-    cmd.arg("devices");
-    let out = output_with_timeout(cmd, PROBE_TIMEOUT)?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let serial = it.next()?;
-            let state = it.next().unwrap_or("unknown");
-            Some((serial.to_owned(), state.to_owned()))
-        })
-        .collect())
+pub fn devices(program: &Path) -> io::Result<Vec<(String, String)>> {
+    Transport::Local.devices(program)
+}
+impl Transport {
+    pub fn devices(self, program: &Path) -> io::Result<Vec<(String, String)>> {
+        let until = Instant::now() + PROBE_TIMEOUT;
+        let mut cmd = self.command(program, until)?;
+        cmd.arg("devices");
+        let out = output_with_timeout(cmd, service::remaining(until)?)?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let serial = it.next()?;
+                let state = it.next().unwrap_or("unknown");
+                Some((serial.to_owned(), state.to_owned()))
+            })
+            .collect())
+    }
 }
 
 /// 该 serial 是否已连接且状态为 `device`。
-pub fn is_ready(serial: &str) -> io::Result<bool> {
-    Ok(devices()?
+pub fn is_ready(device: Device<'_>) -> io::Result<bool> {
+    Ok(device
+        .transport
+        .devices(device.program)?
         .into_iter()
-        .any(|(s, state)| s == serial && state == "device"))
+        .any(|(s, state)| s == device.serial && state == "device"))
 }
 
 /// 建立端口转发，返回实际使用的端口。
-pub fn forward(serial: &str, local_port: u16, remote: &str) -> io::Result<AdbOutput> {
-    run(serial, &["forward", &format!("tcp:{local_port}"), remote])
+pub fn forward(device: Device<'_>, local_port: u16, remote: &str) -> io::Result<AdbOutput> {
+    run(device, &["forward", &format!("tcp:{local_port}"), remote])
 }
 
 /// 撤销端口转发。
-pub fn remove_forward(serial: &str, local_port: u16) -> io::Result<AdbOutput> {
+pub fn remove_forward(device: Device<'_>, local_port: u16) -> io::Result<AdbOutput> {
     run(
-        serial,
+        device,
         &["forward", "--remove", &format!("tcp:{local_port}")],
     )
 }
 
 /// 推送文件到设备。
-pub fn push(serial: &str, local: &str, remote: &str) -> io::Result<AdbOutput> {
-    run(serial, &["push", local, remote])
+pub fn push(device: Device<'_>, local: &str, remote: &str) -> io::Result<AdbOutput> {
+    run(device, &["push", local, remote])
 }

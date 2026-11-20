@@ -5,6 +5,3 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "对 adb 进程调用的封装：只负责执行与读取，不解释状态。"
-
-[dependencies]
-windroid-locations = { path = "../locations" }

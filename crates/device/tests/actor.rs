@@ -50,7 +50,7 @@ fn command_roundtrip_returns_ack() {
     let ack = h.send(Command::Create {
         spec: Spec {
             template: "phone-1080".into(),
-            image: Image { api: 34, tag: "google_apis_playstore".into(), abi: "arm64-v8a".into() },
+            image: Image { revision: 14, api: 34, tag: "google_apis_playstore".into(), abi: "arm64-v8a".into() },
             disk_bytes: 8 << 30,
         },
     });
@@ -68,7 +68,7 @@ fn events_arrive_in_order_with_monotonic_seq() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -94,7 +94,7 @@ fn boot_progresses_through_expected_states() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -134,7 +134,7 @@ fn ready_requires_all_three_services_not_just_pm() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -169,7 +169,7 @@ fn stall_reports_the_sticking_point() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -194,7 +194,7 @@ fn stalled_process_exit_becomes_failed() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -214,7 +214,7 @@ fn duplicate_start_is_rejected_with_reason() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -244,7 +244,7 @@ fn install_before_ready_is_rejected_as_not_ready() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -267,7 +267,7 @@ fn snapshot_and_events_can_be_reconciled_by_seq() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -297,7 +297,7 @@ fn snapshot_state_always_equals_derived_state() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -325,7 +325,7 @@ fn delete_requires_stopped() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -367,7 +367,7 @@ fn hard_limit_aborts_and_reports_failure() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -406,6 +406,7 @@ fn each_retry_has_fresh_soft_and_hard_limits() {
         spec: Spec {
             template: "t".into(),
             image: Image {
+                revision: 14,
                 api: 34,
                 tag: "g".into(),
                 abi: "a".into(),
@@ -442,7 +443,7 @@ fn start_clears_the_previous_stop_request() {
     h.send(Command::Create {
         spec: Spec {
             template: "t".into(),
-            image: Image { api: 34, tag: "g".into(), abi: "a".into() },
+            image: Image { revision: 14, api: 34, tag: "g".into(), abi: "a".into() },
             disk_bytes: 1,
         },
     });
@@ -656,6 +657,7 @@ fn session_count_updates_publish_only_current_instance_facts() {
     let spec = Spec {
         template: "t".into(),
         image: Image {
+            revision: 14,
             api: 34,
             tag: "g".into(),
             abi: "a".into(),
@@ -693,4 +695,39 @@ fn session_count_updates_publish_only_current_instance_facts() {
     assert_eq!(h.snapshot().facts.session_count, 0);
     assert!(!h.set_session_count(1).is_accepted());
     assert!(h.set_session_count(0).is_accepted());
+}
+
+#[test]
+fn restart_publishes_only_a_stop_that_really_completed() {
+    struct RefusedRestart(FakeBackend);
+    impl Backend for RefusedRestart {
+        fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if let Command::Restart { cold } = cmd {
+                if *cold {
+                    self.0.exec(&Command::Stop, facts)?;
+                    facts.stop_requested = true;
+                }
+                return Err(Rejection::Error {
+                    code: contract::ErrorCode::Other, detail: "额度不足".into(),
+                });
+            }
+            self.0.exec(cmd, facts)
+        }
+        fn abort(&mut self, facts: &mut Facts) { self.0.abort(facts) }
+        fn observe(&mut self, facts: &mut Facts) { self.0.observe(facts) }
+    }
+    let (handle, events) = spawn_test(id(), RefusedRestart(FakeBackend::new()), Timeouts::default());
+    let spec = Spec {
+        template: "phone-1080".into(),
+        image: Image { revision: 14, api: 34, tag: "play".into(), abi: "arm64".into() },
+        disk_bytes: 8 << 30,
+    };
+    assert!(handle.send(Command::Create { spec }).is_accepted());
+    assert!(handle.send(Command::Start).is_accepted());
+    until_state(&events, State::Ready, Duration::from_secs(5)).unwrap();
+    assert!(!handle.send(Command::Restart { cold: false }).is_accepted());
+    assert_eq!(handle.snapshot().state, State::Ready);
+    assert!(!handle.send(Command::Restart { cold: true }).is_accepted());
+    assert_eq!(handle.snapshot().state, State::Stopped);
+    assert!(handle.send(Command::Start).is_accepted());
 }

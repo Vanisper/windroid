@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 
 use super::catalog::Artifact;
 use super::integrity::invalid;
-use super::paths::{RECEIPT, directory, receipt, small_text, validate_payload};
+use super::paths::small_text;
+use crate::storage::StableObject;
+
+const INSTALL_MARKER: &str = "windroid-package-install-v1\n";
 
 // 固定包的目录均为 ASCII。逐段检查原始名字，避免解包器静默「修正」路径。
-fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
+pub(super) fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
     let name = std::str::from_utf8(raw).map_err(|_| invalid("无效 ZIP 文件名"))?;
     let name = name.strip_suffix('/').unwrap_or(name);
     if name.len() > 1024 {
@@ -23,7 +26,6 @@ fn relative(raw: &[u8], prefix: &str) -> io::Result<PathBuf> {
         if part.is_empty()
             || part == "."
             || part == ".."
-            || part.eq_ignore_ascii_case(RECEIPT)
             || !part.bytes().all(|c| c.is_ascii_graphic() || c == b' ')
             || part.contains(['\\', ':'])
         {
@@ -116,10 +118,15 @@ fn remove_owned(path: &Path) -> io::Result<()> {
 }
 
 /// 解压与改名都在目标卷完成。独立工作区复用同一组件目录时也要串行发布。
-fn workspace(parent: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
-    let stage = parent.join(format!(".windroid-install-{}", pkg.id));
+pub(super) fn stage_path(dest: &Path, pkg: Artifact) -> PathBuf {
+    dest.parent()
+        .unwrap()
+        .join(format!(".windroid-install-{}-{}", pkg.id, pkg.digest.hex()))
+}
+
+pub(super) fn workspace(dest: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
+    let stage = stage_path(dest, pkg);
     let owner = stage.join("owner");
-    const MARKER: &str = "windroid-package-install-v1\n";
     if let Err(e) = fs::create_dir(&stage)
         && (e.kind() != io::ErrorKind::AlreadyExists || !fs::symlink_metadata(&stage)?.is_dir())
     {
@@ -133,15 +140,17 @@ fn workspace(parent: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
         .create(empty)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&owner)?;
-    lock.try_lock()
-        .map_err(|e| io::Error::other(format!("组件正在其他工作区安装：{e}")))?;
+    // 调用方已持有跨工作区的版本写锁；这个描述符只用于标识原卷和暂存对象。
+    if !lock.metadata()?.is_file() || lock.metadata()?.nlink() != 1 {
+        return Err(invalid("暂存身份记录必须为独立普通文件"));
+    }
     let marker = small_text(&owner)?;
     if marker.is_empty()
         && fs::read_dir(&stage)?.all(|e| e.is_ok_and(|f| f.path() == owner))
         && lock.metadata()?.nlink() == 1
     {
-        lock.write_all(MARKER.as_bytes())?;
-    } else if marker != MARKER {
+        lock.write_all(INSTALL_MARKER.as_bytes())?;
+    } else if marker != INSTALL_MARKER {
         return Err(invalid(format!(
             "安装暂存位置已被其他文件占用：{}",
             stage.display()
@@ -150,105 +159,226 @@ fn workspace(parent: &Path, pkg: Artifact) -> io::Result<(PathBuf, File)> {
     Ok((stage, lock))
 }
 
-fn publish_file(stage: &Path, scratch: &Path, dest: &Path) -> io::Result<()> {
-    let identity = |meta: &fs::Metadata| format!("{}:{}\n", meta.dev(), meta.ino());
-    let published = stage.join("published");
-    match fs::symlink_metadata(dest) {
-        Ok(meta)
-            if meta.is_file() && small_text(&published).is_ok_and(|id| id == identity(&meta)) =>
-        {
-            fs::rename(scratch, dest)?;
-        }
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "目标已有非受管文件，请移走该文件或另选存储位置：{}",
-                    dest.display()
-                ),
-            ));
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            crate::storage::rename_exclusive(scratch, dest)?;
-        }
-        Err(e) => return Err(e),
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Publish {
+    stage: StableObject,
+    old: Option<StableObject>,
+    new: StableObject,
+}
+
+pub(super) fn object(path: &Path) -> io::Result<Option<StableObject>> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => StableObject::at(path).map(Some),
+        Ok(_) => Err(invalid(format!(
+            "发布目录被其他文件占用：{}",
+            path.display()
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    let temp = stage.join("published.new");
-    remove_owned(&temp)?;
-    File::create_new(&temp)?.write_all(identity(&fs::metadata(dest)?).as_bytes())?;
-    fs::rename(temp, published)
+}
+
+/// 事务仅操作同卷私有路径。重入时若版本已换入，先核验再清理；否则恢复原目录。
+pub(super) fn recover(
+    home: &Path,
+    stage: &Path,
+    dest: &Path,
+    pkg: Artifact,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<Option<File>> {
+    guard()?;
+    let journal = stage.join("publish.json");
+    let record: Publish = match small_text(&journal) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|_| invalid("发布记录缺少可核对的卷及对象身份，已保留暂存和原版本"))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !record.stage.matches(stage)? {
+        return Err(invalid("安装暂存目录或所在卷已更换，无法恢复此发布"));
+    }
+    let backup = stage.join("previous");
+    let current = object(dest)?;
+    let previous = object(&backup)?;
+    let mut restored = None;
+    if previous.is_some() && previous != record.old {
+        return Err(invalid(format!("原版本备份发生变化：{}", backup.display())));
+    }
+    if current.as_ref() == Some(&record.new) {
+        match super::manifest::check(home, dest, pkg, true, guard) {
+            Ok(_) if previous.is_some() => {
+                let _lease = crate::storage::lock_staged_version(&backup)?;
+                super::manifest::repairable(&backup, pkg)?;
+                remove_version(&backup, record.old.as_ref(), guard)?;
+            }
+            Ok(_) => (),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                super::manifest::repairable(dest, pkg)?;
+                if previous.is_some() {
+                    restored = Some(crate::storage::lock_staged_version(&backup)?);
+                    require_object(dest, Some(&record.new), guard)?;
+                    crate::storage::rename_exclusive(dest, &stage.join("rejected"))?;
+                    require_object(&backup, record.old.as_ref(), guard)?;
+                    crate::storage::rename_exclusive(&backup, dest)?;
+                }
+                // 首次发布没有备份时保留现状，本次明确修复会在新副本通过验收后再替换。
+            }
+            Err(e) => return Err(e),
+        }
+    } else if current.is_none() && previous.is_some() {
+        restored = Some(crate::storage::lock_staged_version(&backup)?);
+        require_object(&backup, record.old.as_ref(), guard)?;
+        crate::storage::rename_exclusive(&backup, dest)?;
+    } else if current != record.old {
+        return Err(invalid(format!(
+            "目标版本在事务期间改变：{}",
+            dest.display()
+        )));
+    }
+    let rejected = stage.join("rejected");
+    if let Some(identity) = object(&rejected)? {
+        if identity != record.new {
+            return Err(invalid("撤回版本的对象身份已变化"));
+        }
+        super::manifest::repairable(&rejected, pkg)?;
+        remove_version(&rejected, Some(&record.new), guard)?;
+    }
+    guard()?;
+    fs::remove_file(journal)?;
+    Ok(restored)
+}
+
+fn require_object(
+    path: &Path,
+    expected: Option<&StableObject>,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    guard()?;
+    if object(path)?.as_ref() != expected {
+        return Err(invalid(format!("卷或版本目录已更换：{}", path.display())));
+    }
+    Ok(())
+}
+
+fn remove_version(
+    path: &Path,
+    expected: Option<&StableObject>,
+    guard: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    require_object(path, expected, guard)?;
+    remove_owned(path)
+}
+
+/// 调用方已取得版本写锁并恢复发布事务，可以回收该次中断留下的解压空间。
+pub(super) fn discard_unpack(stage: &Path) -> io::Result<()> {
+    remove_owned(&stage.join("unpack"))
 }
 
 pub(super) fn install(
-    root: &Path,
+    home: &Path,
+    stage: &Path,
     mut input: &File,
     dest: &Path,
     pkg: Artifact,
+    approved: Option<&StableObject>,
     check: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
-    input.rewind()?;
-    let parent = dest.parent().ok_or_else(|| invalid("组件目标缺少父目录"))?;
-    directory(root, parent, true)?;
-    let (stage, _lock) = workspace(parent, pkg)?;
-    // 同一目标可能已由另一工作区在下载期间安装。保留已在使用的完整文件。
-    if (pkg.prefix.is_none() || small_text(&dest.join(RECEIPT)).is_ok_and(|r| r == receipt(pkg)))
-        && validate_payload(dest, pkg).is_ok()
-    {
-        return Ok(());
-    }
     let scratch = stage.join("unpack");
     let backup = stage.join("previous");
-    // 上次在两次 rename 间退出。先恢复旧版本，再尝试发布本次产物。
-    if fs::symlink_metadata(&backup).is_ok() && !dest.try_exists()? {
-        fs::rename(&backup, dest)?;
+    let stage_identity = StableObject::at(stage)?;
+    check()?;
+    discard_unpack(stage)?;
+    if object(&backup)?.is_some() {
+        return Err(invalid("无法确认原版本备份的来源"));
     }
-    remove_owned(&scratch)?;
+    input.rewind()?;
+    fs::create_dir(&scratch)?;
+    let scratch_identity = StableObject::at(&scratch)?;
     let result = (|| {
-        if pkg.prefix.is_none() {
-            check()?;
+        if pkg.prefix.is_some() {
+            unpack(input, &scratch, pkg, &check)?;
+        } else {
             io::copy(
                 &mut input,
-                &mut OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&scratch)?,
+                &mut File::create_new(scratch.join("scrcpy-server.jar"))?,
             )?;
-            validate_payload(&scratch, pkg)?;
-            return publish_file(&stage, &scratch, dest);
         }
-        fs::create_dir(&scratch)?;
-        unpack(input, &scratch, pkg, &check)?;
-        validate_payload(&scratch, pkg)?;
-        fs::write(scratch.join(RECEIPT), receipt(pkg))?;
+        super::manifest::full(&scratch, pkg, &check)?;
         check()?;
-        remove_owned(&backup)?;
-        let had_old = match fs::symlink_metadata(dest) {
-            Ok(m) if m.is_dir() => {
-                if !small_text(&dest.join(RECEIPT))
-                    .is_ok_and(|r| r.starts_with(&format!("windroid-v1 {} ", pkg.id)))
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("目标已有非受管目录，请另选存储位置：{}", dest.display()),
-                    ));
-                }
-                fs::rename(dest, &backup)?;
-                true
+        let _next = crate::storage::lock_staged_version(&scratch)?;
+        let old = object(dest)?;
+        if old.is_some() {
+            if old.as_ref() != approved && !super::manifest::empty_skeleton(dest, pkg)? {
+                return Err(invalid("待安装版本已出现，请重新检查后确认操作"));
             }
-            Ok(_) => return Err(invalid("组件目标应为私有目录")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e),
+            super::manifest::repairable(dest, pkg)?;
+        }
+        let record = Publish {
+            stage: stage_identity.clone(),
+            old,
+            new: object(&scratch)?.unwrap(),
         };
+        let journal = stage.join("publish.json");
+        let temp = stage.join("publish.new");
+        check()?;
+        remove_owned(&temp)?;
+        let mut f = File::create_new(&temp)?;
+        serde_json::to_writer(&mut f, &record)?;
+        f.sync_all()?;
+        crate::storage::rename_exclusive(&temp, &journal)?;
+        require_object(dest, record.old.as_ref(), &check)?;
+        if record.old.is_some() {
+            crate::storage::rename_exclusive(dest, &backup)?;
+        }
+        require_object(&scratch, Some(&record.new), &check)?;
         if let Err(e) = crate::storage::rename_exclusive(&scratch, dest) {
-            if had_old && !dest.try_exists()? {
+            if record.old.is_some() && object(dest)?.is_none() {
+                require_object(&backup, record.old.as_ref(), &check)?;
                 crate::storage::rename_exclusive(&backup, dest)?;
             }
             return Err(e);
         }
-        remove_owned(&backup)
+        // 当前进程已持有备份（原目标）对象的独占锁，此处无需再次申请。
+        if let Err(e) = super::manifest::check(home, dest, pkg, true, &check) {
+            super::manifest::repairable(dest, pkg)?;
+            require_object(dest, Some(&record.new), &check)?;
+            crate::storage::rename_exclusive(dest, &scratch)?;
+            if record.old.is_some() {
+                require_object(&backup, record.old.as_ref(), &check)?;
+                crate::storage::rename_exclusive(&backup, dest)?;
+            }
+            check()?;
+            fs::remove_file(journal)?;
+            return Err(e);
+        }
+        if record.old.is_some() {
+            super::manifest::repairable(&backup, pkg)?;
+            require_object(dest, Some(&record.new), &check)?;
+            remove_version(&backup, record.old.as_ref(), &check)?;
+        }
+        check()?;
+        fs::remove_file(journal)?;
+        // 另一线程可能正在 fork 子进程，显式解锁后才向调用方报告新版本可读。
+        File::unlock(&_next)
     })();
-    if result.is_err() {
+    if result.is_err()
+        && check().is_ok()
+        && stage_identity.matches(stage).unwrap_or(false)
+        && scratch_identity.matches(&scratch).unwrap_or(false)
+    {
         remove_owned(&scratch)?;
     }
     result
+}
+
+pub(super) fn is_workspace(stage: &Path) -> bool {
+    fs::symlink_metadata(stage).is_ok_and(|m| m.is_dir())
+        && small_text(&stage.join("owner")).is_ok_and(|s| s == INSTALL_MARKER)
 }
