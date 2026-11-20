@@ -79,6 +79,8 @@ impl Event {
 #[serde(rename_all = "camelCase")]
 pub struct Record {
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_start: Option<u64>,
     pub segment: u64,
     pub stamp: Stamp,
     #[serde(flatten)]
@@ -94,6 +96,7 @@ impl Record {
     fn gap(first: u64, last: u64, stamp: Stamp, segment: u64, reason: &str) -> Self {
         Self {
             seq: last,
+            gap_start: Some(first),
             segment,
             stamp,
             event: Event::new(
@@ -116,6 +119,8 @@ struct Segment {
     latest_utc: String,
     bytes: u64,
     removed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unwritten: bool,
 }
 impl Segment {
     fn filename(&self) -> String {

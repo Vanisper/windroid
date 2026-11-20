@@ -159,9 +159,9 @@ fn rebuilds_after_incomplete_manifest_and_tail_without_inferring_an_exit() {
         .unwrap()
         .write_all(br#"{"seq":2"#)
         .unwrap();
-    fs::remove_file(p.parent().unwrap().join("run.json")).unwrap();
+    fs::write(p.parent().unwrap().join("run.json"), b"{").unwrap();
     let c = Catalog::load(&home.0, None).unwrap();
-    assert!(c.runs[0].outcome.is_none() && !c.runs[0].active);
+    assert!(c.runs[0].outcome.is_none() && !c.runs[0].active && c.runs[0].lost);
     assert_eq!(
         read_page(&home.0, None, &id, None, 0, 50)
             .unwrap()
@@ -184,6 +184,12 @@ fn stalled_disk_never_blocks_producers_and_reports_exact_sequence_gap() {
     }
     assert!(sink.degraded());
     drop(g);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while sink.degraded() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!sink.degraded());
+    assert!(Catalog::load(&home.0, None).unwrap().runs[0].lost);
     w.finish("ok").unwrap();
     let p = read_page(&home.0, None, &id, None, 0, 500).unwrap();
     let last = p.records.last().unwrap();
@@ -196,6 +202,7 @@ fn stalled_disk_never_blocks_producers_and_reports_exact_sequence_gap() {
 fn row(seq: u64, when: Stamp, text: &str) -> Record {
     Record {
         seq,
+        gap_start: None,
         segment: 0,
         stamp: when,
         event: Event::new("stdout", text),
@@ -371,4 +378,26 @@ fn emulator_can_write_when_application_log_tree_is_unusable() {
             .text,
         "ready"
     );
+}
+
+#[test]
+fn unreadable_coordinator_preserves_known_exit_and_tail_range_if_index_is_writable() {
+    let home = Home::new();
+    let writer = RunWriter::app(&home.0).unwrap();
+    let id = writer.id().to_owned();
+    fs::write(home.0.join(".diagnostic-budget"), "blocked").unwrap();
+    for _ in 0..3 {
+        writer.sink().emit(Event::new("windroid", "record"))
+    }
+    assert!(writer.finish("正常退出").is_err());
+    let c = Catalog::load(&home.0, None).unwrap();
+    assert!(c.runs[0].lost);
+    assert_eq!(c.runs[0].outcome.as_deref(), Some("正常退出"));
+    let rows = read_page(&home.0, None, &id, None, 0, 4).unwrap().records;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].gap_start, rows[0].seq, rows[0].segment),
+        (Some(1), 3, 0)
+    );
+    assert!(rows[0].text.contains("采集缺口"));
 }

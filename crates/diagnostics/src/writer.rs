@@ -51,8 +51,7 @@ impl Sink {
     fn capture(&self, mut event: Event, stamp: impl FnOnce() -> Stamp) {
         if event.text.len() > TEXT_LIMIT {
             let end = event.text.floor_char_boundary(TEXT_LIMIT);
-            event.text.truncate(end);
-            event.text.push_str(" [文本已截断]");
+            event.text = format!("{} [文本已截断]", &event.text[..end]);
         }
         let mut input = self.input.lock().unwrap();
         if input.closed {
@@ -60,6 +59,7 @@ impl Sink {
         }
         input.last += 1;
         let row = Record {
+            gap_start: None,
             seq: input.last,
             segment: 0,
             stamp: stamp(),
@@ -235,12 +235,23 @@ impl Disk {
                 }
                 maintenance = Instant::now();
             }
+            // 在等待前取丢失水位。若等待超时，低于这个水位的队列项都已处理，
+            // 即使来源从此一直静默，也能在磁盘恢复后发布缺口。
+            let dropped = health.last_dropped.load(Ordering::Acquire);
             let first = match receiver.recv_timeout(Duration::from_secs(2)) {
-                Ok(m) => m,
-                Err(RecvTimeoutError::Timeout) => continue,
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => {
+                    unfinished = unfinished.max(dropped);
+                    if self.persisted < unfinished
+                        && self.fill_gap(unfinished, &Stamp::now()).is_err()
+                    {
+                        health.disk_failed.store(true, Ordering::Release);
+                    }
+                    None
+                }
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             };
-            for message in std::iter::once(first).chain(receiver.try_iter().take(BATCH - 1)) {
+            for message in first.into_iter().chain(receiver.try_iter().take(BATCH - 1)) {
                 match message {
                     Message::Row(row) => {
                         unfinished = row.seq;
@@ -257,6 +268,20 @@ impl Disk {
                         outcome,
                     } => {
                         let gap = self.fill_gap(seq, &stamp);
+                        // 新段可能受额度或权限限制，但既有清单仍可发布。本周期
+                        // 此后不再写入，把最后未能落盘的精确范围登记为一个缺口。
+                        if gap.is_err() && self.persisted < seq {
+                            self.manifest.segments.push(Segment {
+                                number: self.manifest.segments.last().map_or(1, |s| s.number + 1),
+                                first: self.persisted + 1,
+                                last: seq,
+                                stamp: stamp.clone(),
+                                latest_utc: stamp.utc.clone(),
+                                bytes: 0,
+                                removed: true,
+                                unwritten: true,
+                            });
+                        }
                         self.manifest.ended = outcome.as_ref().map(|_| stamp);
                         self.manifest.outcome = outcome;
                         self.manifest.sealed = true;
@@ -315,12 +340,13 @@ impl Disk {
             )?);
             let segment = Segment {
                 number: row.segment,
-                first: row.seq,
+                first: row.gap_start.unwrap_or(row.seq),
                 last: row.seq,
                 stamp: row.stamp.clone(),
                 latest_utc: row.stamp.utc.clone(),
                 bytes: 0,
                 removed: false,
+                unwritten: false,
             };
             self.segment = Some(self.dir.create(&segment.filename())?);
             self.manifest.segments.push(segment);
@@ -336,7 +362,12 @@ impl Disk {
         bytes.push(b'\n');
         if let Err(e) = file.write_all(&bytes) {
             // write_all 可能留下半条。回到旧边界；若无法回滚，封存本段，读者忽略残尾。
-            if file
+            if segment.bytes == 0 {
+                let empty = segment.filename();
+                self.segment = None;
+                self.manifest.segments.pop();
+                let _ = self.dir.remove(&empty, false);
+            } else if file
                 .set_len(segment.bytes)
                 .and_then(|()| file.seek(SeekFrom::Start(segment.bytes)))
                 .is_err()
@@ -392,17 +423,25 @@ pub fn record_interruption(home: &Path, instance: &str, id: &str, outcome: &str)
         dirty: false,
     };
     disk.manifest.lost = true;
+    disk.manifest.sealed = false;
+    disk.save()?;
     let stamp = Stamp::now();
     let result = disk
         .append(Record {
-            seq: persisted + 1,
+            seq: persisted
+                .checked_add(1)
+                .ok_or_else(|| invalid("日志序号溢出"))?,
+            gap_start: None,
             segment: 0,
             stamp: stamp.clone(),
             event: Event::new("gap", "采集器中断，后续模拟器输出可能缺失，数量未知"),
         })
         .and_then(|_| {
             disk.append(Record {
-                seq: persisted + 2,
+                seq: persisted
+                    .checked_add(2)
+                    .ok_or_else(|| invalid("日志序号溢出"))?,
+                gap_start: None,
                 segment: 0,
                 stamp: stamp.clone(),
                 event: Event::new("windroid", outcome),

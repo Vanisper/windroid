@@ -42,11 +42,18 @@ pub(crate) fn manifest(dir: &Dir, id: &str, owner: Option<&str>) -> io::Result<M
         return Err(invalid("启动清单与所选来源不符"));
     }
     let mut number = 0;
+    let mut last = 0;
     for seg in &m.segments {
-        if !valid_day(&seg.stamp.day) || seg.number <= number || seg.first > seg.last {
+        if !valid_day(&seg.stamp.day)
+            || seg.number <= number
+            || seg.first > seg.last
+            || seg.first <= last
+            || seg.number == u64::MAX
+        {
             return Err(invalid("日志段索引无效"));
         }
         number = seg.number;
+        last = seg.last;
     }
     Ok(m)
 }
@@ -60,7 +67,7 @@ fn active(dir: &Dir) -> io::Result<bool> {
     }
 }
 /// 不接受未换行的尾项；每个读取缓冲都有上限，即使文件在读到一半时损坏。
-fn records(file: File, mut visit: impl FnMut(Record) -> bool) -> io::Result<()> {
+fn records(file: File, mut visit: impl FnMut(Record) -> bool) -> io::Result<bool> {
     let mut input = BufReader::new(file);
     let mut line = Vec::new();
     loop {
@@ -69,15 +76,18 @@ fn records(file: File, mut visit: impl FnMut(Record) -> bool) -> io::Result<()> 
             .by_ref()
             .take(512 << 10)
             .read_until(b'\n', &mut line)?;
-        if n == 0 || line.last() != Some(&b'\n') {
+        if n == 0 {
             break;
+        }
+        if line.last() != Some(&b'\n') {
+            return Ok(false);
         }
         let row: Record = serde_json::from_slice(&line)?;
         if !visit(row) {
             break;
         }
     }
-    Ok(())
+    Ok(true)
 }
 fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io::Result<Manifest> {
     let mut m = m;
@@ -99,7 +109,7 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
         let bytes = file.metadata()?.len();
         let mut rebuilt: Option<Segment> = None;
         let mut lost = false;
-        records(file, |r| {
+        let intact = records(file, |r| {
             if r.segment != n || parse_segment(&name).is_none_or(|(_, d)| d != r.stamp.day) {
                 return false;
             }
@@ -108,12 +118,13 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
             }
             let seg = rebuilt.get_or_insert_with(|| Segment {
                 number: n,
-                first: r.seq,
+                first: r.gap_start.unwrap_or(r.seq),
                 last: r.seq,
                 stamp: r.stamp.clone(),
                 latest_utc: r.stamp.utc.clone(),
                 bytes,
                 removed: false,
+                unwritten: false,
             });
             seg.last = r.seq;
             if seg.latest_utc < r.stamp.utc {
@@ -137,7 +148,7 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
             });
             m.segments.retain(|s| s.number != n);
             m.segments.push(seg);
-            m.lost |= lost;
+            m.lost |= lost || !intact;
         }
     }
     m.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "日志没有可恢复的完整记录"))
@@ -149,7 +160,8 @@ fn load(dir: &Dir, id: &str, owner: Option<&str>) -> io::Result<(Manifest, bool)
     } else {
         sealed_manifest(dir, id, owner)?
     };
-    Ok((m, active))
+    let capturing = active && !m.sealed && m.ended.is_none();
+    Ok((m, capturing))
 }
 pub(crate) fn sealed_manifest(dir: &Dir, id: &str, owner: Option<&str>) -> io::Result<Manifest> {
     match manifest(dir, id, owner) {
@@ -278,8 +290,10 @@ pub fn read_page(
                 seg.first.max(after + 1),
                 seg.last,
                 seg.stamp.clone(),
-                seg.number,
-                if seg.removed {
+                0,
+                if seg.unwritten {
+                    "采集缺口"
+                } else if seg.removed {
                     "保留期限或容量已清理此段"
                 } else {
                     "此段已不可读"
