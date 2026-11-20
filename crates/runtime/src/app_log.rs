@@ -183,10 +183,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unwritable_log_location_keeps_the_session_and_the_original_file() {
+        let id = AppLog::allocate_id().unwrap();
+        let root = std::env::temp_dir().join(format!("windroid-log-fallback-{id}"));
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("logs/app"), b"existing").unwrap();
+        let session = AppLog::open(&root, &id);
+        assert_eq!(current_id(&root).as_deref(), Some(id.as_str()));
+        assert!(capture_issue(&root, None).is_some());
+        start_attempt(&root, "phone", None);
+        assert_eq!(last_start(&root, "phone"), Some((id, None)));
+        record(
+            &root,
+            Level::Warn,
+            "实例调度",
+            Some("phone"),
+            None,
+            "端口被占用",
+        );
+        session.finish("正常退出");
+        assert!(current_id(&root).is_none());
+        assert_eq!(std::fs::read(root.join("logs/app")).unwrap(), b"existing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn download_diagnostics_omit_credentials_and_query_strings() {
         assert_eq!(
             diagnostic_text(
-                "下载 https://user:password@host/path?token=a 失败 http://other/private"
+                "下载 https://user:example@host/path?token=a 失败 http://other/private"
             ),
             "下载 [URL] 失败 [URL]"
         );
