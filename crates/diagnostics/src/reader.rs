@@ -29,6 +29,7 @@ pub struct RunInfo {
 pub struct Catalog {
     pub runs: Vec<RunInfo>,
     pub legacy: bool,
+    pub issues: Vec<String>,
 }
 
 pub(crate) fn manifest(dir: &Dir, id: &str, owner: Option<&str>) -> io::Result<Manifest> {
@@ -167,11 +168,15 @@ pub(crate) fn sealed_manifest(dir: &Dir, id: &str, owner: Option<&str>) -> io::R
 impl Catalog {
     pub fn load(home: &Path, instance: Option<&str>) -> io::Result<Self> {
         let root = Dir::home(home)?;
+        let mut issues = Vec::new();
         let legacy = if let Some(id) = instance {
             match root.instance(id)?.read("emulator.log") {
                 Ok(_) => true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    issues.push(format!("旧版日志不可读 · {e}"));
+                    false
+                }
             }
         } else {
             false
@@ -179,11 +184,16 @@ impl Catalog {
         let mut runs = Vec::new();
         if let Some(dirs) = optional(root.runs(instance, false))? {
             for id in dirs.names()?.into_iter().filter(|id| valid_run(id)) {
-                let Some(dir) = optional(dirs.sub(&id, false))? else {
-                    continue;
-                };
-                let Some((m, active)) = optional(load(&dir, &id, instance))? else {
-                    continue;
+                let (m, active) = match optional(
+                    dirs.sub(&id, false)
+                        .and_then(|dir| load(&dir, &id, instance)),
+                ) {
+                    Ok(Some(run)) => run,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        issues.push(format!("启动记录 {id} 不可读 · {e}"));
+                        continue;
+                    }
                 };
                 let dates: BTreeSet<_> = m.segments.iter().map(|s| s.stamp.day.clone()).collect();
                 runs.push(RunInfo {
@@ -205,7 +215,12 @@ impl Catalog {
                 .cmp(&a.started.utc)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        Ok(Self { runs, legacy })
+        issues.sort();
+        Ok(Self {
+            runs,
+            legacy,
+            issues,
+        })
     }
 }
 pub(crate) fn optional<T>(r: io::Result<T>) -> io::Result<Option<T>> {

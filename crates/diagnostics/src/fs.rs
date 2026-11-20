@@ -74,6 +74,20 @@ impl Dir {
         }
         Ok(f)
     }
+    /// 即使文件缺少读权限也能计费。链接和非私有文件不属于此库。
+    pub(crate) fn size(&self, name: &str) -> io::Result<u64> {
+        let st = rustix::fs::statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        Ok(
+            if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile
+                && st.st_nlink == 1
+                && st.st_uid == unsafe { libc::geteuid() }
+            {
+                st.st_size.max(0) as u64
+            } else {
+                0
+            },
+        )
+    }
     pub(crate) fn read(&self, name: &str) -> io::Result<File> {
         self.file(name, OFlags::RDONLY)
     }

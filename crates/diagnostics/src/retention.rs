@@ -1,4 +1,4 @@
-//! 全库共用一把预算锁，按完整段预留写入空间。活跃周期的清单只有该周期的
+//! 全库共用一把预算锁，小块预留写入空间。活跃周期的清单只有该周期的
 //! 写者能修改；清理者通过同目录请求通知它回收已封存段。
 use crate::{
     Manifest,
@@ -9,6 +9,7 @@ use crate::{
 use chrono::{SecondsFormat, Utc};
 use rustix::fs::OFlags;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -48,20 +49,17 @@ struct Candidate {
     bytes: u64,
 }
 
-fn sources(root: &Dir) -> io::Result<Vec<Option<String>>> {
-    let mut owners = vec![None];
-    if let Some(instances) = optional(root.sub("instances", false))? {
-        owners.extend(
-            instances
-                .names()?
-                .into_iter()
-                .filter(|n| valid_instance(n) && root.instance(n).is_ok())
-                .map(Some),
-        )
+// 在全库协调锁内先登记即将使用的预算。若以后某个目录失去访问权，仍可
+// 保护它上次登记的额度；恢复访问时以其真实文件和写者锁重新核定。
+type Ledger = BTreeMap<String, BTreeMap<String, u64>>;
+fn sources(root: &Dir, ledger: &Ledger) -> BTreeSet<String> {
+    let mut owners = ledger.keys().cloned().collect::<BTreeSet<_>>();
+    owners.insert(String::new());
+    if let Ok(names) = root.sub("instances", false).and_then(|d| d.names()) {
+        owners.extend(names.into_iter().filter(|n| valid_instance(n)));
     }
-    Ok(owners)
+    owners
 }
-
 fn remove(dir: &Dir, manifest: &mut Manifest, n: u64) -> io::Result<()> {
     let Some(seg) = manifest.segments.iter_mut().find(|s| s.number == n) else {
         return Ok(());
@@ -95,15 +93,123 @@ fn expired(dir: &Dir, parent: &Dir, m: &Manifest) -> io::Result<()> {
     }
     Ok(())
 }
-fn coordinator(home: &Path) -> io::Result<File> {
-    let logs = Dir::home(home)?.sub("logs", true)?;
-    let f = logs.file(".retention.lock", OFlags::RDWR | OFlags::CREATE)?;
+fn coordinator(home: &Path) -> io::Result<(Dir, File)> {
+    let budget = Dir::home(home)?.sub(".diagnostic-budget", true)?;
+    let f = budget.file("lock", OFlags::RDWR | OFlags::CREATE)?;
     f.lock()?;
-    Ok(f)
+    Ok((budget, f))
+}
+struct Inventory<'a> {
+    disk: &'a Disk,
+    cutoff: &'a str,
+    owner: Option<&'a str>,
+    runs: &'a Dir,
+}
+impl Inventory<'_> {
+    fn inspect(&self, id: &str, dir: &Dir, candidates: &mut Vec<Candidate>) -> io::Result<u64> {
+        let mine =
+            id == self.disk.manifest.id && self.owner == self.disk.manifest.instance_id.as_deref();
+        let lock = dir.read("writer.lock")?;
+        let active = match lock.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(e) => return Err(e.into()),
+        };
+        let m = if mine {
+            self.disk.manifest.clone()
+        } else if active {
+            manifest(dir, id, self.owner)?
+        } else {
+            let mut m = sealed_manifest(dir, id, self.owner)?;
+            if !m.sealed && m.ended.is_none() {
+                m.sealed = true;
+                dir.publish("run.json", &serde_json::to_vec(&m)?)?;
+            }
+            m
+        };
+        if !active
+            && m.segments.iter().all(|s| s.removed)
+            && m.ended.as_ref().unwrap_or(&m.started).utc.as_str() < self.cutoff
+        {
+            expired(dir, self.runs, &m)?;
+            return Ok(0);
+        }
+        let current = if mine {
+            self.disk.active_segment()
+        } else if active {
+            m.segments.last().map(|s| s.number)
+        } else {
+            None
+        };
+        let mut total = dir.size("run.json")?;
+        let managed: BTreeSet<_> = m.segments.iter().map(|s| s.filename()).collect();
+        for name in dir.names()? {
+            if crate::parse_segment(&name).is_some() && !managed.contains(&name) {
+                total = total.saturating_add(dir.size(&name)?);
+            }
+        }
+        let mut sealed = Vec::new();
+        for seg in m.segments {
+            let name = seg.filename();
+            if seg.removed && (mine || !active) {
+                optional(dir.remove(&name, false))?;
+            }
+            let size = optional(dir.size(&name))?.unwrap_or_default();
+            if current == Some(seg.number) {
+                total += self.disk.limit.charge(size.max(seg.bytes));
+            } else {
+                total += size;
+                if !seg.removed && size > 0 {
+                    sealed.push(Candidate {
+                        instance: self.owner.map(str::to_owned),
+                        id: id.into(),
+                        number: seg.number,
+                        utc: seg.latest_utc,
+                        bytes: size,
+                    });
+                }
+            }
+        }
+        candidates.append(&mut sealed);
+        Ok(total)
+    }
+}
+fn visible_bytes(dir: &Dir) -> io::Result<u64> {
+    let mut bytes = 0u64;
+    for name in dir.names()? {
+        if name == "run.json" || crate::parse_segment(&name).is_some() {
+            bytes = bytes.saturating_add(dir.size(&name)?);
+        }
+    }
+    Ok(bytes)
+}
+fn reclaim(root: &Dir, disk: &mut Disk, c: &Candidate) -> io::Result<bool> {
+    if c.instance == disk.manifest.instance_id && c.id == disk.manifest.id {
+        remove(&disk.dir, &mut disk.manifest, c.number)?;
+    } else {
+        let dir = root.runs(c.instance.as_deref(), false)?.sub(&c.id, false)?;
+        let lock = dir.read("writer.lock")?;
+        match lock.try_lock() {
+            Ok(()) => {
+                let mut m = manifest(&dir, &c.id, c.instance.as_deref())?;
+                remove(&dir, &mut m, c.number)?;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut pending = requests(&dir)?;
+                if !pending.contains(&c.number) {
+                    pending.push(c.number);
+                    dir.publish("prune.json", &serde_json::to_vec(&pending)?)?;
+                }
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(true)
 }
 /// 创建新段时，调用者持有返回的协调锁直到第一条记录和索引都发布。
 pub(crate) fn maintain(disk: &mut Disk, additional: Option<u64>) -> io::Result<File> {
-    let mut guard = coordinator(&disk.home)?;
+    let (budget, mut guard) = coordinator(&disk.home)?;
     let req = requests(&disk.dir)?;
     for n in &req {
         if disk.active_segment() != Some(*n) {
@@ -128,123 +234,87 @@ pub(crate) fn maintain(disk: &mut Disk, additional: Option<u64>) -> io::Result<F
     let cutoff = (now - chrono::Duration::days(disk.limit.days))
         .to_rfc3339_opts(SecondsFormat::Millis, true);
     let root = Dir::home(&disk.home)?;
-    let mut total = 0;
+    let mut ledger: Ledger = optional(budget.json("usage.json"))?.unwrap_or_default();
     let mut candidates = Vec::new();
-    for owner in sources(&root)? {
-        let Some(runs) = optional(root.runs(owner.as_deref(), false))? else {
-            continue;
+    for scope in sources(&root, &ledger) {
+        let owner = (!scope.is_empty()).then_some(scope.as_str());
+        let runs = match root.runs(owner, false) {
+            Ok(runs) => runs,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // 实例目录消失才释放整项。短暂失去 instance.json 或日志子目录时，
+                // 以前预留的额度仍覆盖无法验证的内容。
+                if owner.is_none()
+                    || owner.is_some_and(|id| {
+                        root.sub("instances", false)
+                            .and_then(|d| d.sub(id, false))
+                            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+                    })
+                {
+                    ledger.remove(&scope);
+                }
+                continue;
+            }
+            Err(_) => continue,
         };
-        for id in runs.names()?.into_iter().filter(|id| valid_run(id)) {
-            let Some(dir) = optional(runs.sub(&id, false))? else {
+        let Ok(names) = runs.names() else { continue };
+        let ids: BTreeSet<_> = names.into_iter().filter(|id| valid_run(id)).collect();
+        let charges = ledger.entry(scope.clone()).or_default();
+        charges.retain(|id, _| ids.contains(id));
+        let scan = Inventory {
+            disk,
+            cutoff: &cutoff,
+            owner,
+            runs: &runs,
+        };
+        for id in ids {
+            let Ok(dir) = runs.sub(&id, false) else {
                 continue;
             };
-            let Some(lock) = optional(dir.read("writer.lock"))? else {
-                continue;
-            };
-            let mine = id == disk.manifest.id && owner == disk.manifest.instance_id;
-            let active = if mine {
-                true
-            } else {
-                match lock.try_lock() {
-                    Ok(()) => false,
-                    Err(std::fs::TryLockError::WouldBlock) => true,
-                    Err(e) => return Err(e.into()),
+            match scan.inspect(&id, &dir, &mut candidates) {
+                Ok(bytes) => {
+                    charges.insert(id, bytes);
                 }
-            };
-            // 清单尚未发布的启动没有占用段预留。已完成周期取得写者锁之后才接手。
-            let m = if mine {
-                disk.manifest.clone()
-            } else if active {
-                let Some(m) = optional(manifest(&dir, &id, owner.as_deref()))? else {
-                    continue;
-                };
-                m
-            } else {
-                // 崩溃可能发生在段创建与发布清单之间。封存索引后，后续预算检查
-                // 可以读索引计费，且失去宿主的退出结果仍保持未知。
-                let Some(mut m) = optional(sealed_manifest(&dir, &id, owner.as_deref()))? else {
-                    continue;
-                };
-                if !m.sealed && m.ended.is_none() {
-                    m.sealed = true;
-                    dir.publish("run.json", &serde_json::to_vec(&m)?)?;
+                Err(_) => {
+                    // 个别清单、锁或段损坏时不接手清理。能 stat 的实际文件和最近
+                    // 的保留额取较大值。单个来源的权限或路径故障不阻断其余来源。
+                    let charge = charges.entry(id).or_default();
+                    *charge = (*charge).max(visible_bytes(&dir).unwrap_or_default());
                 }
-                m
-            };
-            if let Some(index) = optional(dir.read("run.json"))? {
-                total += index.metadata()?.len();
-            }
-            let current = if mine {
-                disk.active_segment()
-            } else if active {
-                m.segments.last().map(|s| s.number)
-            } else {
-                None
-            };
-            if !active
-                && m.segments.iter().all(|s| s.removed)
-                && m.ended.as_ref().unwrap_or(&m.started).utc < cutoff
-            {
-                expired(&dir, &runs, &m)?;
-                continue;
-            }
-            for seg in m.segments {
-                if seg.removed {
-                    // 上一次清理可在发布清单和 unlink 之间中断。
-                    if mine || !active {
-                        optional(dir.remove(&seg.filename(), false))?;
-                    }
-                    continue;
-                }
-                if current == Some(seg.number) {
-                    total += disk.limit.charge(seg.bytes);
-                    continue;
-                }
-                total += seg.bytes;
-                candidates.push(Candidate {
-                    instance: owner.clone(),
-                    id: id.clone(),
-                    number: seg.number,
-                    utc: seg.latest_utc,
-                    bytes: seg.bytes,
-                });
             }
         }
     }
+    let mut total = ledger
+        .values()
+        .flat_map(|runs| runs.values())
+        .fold(0u64, |acc, n| acc.saturating_add(*n));
     let reservation = additional.unwrap_or_default();
     candidates.sort_unstable_by(|a, b| a.utc.cmp(&b.utc));
     for c in candidates {
-        if c.utc >= cutoff && total + reservation <= disk.limit.total {
+        if c.utc >= cutoff && total.saturating_add(reservation) <= disk.limit.total {
             break;
         }
-        if c.instance == disk.manifest.instance_id && c.id == disk.manifest.id {
-            remove(&disk.dir, &mut disk.manifest, c.number)?;
-        } else {
-            let Some(dir) = optional(root.runs(c.instance.as_deref(), false)?.sub(&c.id, false))?
-            else {
-                continue;
-            };
-            let lock = dir.read("writer.lock")?;
-            match lock.try_lock() {
-                Ok(()) => {
-                    let mut m = manifest(&dir, &c.id, c.instance.as_deref())?;
-                    remove(&dir, &mut m, c.number)?;
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    let mut pending = requests(&dir)?;
-                    if !pending.contains(&c.number) {
-                        pending.push(c.number);
-                        dir.publish("prune.json", &serde_json::to_vec(&pending)?)?
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
+        if reclaim(&root, disk, &c).unwrap_or(false) {
+            total = total.saturating_sub(c.bytes);
+            if let Some(n) = ledger
+                .get_mut(c.instance.as_deref().unwrap_or(""))
+                .and_then(|runs| runs.get_mut(&c.id))
+            {
+                *n = n.saturating_sub(c.bytes)
             }
         }
-        total = total.saturating_sub(c.bytes);
     }
-    if additional.is_some() && total + reservation > disk.limit.total {
-        return Err(invalid("日志额度暂时被正在写入的段占用"));
+    let full = additional.is_some() && total.saturating_add(reservation) > disk.limit.total;
+    if !full {
+        let charge = ledger
+            .entry(disk.manifest.instance_id.clone().unwrap_or_default())
+            .or_default()
+            .entry(disk.manifest.id.clone())
+            .or_default();
+        *charge = charge.saturating_add(reservation);
+    }
+    budget.publish("usage.json", &serde_json::to_vec(&ledger)?)?;
+    if full {
+        return Err(invalid("日志额度暂时被保留数据占用"));
     }
     Ok(guard)
 }

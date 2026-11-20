@@ -175,7 +175,8 @@ fn stalled_disk_never_blocks_producers_and_reports_exact_sequence_gap() {
     let home = Home::new();
     let w = RunWriter::app(&home.0).unwrap();
     let id = w.id().to_owned();
-    let g = File::create(home.0.join("logs/.retention.lock")).unwrap();
+    fs::create_dir(home.0.join(".diagnostic-budget")).unwrap();
+    let g = File::create(home.0.join(".diagnostic-budget/lock")).unwrap();
     g.lock().unwrap();
     let sink = w.sink();
     for _ in 0..QUEUE * 3 {
@@ -282,5 +283,92 @@ fn only_host_with_an_actual_exit_can_finalize_dead_collector_history_once() {
             .map(|r| r.source.as_str())
             .collect::<Vec<_>>(),
         ["stderr", "gap", "windroid"]
+    );
+}
+
+#[test]
+fn damaged_neighbours_do_not_hide_valid_runs_or_redirect_writes() {
+    let home = Home::new();
+    let external = Home::new();
+    let one = home.instance("one");
+    let two = home.instance("two");
+    fs::write(one.join("logs"), "不是目录").unwrap();
+    symlink(&external.0, two.join("logs")).unwrap();
+    let bad = RunWriter::app(&home.0).unwrap();
+    let bad_id = bad.id().to_owned();
+    bad.sink().emit(Event::new("windroid", "原记录"));
+    bad.finish("退出").unwrap();
+    let index = home.0.join("logs/app").join(&bad_id).join("run.json");
+    let mut poisoned: serde_json::Value =
+        serde_json::from_reader(File::open(&index).unwrap()).unwrap();
+    poisoned["id"] = "wrong-owner".into();
+    fs::write(&index, serde_json::to_vec(&poisoned).unwrap()).unwrap();
+    let good = RunWriter::app(&home.0).unwrap();
+    let good_id = good.id().to_owned();
+    good.sink()
+        .emit(Event::new("windroid", "实例采集目录不可用"));
+    good.finish("退出").unwrap();
+    let catalog = Catalog::load(&home.0, None).unwrap();
+    assert_eq!(catalog.runs.len(), 1);
+    assert_eq!(catalog.runs[0].id, good_id);
+    assert_eq!(catalog.issues.len(), 1);
+    assert!(catalog.issues[0].contains(&bad_id));
+    assert_eq!(
+        read_page(&home.0, None, &good_id, None, 0, 8)
+            .unwrap()
+            .records[0]
+            .text,
+        "实例采集目录不可用"
+    );
+    assert_eq!(fs::read_dir(&external.0).unwrap().count(), 0);
+    assert_eq!(
+        fs::read(index).unwrap(),
+        serde_json::to_vec(&poisoned).unwrap()
+    );
+}
+
+#[test]
+fn unreachable_owner_keeps_its_reserved_bytes_while_other_runs_can_use_the_rest() {
+    let home = Home::new();
+    let owner = home.instance("one");
+    let id = new_run_id().unwrap();
+    let limits = retention::Limits {
+        segment: 2048,
+        total: 3800,
+        days: 14,
+    };
+    let mut prior = Disk::open(&home.0, Some("one"), None, &id, limits).unwrap();
+    prior.write_row(row(1, Stamp::now(), "protected")).unwrap();
+    drop(prior);
+    fs::rename(owner.join("logs"), owner.join("hidden")).unwrap();
+    fs::write(owner.join("logs"), "原位置无法访问").unwrap();
+    let id = new_run_id().unwrap();
+    let mut other = Disk::open(&home.0, None, None, &id, limits).unwrap();
+    assert!(other.write_row(row(1, Stamp::now(), "over quota")).is_err());
+    other.limit.total = 7000;
+    other
+        .write_row(row(2, Stamp::now(), "still accessible"))
+        .unwrap();
+    other.save().unwrap();
+    let page = read_page(&home.0, None, &id, None, 0, 4).unwrap();
+    assert_eq!(page.records[0].source, "gap");
+    assert_eq!(page.records[1].text, "still accessible");
+}
+
+#[test]
+fn emulator_can_write_when_application_log_tree_is_unusable() {
+    let home = Home::new();
+    home.instance("one");
+    fs::write(home.0.join("logs"), "unavailable").unwrap();
+    let id = new_run_id().unwrap();
+    let w = RunWriter::emulator(&home.0, "one", None, &id).unwrap();
+    w.sink().emit(Event::new("stderr", "ready"));
+    w.finish("退出").unwrap();
+    assert_eq!(
+        read_page(&home.0, Some("one"), &id, None, 0, 4)
+            .unwrap()
+            .records[0]
+            .text,
+        "ready"
     );
 }
