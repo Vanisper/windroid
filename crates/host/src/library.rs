@@ -25,6 +25,7 @@ use crate::{
 
 mod batch;
 mod commands;
+mod diagnostics;
 mod first_page;
 mod hardware;
 mod observation;
@@ -282,6 +283,7 @@ impl Library {
             call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
         });
         self.connect_batch();
+        self.connect_diagnostics();
         self.connect_hardware();
         self.connect_resources();
         self.connect_storage();
