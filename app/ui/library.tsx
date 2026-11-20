@@ -2,7 +2,7 @@ import { computed, effect, Scroll, signal, Text, View, windowSize } from "nsh";
 import { Tab, Tabs } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, confirmation, Detail, Heading, Indicator, row, Title } from "./controls";
-import { busy, can, currentId, dropApk, report, running, selected, send, snapshot, switching, type Action, type AppItem, type RunningApp } from "./model";
+import { busy, can, currentId, dropApk, notice, openStartLog, report, running, selected, send, snapshot, switching, type Action, type AppItem, type RunningApp } from "./model";
 
 const points: Record<string, string> = { process: "模拟器进程", adb: "设备连接", activity: "activity 服务", package: "package 服务", window: "window 服务" };
 
@@ -47,6 +47,7 @@ function LifecycleButtons() {
   return <View style={row}>
     {startable() ? <Button id="start" label={snapshot()?.frozen ? "恢复实例" : snapshot()?.state === "failed" ? "重新启动" : "启动实例"}
       primary disabled={busy() || !can("start")} tooltip={can("start") ? undefined : "请先准备运行环境"} press={() => act("start", "启动实例")} /> : null}
+    {selected()?.state === "failed" && !notice()?.startFailed ? <Button id="failed-emulator-logs" label="查看启动日志" press={() => { const id = currentId(); if (id) void openStartLog(id); }} /> : null}
     {can("stop") ? <Button id="stop" label="停止实例" disabled={busy()} press={() => act("stop", "停止实例")} /> : null}
   </View>;
 }

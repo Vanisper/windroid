@@ -2,6 +2,7 @@ import { cleanup, host, Scroll, signal, Text, View } from "nsh";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
 import { openGuide, settingsTab } from "./model";
+import { LogReader } from "./logs";
 import { Storage } from "./storage";
 
 const choices = { ask: "每次询问", background: "保留后台", quit: "完全退出" };
@@ -74,9 +75,7 @@ export function Settings() {
       }</Each>
     </View>
     <Scroll testID="workspace-scroll" style={{ flex: 1, minHeight: 0 }}>
-    {settingsTab() === "window" ? <WindowSettingsPanel /> : settingsTab() === "storage" ? <Storage /> : <View style={card()}>
-      <Heading text="应用日志" /><Detail text="在终端直接运行 Windroid 可执行文件，可以看到写入标准错误的应用日志。" />
-    </View>}
+    {settingsTab() === "window" ? <WindowSettingsPanel /> : settingsTab() === "storage" ? <Storage /> : <LogReader instanceId={null} />}
     </Scroll>
   </View>;
 }

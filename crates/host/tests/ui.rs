@@ -2140,3 +2140,164 @@ fn batch_controls_drive_the_instance_lanes_and_leave_the_unselected_guest_ready(
         "ready"
     );
 }
+
+/// 经过工作区标记、真实实例清单、写者和读取桥，验证两个原生入口只展示各自的来源。
+#[test]
+fn native_log_entries_keep_history_paging_and_same_named_instances_separate() {
+    use windroid_diagnostics::{Event, RunWriter, new_run_id};
+    let home = std::env::temp_dir().join(format!("windroid-ui-logs-{}", new_run_id().unwrap()));
+    runtime::workspace::open(&home).unwrap();
+    let layout = runtime::Layout { root: home.clone() };
+    let store = runtime::instances::InstanceStore::new(layout.clone());
+    let spec = Spec {
+        template: "compact-720".into(),
+        image: Image {
+            revision: 14,
+            api: 34,
+            tag: "google_apis_playstore".into(),
+            abi: "arm64-v8a".into(),
+        },
+        disk_bytes: 6 << 30,
+    };
+    let a = store.create("工作机", spec.clone()).unwrap().id.to_string();
+    let b = store.create("工作机", spec).unwrap().id.to_string();
+    let old_app = RunWriter::app(&home).unwrap();
+    let first = old_app.id().to_owned();
+    old_app
+        .sink()
+        .emit(Event::new("windroid", "第一次 Windroid 启动"));
+    old_app.finish("正常退出").unwrap();
+    let app = RunWriter::app(&home).unwrap();
+    let current = app.id().to_owned();
+    let mut warning = Event::new("windroid", "启动前检查拒绝 · 端口已占用");
+    warning.instance_id = Some(b.clone());
+    app.sink().emit(warning);
+    app.finish("正常退出").unwrap();
+    let run_a = new_run_id().unwrap();
+    let emu = RunWriter::emulator(&home, &a, Some(&current), &run_a).unwrap();
+    for n in 1..=25 {
+        emu.sink()
+            .emit(Event::new("stdout", format!("实例 A 的输出 {n}")));
+    }
+    emu.finish("退出码 0").unwrap();
+    std::fs::write(
+        home.join("instances").join(&a).join("emulator.log"),
+        "升级前的输出",
+    )
+    .unwrap();
+
+    let config = config();
+    let (commands, _windows) = mpsc::channel();
+    let (_events, events_rx) = mpsc::channel();
+    let library =
+        host::Library::attach(config.host.clone(), layout, false, commands, events_rx).unwrap();
+    let mut ui = render(config);
+    wait(&mut ui, "id:library");
+    press(&mut ui, "show-settings");
+    press(&mut ui, "settings-logs");
+    wait(&mut ui, &format!("id:log-line-{first}-1"));
+    wait(&mut ui, "text:启动前检查拒绝 · 端口已占用");
+    press(&mut ui, &format!("open-log-run-{first}"));
+    wait(&mut ui, "text:第一次 Windroid 启动");
+    gone(&mut ui, "text:启动前检查拒绝 · 端口已占用");
+
+    press(&mut ui, "all-instances");
+    press(&mut ui, &format!("manage-{a}"));
+    wait(&mut ui, "id:manage-instance");
+    press(&mut ui, "manage-more");
+    press(&mut ui, "emulator-logs");
+    wait(&mut ui, "text:实例 A 的输出 1");
+    press(&mut ui, &format!("log-next-{run_a}"));
+    wait(&mut ui, "text:实例 A 的输出 25");
+    gone(&mut ui, "text:实例 A 的输出 1");
+    press(&mut ui, &format!("log-back-{run_a}"));
+    wait(&mut ui, "text:实例 A 的输出 1");
+    press(&mut ui, "logs-legacy");
+    wait(&mut ui, "text:旧版日志 · 启动时间未知");
+    wait(&mut ui, "text:升级前的输出");
+    press(&mut ui, "log-return");
+    wait(&mut ui, "id:manage-instance");
+    press(&mut ui, "manage-back");
+    press(&mut ui, &format!("manage-{b}"));
+    wait(&mut ui, "id:manage-instance");
+    press(&mut ui, "manage-more");
+    press(&mut ui, "emulator-logs");
+    wait(&mut ui, "id:logs-empty");
+    gone(&mut ui, "id:logs-legacy");
+    gone(&mut ui, &format!("id:log-run-{run_a}"));
+    library.shutdown();
+    drop(ui);
+    drop(library);
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn a_rejected_start_opens_its_app_run_and_follow_preserves_the_selected_day() {
+    let mut view = ready_view();
+    view["operation"] =
+        json!({"instanceId":"a","message":"端口已占用","failed":true,"startFailed":true,"seq":1});
+    let mut ui = Scripted::new(view, |_, _| unreachable!());
+    let next_day = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let clock = next_day.clone();
+    ui.channel.handle("windroid.logs", move |call| {
+        use std::sync::atomic::Ordering;
+        let q = call.data();
+        if q["kind"] == "lastStart" {
+            assert_eq!(q["instanceId"], "a");
+            return call.resolve(json!({"appRunId":"current","emulatorRunId":null}));
+        }
+        assert_eq!(q["source"], "app");
+        let first = json!({"day":"2026-11-18","local":"2026-11-18T23:59:59+08:00"});
+        let second = json!({"day":"2026-11-19","local":"2026-11-19T00:00:01+08:00"});
+        let midnight = clock.load(Ordering::Acquire);
+        let value = match q["kind"].as_str().unwrap() {
+            "catalog" => {
+                let days = if midnight { json!([second["day"], first["day"]]) } else { json!([first["day"]]) };
+                json!({"runs":[{"id":"current","started":first,"dates":days,"active":true}],
+                    "legacy":false, "issue":null})
+            }
+            "page" => {
+                assert_eq!(q["runId"], "current");
+                let after = q["after"].as_u64().unwrap();
+                let mut rows = vec![];
+                for (n, stamp, msg) in [(1, &first, "拦截了 A"), (2, &second, "A 检查完成")] {
+                    if n > after && (n == 1 || midnight) && (q["day"].is_null() || q["day"] == stamp["day"]) {
+                        rows.push(json!({"seq":n,"stamp":stamp,"segment":n,"source":"windroid","text":msg,"instanceId":"a","continued":false}));
+                    }
+                }
+                json!({"records":rows,"more":false})
+            }
+            kind => panic!("未预期的日志请求 {kind}"),
+        };
+        call.resolve(value);
+    });
+
+    wait(&mut ui.app, "id:open-start-log");
+    press(&mut ui.app, "open-start-log");
+    wait(&mut ui.app, "id:open-log-day-1");
+    wait(&mut ui.app, "text:拦截了 A");
+    press(&mut ui.app, "open-log-day-1");
+    wait(&mut ui.app, "id:open-log-run-current");
+    press(&mut ui.app, "logs-follow");
+    wait(&mut ui.app, "text:暂停跟读");
+    next_day.store(true, std::sync::atomic::Ordering::Release);
+    press(&mut ui.app, "logs-refresh");
+    wait(&mut ui.app, "id:logs-choose >> text:/2026-11-18/");
+    press(&mut ui.app, "logs-choose");
+    // 日期列表已经增加，读者仍留在原日期。
+    assert!(
+        ui.app
+            .menu()
+            .unwrap()
+            .iter()
+            .any(|m| m.label == "2026-11-19")
+    );
+    choose(&mut ui.app, "2026-11-18");
+    gone(&mut ui.app, "text:A 检查完成");
+    press(&mut ui.app, "open-log-run-current");
+    wait(&mut ui.app, "text:拦截了 A");
+    wait(&mut ui.app, "text:A 检查完成");
+    wait(&mut ui.app, "id:open-log-day-2");
+    press(&mut ui.app, "logs-follow");
+    wait(&mut ui.app, "text:跟读");
+}

@@ -3,8 +3,9 @@ import { Button, colors, ConfirmDialog, Detail, narrow, Title } from "./ui/contr
 import { CreateInstance } from "./ui/instances";
 import { Guide } from "./ui/guide";
 import { Inventory, ManageInstance } from "./ui/inventory";
+import { EmulatorLogs } from "./ui/logs";
 import { Library } from "./ui/library";
-import { connect, currentId, firstPageShown, instancePage, loadError, messageText, notice, openInstance, pendingLabel, refresh, screen, snapshot, type Message } from "./ui/model";
+import { connect, currentId, firstPageShown, instancePage, loadError, messageText, notice, openInstance, openStartLog, pendingLabel, refresh, screen, snapshot, type Message } from "./ui/model";
 import { Environment } from "./ui/preparation";
 import { LicenseDialog } from "./ui/resources";
 import { Settings } from "./ui/settings";
@@ -19,6 +20,8 @@ function Feedback() {
     {pendingLabel() ? <Detail id="pending" text={pendingLabel() + "…"} /> : null}
     <If when={visible()}>{note => <View style={{ gap: 5 }}>
       <Text testID="notice" role={note().failed ? "alert" : undefined} style={{ userSelect: "text", fontSize: 13, color: note().failed ? colors().bad : colors().accent }}>{messageText(note())}</Text>
+      {note().startFailed && note().instanceId && screen() !== "emulatorLogs" ? <Button id="open-start-log" label="查看启动日志"
+        press={() => void openStartLog(note().instanceId!)} /> : null}
       {note().installError?.detail ? <Button id="toggle-install-diagnostic" label={expanded() === note() ? "收起诊断" : "查看原始诊断"}
         press={() => expanded.set(expanded() === note() ? null : note())} /> : null}
       {expanded() === note() ? <Text testID="install-diagnostic" style={{ userSelect: "text", fontSize: 12, color: colors().muted }}>{note().installError?.detail}</Text> : null}
@@ -41,7 +44,7 @@ function Workspace() {
       {page() === "loading" ? <Title text={loadError() ? "无法连接应用库" : "正在读取应用库…"} /> :
         <View onLayout={firstPageShown} style={{ minWidth: 0 }}>
           {page() === "environment" ? <Environment /> : page() === "create" ? <CreateInstance /> :
-            page() === "guide" ? <Guide /> : page() === "manage" ? <ManageInstance /> :
+            page() === "guide" ? <Guide /> : page() === "emulatorLogs" ? <EmulatorLogs /> : page() === "manage" ? <ManageInstance /> :
               <Library onManage={() => { const id = currentId(); if (id) void openInstance(id, "manage"); }} />}
         </View>}
     </Scroll>}

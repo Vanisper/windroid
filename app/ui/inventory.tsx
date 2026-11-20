@@ -3,7 +3,7 @@ import { BatchActions, SelectInstance, visibleJob } from "./batch";
 import { Button, card, colors, confirmation, Detail, Heading, row, Title } from "./controls";
 import { HardwareFields, hardwareDraft, hardwareLimits, rendererName } from "./hardware";
 import { DeviceControls } from "./library";
-import { activeTransfer, busy, can, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, send, snapshot, startCreation, switching, type BatchResult, type Instance, type InstanceConfig } from "./model";
+import { activeTransfer, busy, can, describeImage, environmentReady, images, instances, instanceState, managementBack, navigate, openEmulatorLogs, openEnvironment, openGuide, openInstance, openStorage, preparation, selected, send, snapshot, startCreation, switching, type BatchResult, type Instance, type InstanceConfig } from "./model";
 
 const unknown = "未知";
 const cores = (n?: number | null) => n == null ? unknown : n + " 核";
@@ -143,10 +143,6 @@ export function ManageInstance() {
       detail: cold ? "将跳过快照启动，保留已安装的应用和文件。" : "将结束当前会话，再启动此实例。",
       action: () => { void send({ kind: cold ? "coldRestart" : "restart", instanceId: item.id }, label); } });
   }
-  const logPath = computed(() => {
-    const home = snapshot()?.storage?.home;
-    return home && selected() ? home + "/instances/" + selected()!.id + "/emulator.log" : null;
-  });
   const observed = computed(() => selected()?.observed);
   return <View testID="manage-instance" style={{ gap: 16 }}>
     <Button id="manage-back" label={managementBack() === "library" ? "返回应用面板" : "返回全部实例"} press={() => navigate(managementBack())} />
@@ -174,9 +170,7 @@ export function ManageInstance() {
         {restartable() ? <Button id="restart-instance" label="重新启动…" disabled={busy() || !environmentReady()} press={() => confirmRestart(false)} /> : null}
         {restartable() || can("start") ? <Button id="cold-restart" label="冷启动…" disabled={busy() || !environmentReady()} press={() => confirmRestart(true)} /> : null}
       </View>
-      <Heading text="模拟器日志" />
-      {logPath() ? <Text style={{ userSelect: "text", fontSize: 13, color: colors().ink }}>{logPath()}</Text> : null}
-      <Detail text="每次启动模拟器都会覆盖上一次的日志。" />
+      <Button id="emulator-logs" label="模拟器日志" press={() => openEmulatorLogs()} />
     </View> : null}
   </View>;
 }

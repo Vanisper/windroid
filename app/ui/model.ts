@@ -46,7 +46,7 @@ export interface Preparation {
   currentComponent: string | null; error: string | null;
 }
 interface InstallError { code: string; detail: string }
-export interface Message { instanceId: string | null; message: string; failed: boolean; seq?: number; installError?: InstallError }
+export interface Message { instanceId: string | null; message: string; failed: boolean; seq?: number; startFailed?: boolean; installError?: InstallError }
 
 // 错误分类来自宿主的 ErrorCode，拖入和原生文件面板共用一份面向用户的解释。
 const installReasons: Readonly<Record<string, string | undefined>> = {
@@ -129,10 +129,38 @@ export function pickResource(kind: "imageZip" | "runtimeDirectory" | "imageDirec
 export const can = (key: Capability) => currentId() !== null && snapshot()?.capabilities?.[key] === true
   && (key !== "start" || environmentReady());
 
-type Screen = "instances" | "library" | "manage" | "create" | "environment" | "settings" | "guide";
+type Screen = "instances" | "library" | "manage" | "create" | "environment" | "settings" | "guide" | "emulatorLogs";
 export const screen = signal<Screen>("instances");
-export const instancePage = computed(() => screen() === "library" || screen() === "manage");
+export const instancePage = computed(() => screen() === "library" || screen() === "manage" || screen() === "emulatorLogs");
 export const managementBack = signal<"library" | "instances">("instances");
+export const logOrigin = signal<"manage" | "library">("manage");
+let requestedLog: { instance: string | null; run: string | null } | null = null;
+export function takeRequestedLog(instance: string | null) {
+  const target = requestedLog;
+  requestedLog = null;
+  return target?.instance === instance ? target : null;
+}
+export function openEmulatorLogs() {
+  logOrigin.set(screen() === "library" ? "library" : "manage");
+  navigate("emulatorLogs");
+}
+export async function openStartLog(id: string) {
+  const request = navigation;
+  try {
+    const last = await host.call<{ appRunId: string; emulatorRunId: string | null } | null>("windroid.logs", {
+      source: "emulator", instanceId: id, kind: "lastStart",
+    });
+    if (request !== navigation || currentId() !== id) return;
+    if (last && !last.emulatorRunId) {
+      requestedLog = { instance: null, run: last.appRunId };
+      settingsTab.set("logs");
+      navigate("settings");
+    } else {
+      requestedLog = { instance: id, run: last?.emulatorRunId ?? null };
+      openEmulatorLogs();
+    }
+  } catch (e) { if (request === navigation) report("无法读取启动记录 · " + String(e), true, id); }
+}
 type GuideOrigin = "first" | "instances" | "settings";
 export const guideOrigin = signal<GuideOrigin>("instances");
 export function openGuide(origin: GuideOrigin) {
@@ -257,7 +285,8 @@ export async function send(cmd: Command, label: string): Promise<boolean> {
       const reason = r?.kind === "wrongState" && r.current
         ? "当前" + stateName[r.current] + (r.wanted ? "，需要" + r.wanted : "")
         : r?.kind === "notReady" ? "实例尚未就绪" : r?.detail || "宿主未提供原因";
-      report(label + "失败 · " + reason, true, cmd.kind === "selectInstance" ? null : instanceId);
+      remember({ instanceId: cmd.kind === "selectInstance" ? null : instanceId, failed: true,
+        message: label + "失败 · " + reason, startFailed: ["start", "restart", "coldRestart"].includes(cmd.kind) });
       return false;
     }
     // 清除数据没有独立的结果事件，回执只说明请求已提交。
