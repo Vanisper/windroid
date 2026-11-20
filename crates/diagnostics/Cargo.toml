@@ -1,0 +1,14 @@
+[package]
+name = "windroid-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windroid 与各模拟器启动周期的私有诊断历史。"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+serde.workspace = true
+serde_json.workspace = true

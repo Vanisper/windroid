@@ -7347,6 +7347,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "windroid-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "windroid-locations"
 version = "0.1.0"
 dependencies = [
