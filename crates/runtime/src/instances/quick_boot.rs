@@ -9,12 +9,12 @@ use std::path::Path;
 const STALE: &str = ".hardware-snapshot-stale";
 const DISK_SYNCED: &str = ".guest-disk-synced";
 
-/// 跳过快照也会跳过 Android 内存中的脏页。旧版本只确认快照写完，未确认客户机刷盘。
+/// 跳过快照会丢弃其中尚未写回用户分区的内存页。先核对这份快照的刷盘或失效凭证。
 pub(super) fn allow_skip(dir: &Path, record: &InstanceRecord) -> io::Result<()> {
     let Some(snapshot) = stamp(dir, record)? else {
         return Ok(());
     };
-    // 已因改配明确失效的同一份快照不能再正常恢复。早期空标记亦沿用其原有的跳过语义。
+    // 改配时已核实这份快照可以跳过，并保存了它的签名。
     if requires_cold_start(dir, record)? {
         return Ok(());
     }
@@ -37,7 +37,7 @@ pub(super) fn requires_cold_start(dir: &Path, record: &InstanceRecord) -> io::Re
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    Ok(stamp(dir, record)?.is_some_and(|snapshot| marker.is_empty() || marker == snapshot))
+    Ok(stamp(dir, record)?.is_some_and(|snapshot| marker == snapshot))
 }
 
 fn write_stamp(dir: &Path, name: &str, stamp: &str) -> io::Result<()> {
@@ -171,11 +171,11 @@ mod tests {
         assert!(allow_skip(&dir, &record).is_err());
         record_save(&dir, &record, None, true).unwrap();
         allow_skip(&dir, &record).unwrap();
-        // 兼容只记录「这份快照已因改配失效」的早期空标记。
         fs::remove_file(dir.join(DISK_SYNCED)).unwrap();
         fs::write(dir.join(STALE), "").unwrap();
-        assert!(requires_cold_start(&dir, &record).unwrap());
-        allow_skip(&dir, &record).unwrap();
+        assert!(!requires_cold_start(&dir, &record).unwrap());
+        assert!(allow_skip(&dir, &record).is_err());
+        assert!(invalidate(&dir, &record).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }
