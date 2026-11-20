@@ -1,14 +1,14 @@
 import { cleanup, computed, effect, host, signal, Text, View } from "nsh";
 import { Menu } from "nsh/desktop";
 import { Button, card, colors, Detail, Heading, row, Title } from "./controls";
-import { currentId, logOrigin, navigate, selected, takeRequestedLog } from "./model";
+import { currentId, instances, logOrigin, navigate, selected, takeRequestedLog } from "./model";
 
 interface Stamp { local: string; day: string }
 interface Run {
   id: string; started: Stamp; active: boolean; ended: Stamp | null; outcome: string | null;
   dates: string[]; lost: boolean; appRunId: string | null;
 }
-interface Catalog { runs: Run[]; legacy: boolean; issue: string | null }
+interface Catalog { runs: Run[]; legacy: boolean; issue: string | null; issues: string[] }
 interface Entry {
   seq: number; stamp: Stamp; segment: number; source: string; level: string | null; component: string | null;
   text: string; continued: boolean; instanceId: string | null; emulatorRunId: string | null;
@@ -36,8 +36,9 @@ function stampText(stamp: Stamp) {
   return stamp.local.replace("T", " ");
 }
 function metadata(entry: Entry) {
+  const name = entry.instanceId ? instances().find(item => item.id === entry.instanceId)?.name : null;
   const source = [entry.source, entry.level, entry.component, entry.continued ? "续行" : "",
-    entry.instanceId ? "实例 " + entry.instanceId : "", entry.emulatorRunId ? "模拟器启动 " + entry.emulatorRunId : "",
+    entry.instanceId ? "实例 " + (name ? name + " · " : "") + entry.instanceId : "", entry.emulatorRunId ? "模拟器启动 " + entry.emulatorRunId : "",
   ].filter(Boolean).join(" · ");
   return "#" + entry.seq + "  " + stampText(entry.stamp) + "  " + source;
 }
@@ -47,7 +48,7 @@ const startLabel = (run: Run) => stampText(run.started) + " 启动";
 
 function LogRun(props: {
   instanceId: string | null; run: Run; day: string | null; refresh: number; follow: boolean;
-  openDay: (day: string) => void; openRun: (run: string) => void;
+  pause: () => void; openDay: (day: string) => void; openRun: (run: string) => void;
 }) {
   const instance = props.instanceId, runId = props.run.id, day = props.day;
   const key = JSON.stringify([instance, runId, day]);
@@ -63,7 +64,7 @@ function LogRun(props: {
   const atStart = signal(after === 0);
   cleanup(() => { active = false; });
 
-  async function load(cursor: number, append = false) {
+  async function load(cursor: number, append = false, pages?: number[]) {
     if (working()) { pendingRefresh = true; return; }
     working.set(true);
     try {
@@ -77,6 +78,7 @@ function LogRun(props: {
       more.set(page.more);
       atStart.set(after === 0);
       rememberCursor(key, after);
+      if (pages) history.set(pages);
       error.set("");
       loaded.set(true);
     } catch (e) { if (active) error.set("读取记录失败 · " + String(e)); }
@@ -109,13 +111,13 @@ function LogRun(props: {
   function pageNext() {
     const last = records().at(-1);
     if (!last || working()) return;
-    history.update(pages => [...pages, after]);
-    void load(last.seq);
+    props.pause();
+    void load(last.seq, false, [...history(), after]);
   }
   function pageBack() {
     const pages = history();
-    history.set(pages.slice(0, -1));
-    void load(pages.at(-1) ?? 0);
+    props.pause();
+    void load(pages.at(-1) ?? 0, false, pages.slice(0, -1));
   }
   async function reveal(seq: number) {
     try { await read(instance, { kind: "reveal", runId, seq }); }
@@ -255,6 +257,9 @@ export function LogReader(props: { instanceId: string | null }) {
       {filter().mode !== "legacy" ? <Button id="logs-follow" label={follow() ? "暂停跟读" : "跟读"} press={() => { follow.set(!follow()); if (follow()) void refresh(); }} /> : null}
     </View>
     {error() ? <Text testID="logs-error" role="alert" style={{ color: colors().bad }}>{error()}</Text> : null}
+    <Each of={catalog()?.issues} key={message => message}>{message =>
+      <Text testID="log-history-issue" role="alert" accessibilityLabel={message()} style={{ userSelect: "text", color: colors().warn }}>{message()}</Text>
+    }</Each>
     {catalog()?.issue ? <Text testID="capture-issue" role="alert" style={{ color: colors().warn }}>{"日志采集不可用或有缺口 · " + catalog()!.issue}</Text> : null}
     {filter().mode === "legacy" && instance ? <LegacyLog instanceId={instance} /> : <View style={{ gap: 12 }}>
       {(byDay() ? days().length : runs().length) ? <Button id="logs-choose" label={(byDay() ? filter().day || "选择日期" :
@@ -263,10 +268,10 @@ export function LogReader(props: { instanceId: string | null }) {
       <Each of={visible().slice(0, groupLimit()).map(run => ({ run, day: byDay() ? filter().day : null }))}
         key={g => g.run.id + "/" + g.day}>{group =>
         <LogRun instanceId={instance} run={group().run} day={group().day} refresh={revision()} follow={follow()}
-          openDay={day => choose({ mode: "day", day })} openRun={run => choose({ mode: "run", run })} />
+          pause={() => follow.set(false)} openDay={day => choose({ mode: "day", day })} openRun={run => choose({ mode: "run", run })} />
       }</Each>
       {visible().length > groupLimit() ? <Button id="logs-more-runs" label="更多启动记录" press={() => groupLimit.update(n => n + 4)} /> : null}
-      {!error() && catalog() && !visible().length ? <Detail id="logs-empty" accessible text={target?.run && filter().run === target.run ? "此次启动没有可读取的持久化记录。" : runs().length ? "所选范围没有保留的记录。" :
+      {!error() && catalog() && !visible().length ? <Detail id="logs-empty" accessible text={catalog()?.issues?.length ? "所选范围没有可读取的记录。" : target?.run && filter().run === target.run ? "此次启动没有可读取的持久化记录。" : runs().length ? "所选范围没有保留的记录。" :
         instance ? "暂无模拟器启动记录。启动前被拦截的原因可在「设置 → 应用日志」查看。" : "暂无应用启动记录。"} /> : null}
     </View>}
   </View>;

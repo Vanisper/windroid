@@ -2186,6 +2186,9 @@ fn native_log_entries_keep_history_paging_and_same_named_instances_separate() {
     )
     .unwrap();
 
+    // 模拟一个无法打开的启动目录，同一应用其他健康启动仍应可分别读取。
+    let damaged = new_run_id().unwrap();
+    std::fs::write(home.join("logs/app").join(&damaged), "损坏的目录项").unwrap();
     let config = config();
     let (commands, _windows) = mpsc::channel();
     let (_events, events_rx) = mpsc::channel();
@@ -2195,6 +2198,7 @@ fn native_log_entries_keep_history_paging_and_same_named_instances_separate() {
     wait(&mut ui, "id:library");
     press(&mut ui, "show-settings");
     press(&mut ui, "settings-logs");
+    wait(&mut ui, &format!("text:/{damaged}/"));
     wait(&mut ui, &format!("id:log-line-{first}-1"));
     wait(&mut ui, "text:启动前检查拒绝 · 端口已占用");
     press(&mut ui, &format!("open-log-run-{first}"));
@@ -2254,7 +2258,7 @@ fn a_rejected_start_opens_its_app_run_and_follow_preserves_the_selected_day() {
             "catalog" => {
                 let days = if midnight { json!([second["day"], first["day"]]) } else { json!([first["day"]]) };
                 json!({"runs":[{"id":"current","started":first,"dates":days,"active":true}],
-                    "legacy":false, "issue":null})
+                    "legacy":false, "issue":if midnight { Some("写入暂时受限") } else { None }})
             }
             "page" => {
                 assert_eq!(q["runId"], "current");
@@ -2282,6 +2286,7 @@ fn a_rejected_start_opens_its_app_run_and_follow_preserves_the_selected_day() {
     wait(&mut ui.app, "text:暂停跟读");
     next_day.store(true, std::sync::atomic::Ordering::Release);
     press(&mut ui.app, "logs-refresh");
+    wait(&mut ui.app, "id:capture-issue");
     wait(&mut ui.app, "id:logs-choose >> text:/2026-11-18/");
     press(&mut ui.app, "logs-choose");
     // 日期列表已经增加，读者仍留在原日期。

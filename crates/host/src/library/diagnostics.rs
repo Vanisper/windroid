@@ -95,7 +95,7 @@ impl Library {
             && !matches!(query, Query::LastStart)
         {
             return match query {
-                Query::Catalog => Ok(json!({"runs":[],"legacy":false,"issue":null})),
+                Query::Catalog => Ok(json!({"runs":[],"legacy":false,"issue":null,"issues":[]})),
                 _ => Err(io::Error::new(io::ErrorKind::NotFound, "没有持久化日志")),
             };
         }
@@ -111,7 +111,9 @@ impl Library {
                     ),
                     None => e,
                 })?;
-                Ok(json!({"runs":catalog.runs,"legacy":catalog.legacy,"issue":issue}))
+                Ok(
+                    json!({"runs":catalog.runs,"legacy":catalog.legacy,"issue":issue,"issues":catalog.issues}),
+                )
             }
             Query::Page {
                 run_id,
