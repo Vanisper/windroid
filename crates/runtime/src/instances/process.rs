@@ -10,7 +10,7 @@ use contract::{GuestAllocation, InstanceId};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -74,6 +74,7 @@ pub(crate) struct OwnedEmulator {
     child: Child,
     launched: SystemTime,
     pid_file: PathBuf,
+    temporary: PathBuf,
     _lease: File,
     reservation: Reservation,
     pub resources: Arc<SessionResources>,
@@ -217,8 +218,23 @@ impl OwnedEmulator {
         }
         super::quick_boot::clear(&dir)?;
         let pid_file = dir.join("active.pid");
+        // 37.2.13 的 QEMU 按 TMPDIR/netsim.ini 的 grpc.port 发现网络服务。
+        // 每轮用新目录，异常退出遗留的地址也无法指向后来复用端口的其他实例。
+        // https://android.googlesource.com/platform/external/qemu/+/8aaadeb1fea1202b287f1b8361f764a98950a27e/android/third_party/netsim/backend/packet_streamer_client.cc
+        let temp_root = dir.join("tmp");
+        super::private_dir(&temp_root)?;
+        let temporary = temp_root.join(super::nonce()?);
+        fs::DirBuilder::new().mode(0o700).create(&temporary)?;
+        cmd.env("TMPDIR", &temporary)
+            .env_remove("NETSIM_INSTANCE")
+            .env_remove("NETSIM_ARGS")
+            .args([
+                "-netsim-args",
+                "--grpc-port=0 --hci-port=0 --tcp-port=0 --ws-port=0",
+            ]);
         let launched = SystemTime::now();
         let child = cmd.spawn().map_err(|e| {
+            let _ = fs::remove_dir(&temporary);
             io::Error::new(
                 e.kind(),
                 format!("无法启动 {}：{e}", paths.emulator.display()),
@@ -229,6 +245,7 @@ impl OwnedEmulator {
             child,
             launched,
             pid_file,
+            temporary,
             _lease: lease,
             reservation,
             resources,
@@ -395,6 +412,9 @@ impl Drop for OwnedEmulator {
         match self.stop(StopMode::Force) {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
+                if let Err(e) = fs::remove_dir_all(&self.temporary) {
+                    log::warn!("无法清理实例 {} 的本轮临时目录：{e}", self.record.id);
+                }
                 let _ = self.reservation.file.unlock();
             }
             Err(e) => log::warn!("回收实例 {} 时无法确认进程退出：{e}", self.record.id),
