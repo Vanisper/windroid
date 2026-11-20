@@ -314,3 +314,73 @@ fn batch_stop_reports_process_exit_after_a_ready_guest_dies() {
     assert_eq!(preview["items"][0]["eligible"], false);
     assert_eq!(preview["items"][0]["reason"], "模拟器进程已退出");
 }
+
+#[test]
+fn only_executed_start_requests_persist_the_instance_and_refusal() {
+    struct Refuse(device::FakeBackend);
+    impl device::Backend for Refuse {
+        fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if matches!(cmd, Command::Start) {
+                return Err(error("端口对 5554/5555 正被占用"));
+            }
+            self.0.exec(cmd, facts)
+        }
+        fn observe(&mut self, facts: &mut Facts) {
+            self.0.observe(facts);
+        }
+        fn abort(&mut self, facts: &mut Facts) {
+            self.0.abort(facts);
+        }
+    }
+    let run_id = runtime::app_log::AppLog::allocate_id().unwrap();
+    let root = std::env::temp_dir().join(format!("windroid-command-log-{run_id}"));
+    std::fs::create_dir(&root).unwrap();
+    let logs = runtime::app_log::AppLog::open(&root, &run_id);
+    let (windows, _) = mpsc::channel();
+    let lib = Library::new(
+        HostChannel::new(),
+        Layout { root: root.clone() },
+        true,
+        windows,
+        false,
+    );
+    let id = "blocked";
+    add_backend(
+        &lib,
+        id,
+        Refuse(device::FakeBackend::new()),
+        Default::default(),
+    );
+
+    assert!(
+        lib.perform(&json!({"kind":"start", "instanceId":id}))
+            .is_err()
+    );
+    let preview = lib
+        .preview_batch(&json!({"action":"start","scope":"all","ids":[id]}))
+        .unwrap();
+    assert_eq!(preview["items"][0]["eligible"], true);
+    let checked = lib
+        .preview_batch(&json!({"previewId":preview["previewId"]}))
+        .unwrap();
+    commit(&lib, &checked).unwrap();
+    assert_eq!(result(&lib)["items"][0]["status"], "failed");
+    logs.finish("正常退出");
+    let dir = root.join("logs/app").join(run_id);
+    let mut components = Vec::new();
+    for file in std::fs::read_dir(dir).unwrap().flatten() {
+        if file.path().extension().is_some_and(|ext| ext == "jsonl") {
+            for line in std::fs::read_to_string(file.path()).unwrap().lines() {
+                let row: JsonValue = serde_json::from_str(line).unwrap();
+                if row["instanceId"] == id {
+                    assert!(row["text"].as_str().unwrap().contains("端口对 5554/5555"));
+                    assert!(row["emulatorRunId"].is_null());
+                    components.push(row["component"].clone());
+                }
+            }
+        }
+    }
+    assert_eq!(components, vec![json!("实例调度"), json!("批量调度")]);
+    assert!(!root.join("instances").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}

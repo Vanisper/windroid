@@ -3,6 +3,45 @@ use crate::actions::{self, Kind};
 
 impl Library {
     pub(super) fn perform(self: &Arc<Self>, data: &JsonValue) -> Reply {
+        self.perform_logged(data, "实例调度")
+    }
+
+    pub(super) fn perform_logged(self: &Arc<Self>, data: &JsonValue, component: &str) -> Reply {
+        let operation = match data["kind"].as_str() {
+            Some("start") => "启动",
+            Some("restart") => "重新启动",
+            Some("coldRestart") => "冷启动",
+            Some("stop") => "停止",
+            _ => return self.dispatch(data),
+        };
+        let id = data["instanceId"].as_str();
+        if operation != "停止"
+            && let Some(id) = id
+        {
+            runtime::app_log::start_attempt(&self.layout.root, id, None);
+        }
+        let result = self.dispatch(data);
+        let (level, message) = match &result {
+            Ok(_) => (log::Level::Info, format!("{operation}请求已执行")),
+            Err(reason) => (
+                log::Level::Warn,
+                format!("{operation}请求失败：{}", rejection_message(reason)),
+            ),
+        };
+        runtime::app_log::record(
+            &self.layout.root,
+            level,
+            component,
+            id,
+            id.and_then(|id| runtime::app_log::last_start(&self.layout.root, id))
+                .and_then(|(_, run)| run)
+                .as_deref(),
+            &message,
+        );
+        result
+    }
+
+    fn dispatch(self: &Arc<Self>, data: &JsonValue) -> Reply {
         if self.stopping.load(Ordering::Acquire) {
             return Err(error("应用库正在退出"));
         }

@@ -510,10 +510,17 @@ fn rejection_note(kind: Option<&str>, reason: &Rejection) -> JsonValue {
     {
         return json!({"failed":true,"message":"APK 安装未完成","installError":{"code":code,"detail":detail}});
     }
-    let message = match reason {
+    let mut note = json!({"failed":true,"message":rejection_message(reason)});
+    if matches!(kind, Some("start" | "restart" | "coldRestart")) {
+        note["startFailed"] = true.into();
+    }
+    note
+}
+
+fn rejection_message(reason: &Rejection) -> String {
+    match reason {
         Rejection::Error { detail, .. } => detail.clone(),
         Rejection::NotReady { .. } => "实例尚未就绪".into(),
         Rejection::WrongState { wanted, .. } => format!("此操作需要{wanted}的实例"),
-    };
-    json!({"failed":true,"message":message})
+    }
 }
