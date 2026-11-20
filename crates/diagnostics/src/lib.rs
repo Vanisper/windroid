@@ -6,7 +6,10 @@ mod writer;
 
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 pub use fs::new_run_id;
-pub use reader::{Catalog, Page, RunInfo, legacy_page, read_page, reveal_path};
+pub use reader::{
+    Catalog, LocatedFile, Page, RunInfo, legacy_page, open_legacy_file, open_segment_file,
+    read_page,
+};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 pub use writer::{RunWriter, Sink, record_interruption};

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Catalog, legacy_page, read_page, reveal_path};
+use crate::{Catalog, legacy_page, open_segment_file, read_page};
 use chrono::DateTime;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
@@ -73,7 +73,7 @@ fn capture_time_controls_midnight_silence_clock_rollback_and_paging() {
         date.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
         [1, 5]
     );
-    let file = reveal_path(&home.0, None, Some(&id), false, Some(5)).unwrap();
+    let file = open_segment_file(&home.0, None, &id, 5).unwrap().path;
     assert!(file.ends_with("000004-2030-10-31.jsonl"));
     assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
     assert_eq!(
@@ -152,7 +152,7 @@ fn rebuilds_after_incomplete_manifest_and_tail_without_inferring_an_exit() {
     let id = writer.id().to_owned();
     writer.sink().emit(Event::new("windroid", "完整"));
     writer.finish("ok").unwrap();
-    let p = reveal_path(&home.0, None, Some(&id), false, Some(1)).unwrap();
+    let p = open_segment_file(&home.0, None, &id, 1).unwrap().path;
     File::options()
         .append(true)
         .open(&p)
@@ -220,7 +220,9 @@ fn retention_uses_utc_and_keeps_the_active_segment_and_legacy() {
         .unwrap();
     retention::maintain(&mut disk, None).unwrap();
     assert!(!disk.manifest.segments[0].removed);
-    let old_file = reveal_path(&home.0, Some("one"), Some(&id), false, Some(1)).unwrap();
+    let old_file = open_segment_file(&home.0, Some("one"), &id, 1)
+        .unwrap()
+        .path;
     disk.write_row(row(2, Stamp::now(), "新")).unwrap();
     assert!(disk.manifest.segments[0].removed);
     assert!(!old_file.exists());

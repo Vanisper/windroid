@@ -1,9 +1,14 @@
 //! 只接受当前工作区内的来源标识。所有目录扫描、分页读取与 Finder 定位都在
 //! 同一个后台队列完成；慢盘不会占用引擎线程或实例的启停队列。
 use super::{Arc, HostCall, JsonValue, Library, json, mpsc, thread};
+use objc2::rc::Retained;
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSArray, NSString, NSURL};
 use serde::Deserialize;
-use std::{io, path::Path, process::Command};
-use windroid_diagnostics::{Catalog, legacy_page, read_page, reveal_path};
+use std::{fs::File, io, os::fd::AsRawFd};
+use windroid_diagnostics::{
+    Catalog, LocatedFile, legacy_page, open_legacy_file, open_segment_file, read_page,
+};
 
 #[derive(Deserialize)]
 #[serde(
@@ -128,35 +133,55 @@ impl Library {
                 let (text, next, more) = legacy_page(home, legacy_instance()?, offset, 16 * 1024)?;
                 Ok(json!({"text":text, "next":next, "more":more}))
             }
-            Query::Reveal { run_id, seq } => reveal(&reveal_path(
-                home,
-                instance,
-                Some(&run_id),
-                false,
-                Some(seq),
-            )?),
+            Query::Reveal { run_id, seq } => {
+                reveal(open_segment_file(home, instance, &run_id, seq)?)
+            }
             Query::LastStart => {
                 let result = instance
                     .and_then(|id| runtime::app_log::last_start(home, id))
                     .map(|(app, emulator)| json!({"appRunId":app, "emulatorRunId":emulator}));
                 Ok(json!(result))
             }
-            Query::RevealLegacy => reveal(&reveal_path(
-                home,
-                Some(legacy_instance()?),
-                None,
-                true,
-                None,
-            )?),
+            Query::RevealLegacy => reveal(open_legacy_file(home, legacy_instance()?)?),
         }
     }
 }
 
-fn reveal(path: &Path) -> io::Result<JsonValue> {
-    let status = Command::new("/usr/bin/open").arg("-R").arg(path).status()?;
-    if status.success() {
+// 由仍持有的描述符构造文件引用 URL。Finder 按文件身份选中，目录在交接时更名也可识别。
+// https://developer.apple.com/documentation/foundation/nsurl/filereferenceurl()
+fn file_reference(file: &File) -> Option<Retained<NSURL>> {
+    let descriptor = NSString::from_str(&format!("/dev/fd/{}", file.as_raw_fd()));
+    NSURL::fileURLWithPath(&descriptor).fileReferenceURL()
+}
+fn reveal(location: LocatedFile) -> io::Result<JsonValue> {
+    objc2::rc::autoreleasepool(|_| {
+        let reference = file_reference(&location.file).ok_or_else(|| {
+            io::Error::other(format!("无法定位日志文件 · {}", location.path.display()))
+        })?;
+        NSWorkspace::sharedWorkspace()
+            .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[reference]));
         Ok(JsonValue::Null)
-    } else {
-        Err(io::Error::other(format!("Finder 未能定位文件（{status}）")))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn finder_reference_follows_the_open_file_when_its_name_changes() {
+        let home = std::env::temp_dir().join(windroid_diagnostics::new_run_id().unwrap());
+        std::fs::create_dir(&home).unwrap();
+        let path = home.join("first");
+        let file = File::create_new(&path).unwrap();
+        let reference = file_reference(&file).unwrap();
+        let moved = home.join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        File::create_new(&path).unwrap();
+        let resolved = reference.filePathURL().unwrap().path().unwrap().to_string();
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            moved.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

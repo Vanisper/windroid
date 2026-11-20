@@ -289,7 +289,7 @@ pub fn legacy_page(
     offset: u64,
     limit: usize,
 ) -> io::Result<(String, u64, bool)> {
-    let mut file = Dir::home(home)?.instance(id)?.read("emulator.log")?;
+    let mut file = open_legacy_file(home, id)?.file;
     let size = file.metadata()?.len();
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
@@ -310,39 +310,41 @@ pub fn legacy_page(
         next < size,
     ))
 }
-pub fn reveal_path(
+/// 位置用于错误提示，已校验的句柄用于文件管理器定位。两者在打开时属于同一对象。
+pub struct LocatedFile {
+    pub path: PathBuf,
+    pub file: File,
+}
+
+pub fn open_legacy_file(home: &Path, id: &str) -> io::Result<LocatedFile> {
+    let file = Dir::home(home)?.instance(id)?.read("emulator.log")?;
+    Ok(LocatedFile {
+        file,
+        path: home.join("instances").join(id).join("emulator.log"),
+    })
+}
+
+pub fn open_segment_file(
     home: &Path,
     instance: Option<&str>,
-    id: Option<&str>,
-    legacy: bool,
-    seq: Option<u64>,
-) -> io::Result<PathBuf> {
-    let home = home.to_path_buf();
-    let root = Dir::home(&home)?;
-    if legacy {
-        let id = instance.ok_or_else(|| invalid("旧日志需要实例标识"))?;
-        root.instance(id)?.read("emulator.log")?;
-        return Ok(home.join("instances").join(id).join("emulator.log"));
-    }
-    root.runs(instance, false)?;
-    let mut path = match instance {
+    id: &str,
+    seq: u64,
+) -> io::Result<LocatedFile> {
+    let dir = run(home, instance, id)?;
+    let (m, _) = load(&dir, id, instance)?;
+    let seg = m
+        .segments
+        .iter()
+        .find(|s| s.first <= seq && seq <= s.last && !s.removed)
+        .ok_or_else(|| invalid("所选日志段已清理"))?;
+    let name = seg.filename();
+    let file = dir.read(&name)?;
+    let root = match instance {
         None => home.join("logs/app"),
         Some(i) => home.join("instances").join(i).join("logs/emulator"),
     };
-    if let Some(id) = id {
-        let dir = run(&home, instance, id)?;
-        let (m, _) = load(&dir, id, instance)?;
-        path.push(id);
-        if let Some(seq) = seq {
-            let seg = m
-                .segments
-                .iter()
-                .find(|s| s.first <= seq && seq <= s.last && !s.removed)
-                .ok_or_else(|| invalid("所选日志段已清理"))?;
-            let name = seg.filename();
-            dir.read(&name)?;
-            path.push(name);
-        }
-    }
-    Ok(path)
+    Ok(LocatedFile {
+        file,
+        path: root.join(id).join(name),
+    })
 }
