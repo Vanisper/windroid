@@ -27,7 +27,7 @@ impl Library {
                     && let Some((watching, tx)) = &lib.state.lock().unwrap().batch_observer
                     && watching == &id
                 {
-                    let _ = tx.send(event);
+                    let _ = tx.send(batch::Update::Device(event));
                 }
                 lib.notify();
             }

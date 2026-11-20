@@ -126,7 +126,39 @@ enum PreviewRequest {
     },
 }
 
+pub(super) enum Update {
+    Device(contract::Event),
+    Replacing {
+        before: u64,
+        accepted: mpsc::Receiver<()>,
+    },
+}
+
 impl Library {
+    /// 重启可从 Stalled 直接跳到下一轮 Starting。先为其回执在事件流中占位，
+    /// 才能在原会话被替换时截断等待；若预检拒绝，仍按原会话的后续事件结算。
+    pub(super) fn observe_batch_replacement(
+        &self,
+        instance: &Instance,
+    ) -> Option<mpsc::Sender<()>> {
+        let state = self.state.lock().unwrap();
+        let (id, observer) = state.batch_observer.as_ref()?;
+        if id != instance.handle.id().as_str() {
+            return None;
+        }
+        let snap = instance.handle.snapshot();
+        if !matches!(snap.state, State::Starting | State::Stalled) {
+            return None;
+        }
+        let (ack, accepted) = mpsc::channel();
+        observer
+            .send(Update::Replacing {
+                before: snap.seq,
+                accepted,
+            })
+            .ok()?;
+        Some(ack)
+    }
     pub(super) fn connect_batch(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         self.channel.handle("windroid.previewBatch", move |call| {
@@ -428,19 +460,25 @@ fn reason_text(reason: &Rejection) -> String {
         .into()
 }
 
-fn wait_for_outcome(action: Action, seq: u64, events: mpsc::Receiver<contract::Event>) -> Outcome {
+fn wait_for_outcome(action: Action, seq: u64, events: mpsc::Receiver<Update>) -> Outcome {
     // 设备域负责启动硬上限和回收。再留两轮观测接收最终事件，丢失回执也有明确终态。
     let timeout = device::Timeouts::default();
     let deadline = Instant::now() + timeout.hard + 2 * timeout.poll;
     while let Ok(event) = events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        let contract::Event::StateChanged {
-            seq: changed,
-            to,
-            facts,
-            ..
-        } = event
-        else {
-            continue;
+        let (changed, to, facts) = match event {
+            Update::Device(contract::Event::StateChanged { seq, to, facts, .. }) => {
+                (seq, to, facts)
+            }
+            Update::Replacing { before, accepted } if before >= seq => {
+                if accepted
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_ok()
+                {
+                    return Outcome::new(Status::Failed, "本次启动已被重新启动替换");
+                }
+                continue;
+            }
+            _ => continue,
         };
         if changed < seq {
             continue;

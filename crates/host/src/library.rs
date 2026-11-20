@@ -69,7 +69,7 @@ struct ViewState {
     selected: Option<String>,
     batch: Option<batch::Job>,
     /// 从设备事件中确认本次命令的终态。游标使之前一轮的迟到事件无法结算本轮。
-    batch_observer: Option<(String, mpsc::Sender<contract::Event>)>,
+    batch_observer: Option<(String, mpsc::Sender<batch::Update>)>,
     instances: BTreeMap<String, Instance>,
     operations: BTreeMap<String, JsonValue>,
     /// 已经打开或正在创建的窗口分别记账，连续打开计一次配额。

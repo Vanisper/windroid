@@ -174,7 +174,15 @@ impl Library {
                 if kind == "install" {
                     self.note(Some(id), false, "正在安装 APK…");
                 }
+                let replacing = if matches!(command, Command::Restart { .. }) {
+                    self.observe_batch_replacement(&instance)
+                } else {
+                    None
+                };
                 let seq = self.device(&instance, command)?;
+                if let Some(accepted) = replacing {
+                    let _ = accepted.send(());
+                }
                 match kind {
                     "start" | "restart" | "coldRestart" => {
                         if kind != "start" && snap.facts.process_alive {

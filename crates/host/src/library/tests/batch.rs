@@ -207,3 +207,58 @@ fn a_start_ack_is_not_success_when_the_guest_dies_or_times_out() {
     commit(&lib, &retry).unwrap();
     assert_eq!(result(&lib)["items"][0]["status"], "failed");
 }
+
+#[test]
+fn restart_during_a_stalled_batch_start_cannot_complete_the_original_boot() {
+    struct ReplaceBoot {
+        inner: device::FakeBackend,
+        reject: bool,
+    }
+    impl device::Backend for ReplaceBoot {
+        fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if matches!(cmd, Command::Restart { .. }) {
+                if self.reject {
+                    self.reject = false;
+                    return Err(error("本轮重启预检失败"));
+                }
+                self.inner = device::FakeBackend::new();
+            }
+            self.inner.exec(cmd, facts)
+        }
+        fn observe(&mut self, facts: &mut Facts) {
+            self.inner.observe(facts);
+        }
+        fn abort(&mut self, facts: &mut Facts) {
+            self.inner.abort(facts);
+        }
+    }
+    let (lib, _) = library();
+    let id = "slow-boot";
+    add_backend(
+        &lib,
+        id,
+        ReplaceBoot {
+            inner: device::FakeBackend::new().stalling(),
+            reject: true,
+        },
+        device::Timeouts {
+            services: Duration::from_millis(60),
+            poll: Duration::from_millis(10),
+            ..Default::default()
+        },
+    );
+    let plan = lib
+        .preview_batch(&json!({"action":"start","scope":"all","ids":[id]}))
+        .unwrap();
+    commit(&lib, &plan).unwrap();
+    let handle = lib.state.lock().unwrap().instances[id].handle.clone();
+    until(|| handle.snapshot().state == State::Stalled);
+    let restart = json!({"kind":"restart","instanceId":id});
+    assert!(lib.perform(&restart).is_err());
+    assert_eq!(lib.snapshot()["batch"]["active"], true);
+    lib.perform(&restart).unwrap();
+    let job = result(&lib);
+    assert_eq!(job["items"][0]["status"], "failed");
+    assert_eq!(job["items"][0]["message"], "本次启动已被重新启动替换");
+    until(|| handle.snapshot().state == State::Ready);
+}
