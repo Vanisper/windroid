@@ -26,10 +26,13 @@ impl Action {
     }
 
     fn skip_reason(self, snap: &Snapshot) -> String {
-        if self == Self::Start && snap.state.accepts_stream() {
-            "已在运行".into()
-        } else {
-            crate::describe(snap.state, snap.phase, &snap.facts)
+        match (self, snap.state) {
+            (Self::Start, State::Ready | State::Streaming) => "已在运行".into(),
+            (Self::Stop, State::Failed) if snap.facts.aborted => {
+                "启动超时，模拟器进程已退出".into()
+            }
+            (Self::Stop, State::Failed) => "模拟器进程已退出".into(),
+            _ => crate::describe(snap.state, snap.phase, &snap.facts),
         }
     }
 }

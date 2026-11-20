@@ -262,3 +262,55 @@ fn restart_during_a_stalled_batch_start_cannot_complete_the_original_boot() {
     assert_eq!(job["items"][0]["message"], "本次启动已被重新启动替换");
     until(|| handle.snapshot().state == State::Ready);
 }
+
+#[test]
+fn batch_stop_reports_process_exit_after_a_ready_guest_dies() {
+    struct CrashAfterReady {
+        inner: device::FakeBackend,
+        crash: Arc<AtomicBool>,
+    }
+    impl device::Backend for CrashAfterReady {
+        fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            self.inner.exec(cmd, facts)
+        }
+        fn observe(&mut self, facts: &mut Facts) {
+            if self.crash.load(Ordering::Acquire) {
+                self.inner.abort(facts);
+            } else {
+                self.inner.observe(facts);
+            }
+        }
+        fn abort(&mut self, facts: &mut Facts) {
+            self.inner.abort(facts);
+        }
+    }
+    let (lib, _) = library();
+    let id = "exited";
+    let crash = Arc::new(AtomicBool::new(false));
+    add_backend(
+        &lib,
+        id,
+        CrashAfterReady {
+            inner: device::FakeBackend::new(),
+            crash: crash.clone(),
+        },
+        Default::default(),
+    );
+    let instance = ready(&lib, id);
+    let request = json!({"scope":"selected","action":"stop","ids":[id]});
+    let plan = lib.preview_batch(&request).unwrap();
+    assert_eq!(plan["items"][0]["eligible"], true);
+    crash.store(true, Ordering::Release);
+    until(|| instance.handle.snapshot().state == State::Failed);
+    commit(&lib, &plan).unwrap();
+    let receipt = result(&lib);
+    assert_eq!(receipt["items"][0]["status"], "skipped");
+    assert_eq!(receipt["items"][0]["message"], "模拟器进程已退出");
+    assert!(
+        lib.preview_batch(&json!({"retryOf":receipt["jobId"]}))
+            .is_err()
+    );
+    let preview = lib.preview_batch(&request).unwrap();
+    assert_eq!(preview["items"][0]["eligible"], false);
+    assert_eq!(preview["items"][0]["reason"], "模拟器进程已退出");
+}
