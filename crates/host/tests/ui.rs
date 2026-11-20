@@ -2166,7 +2166,15 @@ fn native_log_entries_keep_history_paging_and_same_named_instances_separate() {
     old_app
         .sink()
         .emit(Event::new("windroid", "第一次 Windroid 启动"));
+    old_app.sink().emit(Event::new("windroid", "历史尾行"));
     old_app.finish("正常退出").unwrap();
+    // 清单已发布两行，模拟存储在封存后丢失最后一行。
+    let segment = windroid_diagnostics::open_segment_file(&home, None, &first, 2)
+        .unwrap()
+        .path;
+    let bytes = std::fs::read(&segment).unwrap();
+    let first_end = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+    std::fs::write(segment, &bytes[..first_end]).unwrap();
     let app = RunWriter::app(&home).unwrap();
     let current = app.id().to_owned();
     let mut warning = Event::new("windroid", "启动前检查拒绝 · 端口已占用");
@@ -2200,9 +2208,12 @@ fn native_log_entries_keep_history_paging_and_same_named_instances_separate() {
     press(&mut ui, "settings-logs");
     wait(&mut ui, &format!("text:/{damaged}/"));
     wait(&mut ui, &format!("id:log-line-{first}-1"));
+    let gap = "text:清单已登记，但完整日志行缺失（序号 2–2，共 1 条）";
+    wait(&mut ui, gap);
     wait(&mut ui, "text:启动前检查拒绝 · 端口已占用");
     press(&mut ui, &format!("open-log-run-{first}"));
     wait(&mut ui, "text:第一次 Windroid 启动");
+    wait(&mut ui, gap);
     gone(&mut ui, "text:启动前检查拒绝 · 端口已占用");
 
     press(&mut ui, "all-instances");

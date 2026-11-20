@@ -42,6 +42,9 @@ function metadata(entry: Entry) {
   ].filter(Boolean).join(" · ");
   return "#" + entry.seq + "  " + stampText(entry.stamp) + "  " + source;
 }
+function describeRecords(summary: string, entries: Entry[]) {
+  return [summary, ...entries.map(entry => metadata(entry) + "  " + entry.text)].join("\n");
+}
 
 const stateText = (run: Run) => run.outcome ?? (run.active ? "采集中" : "退出原因未知");
 const startLabel = (run: Run) => stampText(run.started) + " 启动";
@@ -126,7 +129,9 @@ function LogRun(props: {
 
   return <View testID={"log-run-" + runId} style={card()}>
     <View style={row}>
-      {day ? <Button id={"open-log-run-" + runId} label={startLabel(props.run)} accessibleValue={identity() + " · " + stateText(props.run)} press={() => props.openRun(runId)} /> :
+      {day ? <Button id={"open-log-run-" + runId} label={startLabel(props.run)}
+        accessibleValue={describeRecords(identity() + " · " + stateText(props.run), records().filter(entry => entry.segment === 0))}
+        press={() => props.openRun(runId)} /> :
         <Heading text={startLabel(props.run)} />}
       <Detail text={stateText(props.run)} accessible />
     </View>
@@ -134,10 +139,12 @@ function LogRun(props: {
     {props.run.lost ? <Detail text="部分记录已清理或采集有缺口。" accessible /> : null}
     <Each of={chunks()} key={g => g.records[0].seq}>{group => <View style={{ minWidth: 0, gap: 5 }}>
       <View style={row}>
-        {!day ? <Button id={"open-log-day-" + group().records[0].seq} label={group().day} press={() => props.openDay(group().day)} /> : null}
+        {!day ? <Button id={"open-log-day-" + group().records[0].seq} label={group().day}
+          accessibleValue={group().segment === 0 ? describeRecords(identity(), group().records) : undefined}
+          press={() => props.openDay(group().day)} /> : null}
         {group().segment > 0 ? <Button id={"log-file-" + runId + "-" + group().segment}
           label={"第 " + group().segment + " 段 · 在 Finder 中显示"}
-          accessibleValue={[identity(), ...group().records.map(entry => metadata(entry) + "  " + entry.text)].join("\n")} press={() => void reveal(group().records[0].seq)} /> : null}
+          accessibleValue={describeRecords(identity(), group().records)} press={() => void reveal(group().records[0].seq)} /> : null}
       </View>
       <Each of={group().records} key={entry => entry.seq}>{entry =>
         <View style={{ minWidth: 0, gap: 2, borderTopWidth: 1, borderColor: colors().line, paddingVertical: 5 }}>

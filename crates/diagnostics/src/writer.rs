@@ -48,7 +48,7 @@ impl Sink {
     pub fn emit(&self, event: Event) {
         self.capture(event, Stamp::now)
     }
-    fn capture(&self, mut event: Event, stamp: impl FnOnce() -> Stamp) {
+    pub(super) fn capture(&self, mut event: Event, stamp: impl FnOnce() -> Stamp) {
         if event.text.len() > TEXT_LIMIT {
             let end = event.text.floor_char_boundary(TEXT_LIMIT);
             event.text = format!("{} [文本已截断]", &event.text[..end]);

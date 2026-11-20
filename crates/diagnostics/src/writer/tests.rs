@@ -194,8 +194,20 @@ fn stalled_disk_never_blocks_producers_and_reports_exact_sequence_gap() {
     let p = read_page(&home.0, None, &id, None, 0, 500).unwrap();
     let last = p.records.last().unwrap();
     assert_eq!(last.seq as usize, QUEUE * 3);
-    assert_eq!(last.source, "gap");
-    assert!(p.records.len() <= QUEUE + 2);
+    assert!(p.records.iter().any(|r| r.source == "gap"));
+    // 写者可在生产者已经丢过一批记录后才取走第一条，此时会有两个缺口。
+    // 队列容量约束保留的输出条数，缺口记录另行核对完整的序号范围。
+    let retained = p.records.iter().filter(|r| r.source != "gap").count();
+    assert!(retained <= QUEUE + 1);
+    let mut next = 1;
+    for row in &p.records {
+        assert!(row.segment > 0);
+        assert_eq!(row.source == "gap", row.gap_start.is_some());
+        assert_eq!(row.gap_start.unwrap_or(row.seq), next);
+        assert!(row.seq >= next);
+        next = row.seq + 1;
+    }
+    assert_eq!(next as usize, QUEUE * 3 + 1);
     assert!(Catalog::load(&home.0, None).unwrap().runs[0].lost);
 }
 

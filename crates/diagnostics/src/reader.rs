@@ -67,9 +67,10 @@ fn active(dir: &Dir) -> io::Result<bool> {
     }
 }
 /// 不接受未换行的尾项；每个读取缓冲都有上限，即使文件在读到一半时损坏。
-fn records(file: File, mut visit: impl FnMut(Record) -> bool) -> io::Result<bool> {
+fn records(file: impl Read, mut visit: impl FnMut(Record) -> bool) -> io::Result<bool> {
     let mut input = BufReader::new(file);
     let mut line = Vec::new();
+    let mut intact = true;
     loop {
         line.clear();
         let n = input
@@ -80,14 +81,28 @@ fn records(file: File, mut visit: impl FnMut(Record) -> bool) -> io::Result<bool
             break;
         }
         if line.last() != Some(&b'\n') {
-            return Ok(false);
+            intact = false;
+            // 超长损坏行也要消费至下一行，保留它后面仍可读的记录。
+            input.skip_until(b'\n')?;
+            continue;
         }
-        let row: Record = serde_json::from_slice(&line)?;
+        let Ok(row) = serde_json::from_slice::<Record>(&line) else {
+            intact = false;
+            continue;
+        };
+        if row.seq == 0
+            || row
+                .gap_start
+                .is_some_and(|start| start == 0 || start > row.seq || row.source != "gap")
+        {
+            intact = false;
+            continue;
+        }
         if !visit(row) {
             break;
         }
     }
-    Ok(true)
+    Ok(intact)
 }
 fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io::Result<Manifest> {
     let mut m = m;
@@ -99,9 +114,13 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
     names.sort_unstable();
     let last = m.as_ref().and_then(|m| m.segments.last().map(|s| s.number));
     for (n, name) in names {
-        if last.is_some_and(|last| n < last)
-            || m.as_ref()
-                .is_some_and(|m| m.segments.iter().any(|s| s.number == n && s.removed))
+        if n == u64::MAX
+            || last.is_some_and(|last| n < last)
+            || m.as_ref().is_some_and(|m| {
+                m.segments
+                    .iter()
+                    .any(|s| s.number == n && (s.removed || s.filename() != name))
+            })
         {
             continue;
         }
@@ -109,13 +128,18 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
         let bytes = file.metadata()?.len();
         let mut rebuilt: Option<Segment> = None;
         let mut lost = false;
+        let mut previous = m
+            .as_ref()
+            .and_then(|m| m.segments.iter().rev().find(|s| s.number < n))
+            .map_or(0, |s| s.last);
+        let day = parse_segment(&name).unwrap().1;
         let intact = records(file, |r| {
-            if r.segment != n || parse_segment(&name).is_none_or(|(_, d)| d != r.stamp.day) {
-                return false;
+            if r.segment != n || r.stamp.day != day || r.gap_start.unwrap_or(r.seq) <= previous {
+                lost = true;
+                return true;
             }
-            if r.source == "gap" {
-                lost = true
-            }
+            lost |= r.source == "gap" || (previous != 0 && r.seq - 1 != previous);
+            previous = r.seq;
             let seg = rebuilt.get_or_insert_with(|| Segment {
                 number: n,
                 first: r.gap_start.unwrap_or(r.seq),
@@ -146,8 +170,23 @@ fn recover(dir: &Dir, id: &str, owner: Option<&str>, m: Option<Manifest>) -> io:
                 lost: false,
                 sealed: false,
             });
-            m.segments.retain(|s| s.number != n);
-            m.segments.push(seg);
+            if let Some(published) = m.segments.iter_mut().find(|s| s.number == n) {
+                // 清单可能落后于段的最后完整行，也可能在文件后来受损前已经发布更多记录。
+                // 恢复只扩展已知范围，使分页仍能指出其中缺失的序号。
+                lost |= seg.first > published.first
+                    || seg.last < published.last
+                    || seg.bytes < published.bytes;
+                published.first = published.first.min(seg.first);
+                published.last = published.last.max(seg.last);
+                published.bytes = published.bytes.max(seg.bytes);
+                if published.latest_utc < seg.latest_utc {
+                    published.latest_utc = seg.latest_utc;
+                }
+            } else {
+                m.segments.push(seg);
+            }
+        }
+        if let Some(m) = &mut m {
             m.lost |= lost || !intact;
         }
     }
@@ -196,10 +235,10 @@ impl Catalog {
         let mut runs = Vec::new();
         if let Some(dirs) = optional(root.runs(instance, false))? {
             for id in dirs.names()?.into_iter().filter(|id| valid_run(id)) {
-                let (m, active) = match optional(
-                    dirs.sub(&id, false)
-                        .and_then(|dir| load(&dir, &id, instance)),
-                ) {
+                let (dir, m, active) = match optional(dirs.sub(&id, false).and_then(|dir| {
+                    let (m, active) = load(&dir, &id, instance)?;
+                    Ok((dir, m, active))
+                })) {
                     Ok(Some(run)) => run,
                     Ok(None) => continue,
                     Err(e) => {
@@ -215,7 +254,14 @@ impl Catalog {
                     outcome: m.outcome,
                     active,
                     dates: dates.into_iter().rev().collect(),
-                    lost: m.lost || m.segments.iter().any(|s| s.removed),
+                    lost: m.lost
+                        || m.segments.iter().any(|s| {
+                            s.removed
+                                || match dir.size(&s.filename()) {
+                                    Ok(bytes) => bytes < s.bytes,
+                                    Err(e) => e.kind() == io::ErrorKind::NotFound,
+                                }
+                        }),
                     instance_id: m.instance_id,
                     app_run_id: m.app_run_id,
                 });
@@ -253,6 +299,54 @@ pub struct Page {
     pub records: Vec<Record>,
     pub more: bool,
 }
+/// 每页仅核对清单已经发布的范围。完整的采集缺口行自身可覆盖多个序号；
+/// 合成缺口占一个分页位置，以末序号接续下一页。开头被游标截去的范围不重放。
+fn read_published(
+    file: File,
+    seg: &Segment,
+    after: u64,
+    limit: usize,
+    rows: &mut Vec<Record>,
+) -> io::Result<()> {
+    let missing = |first, last| {
+        Record::gap(
+            first,
+            last,
+            seg.stamp.clone(),
+            0,
+            "清单已登记，但完整日志行缺失",
+        )
+    };
+    let mut covered = after.max(seg.first.saturating_sub(1));
+    records(file.take(seg.bytes), |r| {
+        if r.seq > seg.last
+            || r.seq <= covered
+            || r.segment != seg.number
+            || r.stamp.day != seg.stamp.day
+        {
+            return true;
+        }
+        let first = if r.source == "gap" {
+            // 早期格式的缺口只在文本中记载起点，末序号仍是其游标。
+            r.gap_start.unwrap_or(covered + 1)
+        } else {
+            r.seq
+        };
+        if first > covered + 1 {
+            rows.push(missing(covered + 1, first - 1));
+        }
+        covered = r.seq;
+        if rows.len() <= limit {
+            rows.push(r)
+        }
+        rows.len() <= limit && covered < seg.last
+    })?;
+    if rows.len() <= limit && covered < seg.last {
+        rows.push(missing(covered + 1, seg.last));
+    }
+    Ok(())
+}
+
 pub fn read_page(
     home: &Path,
     instance: Option<&str>,
@@ -279,12 +373,7 @@ pub fn read_page(
             optional(dir.read(&seg.filename()))?
         };
         if let Some(file) = file {
-            records(file, |r| {
-                if r.seq > after && r.seq <= seg.last && r.segment == seg.number {
-                    rows.push(r)
-                }
-                rows.len() <= limit
-            })?;
+            read_published(file, seg, after, limit, &mut rows)?;
         } else {
             rows.push(Record::gap(
                 seg.first.max(after + 1),
@@ -377,3 +466,6 @@ pub fn open_segment_file(
         path: root.join(id).join(name),
     })
 }
+
+#[cfg(test)]
+mod tests;
