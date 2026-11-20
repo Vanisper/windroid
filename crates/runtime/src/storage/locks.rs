@@ -8,6 +8,17 @@ use std::io::{self, ErrorKind};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
+/// 操作结束时显式解锁。其他子进程可能在 fork 与 exec 之间暂时持有同一文件描述。
+pub(crate) struct OperationLocks(pub(crate) Vec<File>);
+
+impl Drop for OperationLocks {
+    fn drop(&mut self) {
+        for file in self.0.iter().rev() {
+            let _ = file.unlock();
+        }
+    }
+}
+
 pub(super) fn lock(home: &Path, name: &str) -> io::Result<File> {
     fs::create_dir_all(home)?;
     let file = OpenOptions::new()
@@ -28,7 +39,11 @@ pub(super) fn lock(home: &Path, name: &str) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn resource_lease(home: &Path, components: bool, images: bool) -> io::Result<Vec<File>> {
+pub(crate) fn resource_lease(
+    home: &Path,
+    components: bool,
+    images: bool,
+) -> io::Result<OperationLocks> {
     workspace_locks(home, (components, images), false)
 }
 
@@ -36,8 +51,8 @@ pub(super) fn workspace_locks(
     home: &Path,
     changed: (bool, bool),
     moving: bool,
-) -> io::Result<Vec<File>> {
-    let mut leases = Vec::new();
+) -> io::Result<OperationLocks> {
+    let mut leases = OperationLocks(Vec::new());
     for (needed, name) in [(changed.0, ".components.lock"), (changed.1, ".images.lock")] {
         if needed {
             let file = lock(home, name)?;
@@ -52,7 +67,7 @@ pub(super) fn workspace_locks(
                     "请等待本工作区相关资源准备或切换完成",
                 )
             })?;
-            leases.push(file);
+            leases.0.push(file);
         }
     }
     Ok(leases)

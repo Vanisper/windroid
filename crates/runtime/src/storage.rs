@@ -7,7 +7,8 @@ pub(crate) use mounts::check_selected_volume;
 mod transaction;
 
 pub(crate) use locks::{
-    instance_lease, lock_staged_version, resource_lease, version_read_lease, version_write_lease,
+    OperationLocks, instance_lease, lock_staged_version, resource_lease, version_read_lease,
+    version_write_lease,
 };
 pub(crate) use transaction::CLEANUP;
 pub use transaction::{apply, pending_cleanup, recover, validate_journal};

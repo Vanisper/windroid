@@ -217,11 +217,11 @@ pub fn validate_journal(home: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn coordinator(home: &Path) -> io::Result<File> {
+fn coordinator(home: &Path) -> io::Result<OperationLocks> {
     let lock = locks::lock(home, ".storage.lock")?;
     lock.try_lock()
         .map_err(|_| io::Error::new(ErrorKind::WouldBlock, "另一个目录切换正在进行"))?;
-    Ok(lock)
+    Ok(OperationLocks(vec![lock]))
 }
 fn sibling(target: &Path, nonce: &str, phase: &str) -> PathBuf {
     target.with_file_name(format!(
@@ -790,6 +790,38 @@ mod tests {
                 stage_object: None,
             }],
         }
+    }
+
+    #[test]
+    fn completed_workspace_switch_releases_locks_even_with_inherited_descriptors() {
+        let home = Temp::new();
+        let target = StorageLocations {
+            runtime_root: home.0.join("components"),
+            image_root: home.0.join("images"),
+        };
+        let plan = preview_switch(&home.0, &target, SwitchMode::Future, false).unwrap();
+        let transaction = coordinator(&home.0).unwrap();
+        let work = locks::workspace_locks(&home.0, plan.changed_roots(), true).unwrap();
+        // dup 与 fork 继承同一个文件描述。让副本活过操作，确定性覆盖 exec 前的窗口。
+        let inherited: Vec<_> = transaction
+            .0
+            .iter()
+            .chain(&work.0)
+            .map(|file| file.try_clone().unwrap())
+            .collect();
+        assert_eq!(
+            apply(&home.0, &plan).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        drop(transaction);
+        assert_eq!(
+            apply(&home.0, &plan).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        drop(work);
+        apply(&home.0, &plan).unwrap();
+        assert_eq!(StorageLocations::load(&home.0).unwrap(), target);
+        drop(inherited);
     }
 
     #[test]

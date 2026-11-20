@@ -92,17 +92,6 @@ struct Shared {
     transfer: Mutex<Option<Child>>,
 }
 
-/// fork 到 exec 之间，其他线程创建的子进程可能临时继承描述符。
-/// 在发布或恢复完成后显式解锁，以便紧接着进行的共享核验或手动续传可取得租约。
-struct Leases(Vec<fs::File>);
-impl Drop for Leases {
-    fn drop(&mut self) {
-        for file in self.0.iter().rev() {
-            let _ = file.unlock();
-        }
-    }
-}
-
 struct Owner {
     worker: Arc<Shared>,
 }
@@ -385,7 +374,7 @@ impl Provisioner {
         if let Err(e) = std::thread::Builder::new()
             .name("windroid-provision".into())
             .spawn(move || {
-                let _leases = Leases(leases);
+                let _leases = leases;
                 worker.run(&selected, task, &paths, candidate_job, volume);
             })
         {
@@ -856,7 +845,8 @@ impl Shared {
             check_repair(&dest, pkg, expected)?;
         }
         directory(paths.installation_root(pkg), parent, true)?;
-        let mut leases = Leases(crate::storage::version_write_lease(&dest)?);
+        let mut leases =
+            crate::storage::OperationLocks(crate::storage::version_write_lease(&dest)?);
         let (stage, _lock) = archive::workspace(&dest, pkg)?;
         use std::os::unix::fs::MetadataExt;
         let owner = _lock.metadata()?;
