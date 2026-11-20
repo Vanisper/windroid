@@ -23,6 +23,7 @@ use crate::{
     surface::{WindowCommand, WindowEvent, WindowKey},
 };
 
+mod batch;
 mod commands;
 mod first_page;
 mod hardware;
@@ -40,9 +41,16 @@ pub(super) fn error(message: impl ToString) -> Rejection {
 }
 
 type Reply = Result<u64, Rejection>;
-struct Request {
-    data: JsonValue,
-    reply: Option<HostCall>,
+enum Request {
+    Command {
+        data: JsonValue,
+        reply: Option<HostCall>,
+    },
+    Batch {
+        id: String,
+        action: batch::Action,
+        reply: mpsc::Sender<Result<(u64, Snapshot), batch::Outcome>>,
+    },
 }
 type Lane = mpsc::SyncSender<Request>;
 
@@ -59,6 +67,9 @@ struct Instance {
 #[derive(Default)]
 struct ViewState {
     selected: Option<String>,
+    batch: Option<batch::Job>,
+    /// 从设备事件中确认本次命令的终态。游标使之前一轮的迟到事件无法结算本轮。
+    batch_observer: Option<(String, mpsc::Sender<contract::Event>)>,
     instances: BTreeMap<String, Instance>,
     operations: BTreeMap<String, JsonValue>,
     /// 已经打开或正在创建的窗口分别记账，连续打开计一次配额。
@@ -121,6 +132,7 @@ pub struct Library {
     state: Mutex<ViewState>,
     sequence: AtomicU64,
     starting: Mutex<()>,
+    batch_preview: Mutex<Option<batch::Preview>>,
     stopping: AtomicBool,
     /// 只有测试挂载的单实例允许省略路由键。
     fixture: bool,
@@ -195,6 +207,7 @@ impl Library {
             state: Mutex::default(),
             sequence: AtomicU64::new(0),
             starting: Mutex::new(()),
+            batch_preview: Mutex::default(),
             stopping: AtomicBool::new(false),
             fixture,
         })
@@ -268,6 +281,7 @@ impl Library {
             let result = lib.first_page.as_ref().map(|p| p.shown()).transpose();
             call.reply(result.map(|_| JsonValue::Null).map_err(|e| e.to_string()));
         });
+        self.connect_batch();
         self.connect_hardware();
         self.connect_resources();
         self.connect_storage();
@@ -304,12 +318,17 @@ impl Library {
                     .and_then(|id| state.instances.get(id))
                     .map(|i| i.lane.clone())
             };
-            if let Err(e) = lane.as_ref().unwrap_or(&global).try_send(Request {
+            if let Err(e) = lane.as_ref().unwrap_or(&global).try_send(Request::Command {
                 data,
                 reply: Some(call),
             }) {
                 let (mpsc::TrySendError::Full(req) | mpsc::TrySendError::Disconnected(req)) = e;
-                req.reply.unwrap().reject("操作队列繁忙，请稍后再试");
+                if let Request::Command {
+                    reply: Some(call), ..
+                } = req
+                {
+                    call.reject("操作队列繁忙，请稍后再试");
+                }
             }
         });
         let weak = Arc::downgrade(self);
@@ -336,24 +355,34 @@ impl Library {
         thread::spawn(move || {
             for req in rx {
                 let Some(lib) = weak.upgrade() else {
-                    if let Some(call) = req.reply {
+                    if let Request::Command {
+                        reply: Some(call), ..
+                    } = req
+                    {
                         call.reject("应用库已关闭");
                     }
                     break;
                 };
-                let result = lib.perform(&req.data);
+                let (data, reply) = match req {
+                    Request::Command { data, reply } => (data, reply),
+                    Request::Batch { id, action, reply } => {
+                        let _ = reply.send(lib.perform_batch_item(&id, action));
+                        continue;
+                    }
+                };
+                let result = lib.perform(&data);
                 let ack = match result {
                     Ok(seq) => Ack::Accepted { seq },
                     Err(reason) => {
-                        lib.release_quit(&req.data);
+                        lib.release_quit(&data);
                         lib.publish_note(
-                            req.data["instanceId"].as_str(),
-                            rejection_note(req.data["kind"].as_str(), &reason),
+                            data["instanceId"].as_str(),
+                            rejection_note(data["kind"].as_str(), &reason),
                         );
                         Ack::Rejected { reason }
                     }
                 };
-                if let Some(call) = req.reply {
+                if let Some(call) = reply {
                     call.resolve(crate::to_json(&ack));
                 }
                 lib.notify();
@@ -427,6 +456,7 @@ impl Library {
             .collect();
         out["showWelcome"] = json!(self.first_page.as_ref().is_some_and(|p| p.welcome()));
         out["selectedId"] = json!(state.selected);
+        out["batch"] = json!(state.batch);
         out["frozen"] = json!(state.frozen.contains(&id));
         out["operation"] = state
             .operations
@@ -451,6 +481,8 @@ impl Library {
         if let Some(runtime) = &self.runtime {
             let _ = runtime.lock().unwrap().provisioner.pause();
         }
+        // 等待已进入启动临界区的请求提交，关机清单才能看见它刚创建的进程。
+        let _starting = self.starting.lock().unwrap();
         let handles: Vec<_> = self
             .state
             .lock()

@@ -14,6 +14,7 @@ impl Library {
             }
             "prepareCandidateImage" => return self.prepare_candidate_image(data),
             "applyStorage" => return self.apply_storage(data),
+            "executeBatch" => return self.execute_batch(data),
             "createInstance" => return self.create_instance(data),
             _ => {}
         }
@@ -150,6 +151,9 @@ impl Library {
                 let starting = matches!(kind, "start" | "restart" | "coldRestart");
                 let _resources = starting.then(|| self.starting.lock().unwrap());
                 if starting {
+                    if self.stopping.load(Ordering::Acquire) {
+                        return Err(error("应用库正在退出"));
+                    }
                     self.require_ready_runtime()?;
                     if let Some(record) = &instance.record
                         && !resources::image_available(&self.preparation(), &record.spec.image)
