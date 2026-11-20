@@ -131,6 +131,8 @@ impl Mounts {
 
 pub(crate) fn check_selected_volume(home: &Path, root: &Path) -> io::Result<()> {
     check_volume(root)?;
+    // 卷重新挂载后，外卷中的链接也可能回指工作区的私有目录。
+    safe_root(home, &absolute(root)?)?;
     let settings = StorageLocations::load(home)?;
     let points = load(home)?;
     if same_location(root, &settings.runtime_root) {

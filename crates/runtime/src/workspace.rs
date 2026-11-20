@@ -5,16 +5,10 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const FORMAT: &str = "workspace-format";
-const VERSION: &[u8] = b"windroid-workspace-v2\n";
-const LEGACY: &[&str] = &[
-    "storage-locations.json",
-    ".storage-migration.json",
-    "staging",
-    "groups.json",
-];
+const VERSION: &[u8] = b"windroid-workspace-v1\n";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Workspace {
@@ -67,31 +61,6 @@ fn entry_type(path: &Path) -> io::Result<Option<fs::FileType>> {
     }
 }
 
-/// 旧版可把工作区的 system-images 选为镜像根。只探测旧发布清单的三个 ABI 目录，
-/// 不跟随层级链接，不打开镜像、扫描修订内容或访问设置引用的外部目录。
-fn legacy_image_item(root: &Path) -> io::Result<Option<PathBuf>> {
-    let marker = root.join(".windroid-workspace");
-    if entry_type(&marker)?.is_some() {
-        return Ok(Some(marker));
-    }
-    'package: for api in ["android-33", "android-34", "android-35"] {
-        let mut dir = root.to_owned();
-        for name in [api, "google_apis_playstore", "arm64-v8a"] {
-            dir.push(name);
-            if !entry_type(&dir)?.is_some_and(|kind| kind.is_dir()) {
-                continue 'package;
-            }
-        }
-        for name in ["source.properties", "system.img"] {
-            let path = dir.join(name);
-            if entry_type(&path)?.is_some_and(|kind| kind.is_file()) {
-                return Ok(Some(path));
-            }
-        }
-    }
-    Ok(None)
-}
-
 pub fn inspect(home: &Path) -> io::Result<Workspace> {
     if !home.is_absolute()
         || home
@@ -107,57 +76,18 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
         Ok(m) if !m.is_dir() => return Err(unknown("所选路径应为普通目录")),
         Ok(_) => (),
     }
-    let items = entries(home).map_err(unknown)?;
-    if items.is_empty() {
-        access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
-        return Ok(Workspace::Empty);
-    }
-    let has = |name: &str| items.iter().any(|item| item == name);
-    let current = has(FORMAT);
-    // 文件存在本身就表明旧布局，包括断开的链接。避免打开旧设置中引用的外部卷。
-    let old_runtime = home.join("runtime");
-    let old = LEGACY
-        .iter()
-        .find(|name| has(name))
-        .map(|s| s.to_string())
-        .or_else(|| {
-            (!current
-                && ["instances", "preferences", "logs", "cache", ".storage.lock"]
-                    .iter()
-                    .any(|name| has(name)))
-            .then(|| "既有工作区状态".into())
-        });
-    if let Some(item) = old {
-        return if current {
-            Err(unknown(format!("新格式记录与旧状态 {item} 并存")))
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("此目录是旧版 Windroid 工作区（{item}），原文件已保留。"),
-            ))
-        };
-    }
-    if has("runtime") {
-        plain(&old_runtime, true).map_err(unknown)?;
-        let names = entries(&old_runtime).map_err(unknown)?;
-        if names
-            .iter()
-            .any(|s| s == "sdk" || s == "scrcpy-server.jar" || s == ".windroid-workspace")
-        {
-            return Err(if current {
-                unknown("新格式工作区内存在旧运行组件布局")
-            } else {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "此目录使用旧版运行组件布局，原文件已保留。",
-                )
-            });
+    // 与实际读写方使用相同的路径查询，遵循所在卷的大小写规则。
+    let has = |name: &str| entry_type(&home.join(name)).map(|entry| entry.is_some());
+    if !has(FORMAT)? {
+        let items = entries(home).map_err(unknown)?;
+        if items.is_empty() {
+            access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
+            return Ok(Workspace::Empty);
         }
-    }
-    if !current {
         if items.iter().any(|s| s != "runtime" && s != "system-images") {
-            return Err(unknown("目录中存在未识别的文件或工作区记录"));
+            return Err(unknown("目录已有内容，缺少 Windroid 工作区格式标记"));
         }
+        access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
         let names = crate::provision::preview_seed(home).map_err(unknown)?;
         if names.is_empty() {
             return Err(unknown("目录非空，未识别到完整的清单资源"));
@@ -167,73 +97,59 @@ pub fn inspect(home: &Path) -> io::Result<Workspace> {
     let path = home.join(FORMAT);
     plain(&path, false)?;
     let mut value = Vec::new();
-    File::open(&path)
-        .and_then(|f| f.take(128).read_to_end(&mut value))
-        .map_err(unknown)?;
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .and_then(|f| f.take(VERSION.len() as u64 + 1).read_to_end(&mut value))
+        .map_err(|e| unknown(format!("{}：{e}", path.display())))?;
     if value != VERSION {
-        return Err(unknown("工作区版本记录损坏或不受支持"));
+        return Err(unknown(format!(
+            "{}：工作区版本记录损坏或不受支持",
+            path.display()
+        )));
     }
-    if has("system-images") {
-        let root = home.join("system-images");
-        plain(&root, true).map_err(unknown)?;
-        if let Some(path) = legacy_image_item(&root).map_err(unknown)? {
-            return Err(unknown(format!(
-                "新格式工作区内存在旧镜像布局：{}",
-                path.display()
-            )));
-        }
-    }
-    if has("logs") {
-        plain(&home.join("logs"), true).map_err(unknown)?;
-    }
+    // 标记确定工作区身份。只检查客户端会打开的路径，其他内容留在原处。
     access(home, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
-    for name in ["instances", "preferences", "cache", "storage-cleanup-v2"] {
-        if has(name) {
-            plain(&home.join(name), true).map_err(unknown)?;
-            access(&home.join(name), libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
+    for name in ["runtime", "system-images"] {
+        if has(name)? {
+            let dir = home.join(name);
+            plain(&dir, true)?;
+            access(&dir, libc::R_OK | libc::X_OK).map_err(unknown)?;
         }
     }
-    // 其他目录可以是用户保留在工作区内的自选资源根。仅识别程序确实使用的
-    // 顶层状态文件，避免误把旧设置或未知的持久记录当作本版状态。
-    for item in &items {
-        let path = home.join(item);
-        let name = item.to_str().ok_or_else(|| unknown("工作区文件名无效"))?;
-        let meta = fs::symlink_metadata(&path).map_err(unknown)?;
-        match name {
-            ".storage.lock" | ".components.lock" | ".images.lock" => {
-                access(&path, libc::R_OK | libc::W_OK).map_err(unknown)?;
-                if !meta.is_file() || meta.len() != 0 || meta.nlink() != 1 {
-                    return Err(unknown(format!(
-                        "工作区锁文件类型或内容异常：{}",
-                        path.display()
-                    )));
-                }
-            }
-            FORMAT | windroid_locations::SETTINGS | ".storage-migration-v2.json" | ".DS_Store" => {
-                plain(&path, false).map_err(unknown)?
-            }
-            _ if meta.is_dir() => (),
-            _ if name.starts_with(".storage-writing-")
-                || name.starts_with(".workspace-format-") =>
-            {
-                plain(&path, false).map_err(unknown)?
-            }
-            _ => return Err(unknown(format!("未识别的工作区记录：{}", path.display()))),
+    if has("logs")? {
+        plain(&home.join("logs"), true)?;
+    }
+    for name in ["instances", "preferences", "cache", crate::storage::CLEANUP] {
+        if has(name)? {
+            let dir = home.join(name);
+            plain(&dir, true)?;
+            access(&dir, libc::R_OK | libc::W_OK | libc::X_OK).map_err(unknown)?;
         }
     }
-    if has("preferences") {
-        for key in entries(&home.join("preferences")).map_err(unknown)? {
-            let control = home.join("preferences").join(key);
-            plain(&control, false).map_err(unknown)?;
-            access(&control, libc::R_OK).map_err(unknown)?;
+    for name in [".storage.lock", ".components.lock", ".images.lock"] {
+        if has(name)? {
+            let path = home.join(name);
+            let meta = fs::symlink_metadata(&path)?;
+            if !meta.is_file() || meta.len() != 0 || meta.nlink() != 1 {
+                return Err(unknown(format!("锁文件类型或内容异常：{}", path.display())));
+            }
+            access(&path, libc::R_OK | libc::W_OK).map_err(unknown)?;
         }
     }
-    if has("instances") {
+    if has("preferences")? {
+        let prefs = home.join("preferences");
+        for name in ["first-page.pending", "first-page-shown", "window-close"] {
+            let path = prefs.join(name);
+            if entry_type(&path)?.is_some() {
+                plain(&path, false)?;
+                access(&path, libc::R_OK).map_err(unknown)?;
+            }
+        }
+    }
+    if has("instances")? {
         crate::instances::inspect_registry(&home.join("instances")).map_err(unknown)?;
-    }
-    if has(windroid_locations::SETTINGS) {
-        plain(&home.join(windroid_locations::SETTINGS), false)?;
-        windroid_locations::StorageLocations::load(home).map_err(unknown)?;
     }
     crate::storage::validate_journal(home).map_err(unknown)?;
     Ok(Workspace::Current)
@@ -246,7 +162,7 @@ pub fn initialize(home: &Path, choice: &Workspace) -> io::Result<()> {
         return Ok(());
     }
     if &actual != choice {
-        return Err(unknown("目录在检查后已变化，请重新打开"));
+        return Err(unknown("目录内容在确认期间已改变"));
     }
     fs::DirBuilder::new()
         .mode(0o700)

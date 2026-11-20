@@ -5,8 +5,9 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
 use windroid_locations::SETTINGS;
 
-const JOURNAL: &str = ".storage-migration-v2.json";
-const CLEANUP: &str = "storage-cleanup-v2";
+const JOURNAL: &str = ".storage-migration.json";
+pub(crate) const CLEANUP: &str = "storage-cleanup";
+const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -15,8 +16,6 @@ struct Entry {
     digest: String,
     copy: bool,
     cleanup: bool,
-    // 早期 v2 记录中的临时设备号仅用于读回原校验和，不能用于授权。
-    created: Option<(u64, u64)>,
     #[serde(default)]
     retained: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,7 +145,7 @@ fn ledger_paths(home: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 fn check_record(home: &Path, journal: &Journal) -> io::Result<()> {
-    if journal.schema != 2
+    if journal.schema != SCHEMA
         || journal.workspace != absolute(home)?
         || journal.nonce.len() != 32
         || !journal.nonce.bytes().all(|b| b.is_ascii_hexdigit())
@@ -175,7 +174,7 @@ fn check_record(home: &Path, journal: &Journal) -> io::Result<()> {
             || !valid_version
             || entry.digest.len() != 64
             || !entry.digest.bytes().all(|b| b.is_ascii_hexdigit())
-            || !entry.copy && entry.created.is_some()
+            || !entry.copy && entry.stage_object.is_some()
         {
             return Err(invalid("存储事务的版本记录无效"));
         }
@@ -183,17 +182,26 @@ fn check_record(home: &Path, journal: &Journal) -> io::Result<()> {
     Ok(())
 }
 
-/// 工作区格式门禁可调用此函数。只读事务小文件，不访问外部卷、版本内容或用户盘。
+/// 核对工作区内的目录设置、卷引用和事务记录，不访问外部卷、版本内容或用户盘。
 pub fn validate_journal(home: &Path) -> io::Result<()> {
-    mounts::load(home)?;
+    let settings = home.join(windroid_locations::SETTINGS);
+    if metadata(&settings)?.is_some() {
+        let context =
+            |e: io::Error| io::Error::new(e.kind(), format!("{}：{e}", settings.display()));
+        let roots = StorageLocations::load(home).map_err(context)?;
+        safe_root(home, &roots.runtime_root).map_err(context)?;
+        safe_root(home, &roots.image_root).map_err(context)?;
+        mounts::load(home).map_err(context)?;
+    }
     let mut records = ledger_paths(home)?;
     let primary = home.join(JOURNAL);
     if metadata(&primary)?.is_some() {
         records.push(primary.clone());
     }
     for path in records {
-        let journal = read_record(&path)?;
-        check_record(home, &journal)?;
+        let context = |e: io::Error| io::Error::new(e.kind(), format!("{}：{e}", path.display()));
+        let journal = read_record(&path).map_err(context)?;
+        check_record(home, &journal).map_err(context)?;
         if path != primary
             && !["cleanup", "finish", "undo"].into_iter().any(|phase| {
                 path.file_name()
@@ -700,7 +708,7 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
         return Ok(());
     }
     let mut journal = Journal {
-        schema: 2,
+        schema: SCHEMA,
         workspace: absolute(home)?,
         nonce: crate::instances::nonce()?,
         before: plan.before,
@@ -716,7 +724,6 @@ pub fn apply(home: &Path, confirmed: &MigrationPlan) -> io::Result<()> {
                 digest: row.digest.expect("confirmed complete version"),
                 copy: row.status == VersionStatus::Copy,
                 cleanup: row.cleanup,
-                created: None,
                 retained: None,
                 source_object: row.source_object,
                 prior_target: row.target_object,
@@ -765,7 +772,7 @@ mod tests {
             .find(|p| p.id() == "scrcpy-server")
             .unwrap();
         Journal {
-            schema: 2,
+            schema: SCHEMA,
             nonce: crate::instances::nonce().unwrap(),
             workspace: home.into(),
             before: StorageLocations::defaults(home),
@@ -777,7 +784,6 @@ mod tests {
                 digest: src.content_digest(),
                 copy: true,
                 cleanup,
-                created: None,
                 retained: None,
                 source_object: None,
                 prior_target: None,
@@ -808,6 +814,12 @@ mod tests {
         assert!(validate_journal(&home.0).is_err());
         assert!(primary.exists());
         assert!(!target.runtime_root.exists());
+        let mut unsupported = original.clone();
+        unsupported.schema = u32::MAX;
+        write_record(&primary, &unsupported).unwrap();
+        let unchanged = fs::read(&primary).unwrap();
+        assert!(validate_journal(&home.0).is_err());
+        assert_eq!(fs::read(&primary).unwrap(), unchanged);
         let mut bad = original.clone();
         bad.entries[0].digest = "f".repeat(64);
         write_record(&primary, &bad).unwrap();

@@ -577,7 +577,7 @@ fn import_checks_the_confirmed_copy_and_preserves_the_download_prefix_after_fail
     let preview = p.inspect_image_zip(&zip).unwrap();
     assert_eq!(preview.image.unwrap().api, 34);
     assert!(!preview.ready && !preview.location.exists());
-    assert!(!home.0.join("staging").exists());
+    assert!(!archive::stage_path(&preview.location, pkg).exists());
     let prefix = stage(&home.0, pkg, &bytes[..50]);
 
     let mut changed = bytes.clone();

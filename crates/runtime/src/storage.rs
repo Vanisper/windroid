@@ -9,6 +9,7 @@ mod transaction;
 pub(crate) use locks::{
     instance_lease, lock_staged_version, resource_lease, version_read_lease, version_write_lease,
 };
+pub(crate) use transaction::CLEANUP;
 pub use transaction::{apply, pending_cleanup, recover, validate_journal};
 pub use windroid_locations::StorageLocations;
 
@@ -295,6 +296,69 @@ fn classify(
     }
 }
 
+fn private_name(home: &Path, name: &std::ffi::OsStr) -> io::Result<bool> {
+    const PRIVATE: &[&str] = &[
+        "instances",
+        "preferences",
+        "logs",
+        "cache",
+        "workspace-format",
+        windroid_locations::SETTINGS,
+        CLEANUP,
+    ];
+    let bytes = name.as_encoded_bytes();
+    if bytes.starts_with(b".") || PRIVATE.iter().any(|entry| entry.as_bytes() == bytes) {
+        return Ok(true);
+    }
+    if bytes.is_ascii()
+        && !PRIVATE
+            .iter()
+            .any(|entry| entry.as_bytes().eq_ignore_ascii_case(bytes))
+    {
+        return Ok(false);
+    }
+    if let Some(candidate) = metadata(&home.join(name))? {
+        for reserved in PRIVATE {
+            if let Some(other) = metadata(&home.join(reserved))?
+                && (candidate.dev(), candidate.ino()) == (other.dev(), other.ino())
+            {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // 私有目录可能尚未建立，采用所在卷的大小写规则及系统的 Unicode 比较。
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_core_foundation::{CFComparisonResult, CFString, CFStringCompareFlags as Flags};
+        let parent = existing_ancestor(home)?;
+        let path = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())?;
+        let mut flags = Flags::CompareNonliteral;
+        if unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) } == 0 {
+            flags |= Flags::CompareCaseInsensitive;
+        }
+        let Some(text) = name.to_str() else {
+            return Ok(false);
+        };
+        let name = CFString::from_str(text);
+        Ok(PRIVATE.iter().any(|entry| {
+            name.compare(Some(&CFString::from_str(entry)), flags)
+                == CFComparisonResult::CompareEqualTo
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let a = metadata(&home.join("workspace-format"))?;
+        let b = metadata(&home.join("WORKSPACE-FORMAT"))?;
+        Ok(
+            matches!((a, b), (Some(a), Some(b)) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
+                && PRIVATE
+                    .iter()
+                    .any(|entry| entry.as_bytes().eq_ignore_ascii_case(bytes)),
+        )
+    }
+}
+
 fn safe_root(home: &Path, root: &Path) -> io::Result<()> {
     if !root.is_absolute()
         || root.components().any(|part| part == Component::ParentDir)
@@ -304,28 +368,50 @@ fn safe_root(home: &Path, root: &Path) -> io::Result<()> {
     {
         return Err(invalid("无效的资源根路径"));
     }
-    if let Ok(relative) = root.strip_prefix(home)
-        && let Some(Component::Normal(first)) = relative.components().next()
-    {
-        let name = first.to_string_lossy();
-        if name.starts_with('.')
-            || matches!(
-                name.as_ref(),
-                "instances"
-                    | "preferences"
-                    | "logs"
-                    | "cache"
-                    | "workspace-format"
-                    | "storage-v2.json"
-                    | "storage-cleanup-v2"
-                    | "staging"
-                    | "storage-locations.json"
-                    | "groups.json"
-            )
-        {
-            return Err(invalid("资源根与工作区私有目录或设置冲突"));
+    let home = absolute(home)?;
+    let ancestor = existing_ancestor(&home)?;
+    let info = fs::metadata(ancestor)?;
+    let home_id = (ancestor == home).then(|| (info.dev(), info.ino()));
+    let local_devices = [info.dev(), fs::metadata("/")?.dev()];
+    let mut candidate = root.to_owned();
+    // 只读本机路径元数据。逐段展开链接可在跨卷挂载点停下，不进入外卷搜索资源。
+    'links: for _ in 0..=40 {
+        let (mut path, rest) = match candidate.strip_prefix(&home) {
+            Ok(relative) => (home.clone(), relative),
+            Err(_) => (PathBuf::from("/"), candidate.as_path()),
+        };
+        let mut at_home = path == home;
+        let mut parts = rest.components();
+        while let Some(part) = parts.next() {
+            match part {
+                Component::Normal(name) => {
+                    if at_home && private_name(&home, name)? {
+                        return Err(invalid("资源根与工作区私有目录或设置冲突"));
+                    }
+                    path.push(name);
+                }
+                Component::ParentDir => {
+                    path.pop();
+                }
+                _ => continue,
+            }
+            let Ok(info) = fs::symlink_metadata(&path) else {
+                return Ok(());
+            };
+            if !local_devices.contains(&info.dev()) {
+                return Ok(());
+            }
+            if info.is_symlink() {
+                let target = fs::read_link(&path)?;
+                path.pop();
+                candidate = path.join(target).join(parts.as_path());
+                continue 'links;
+            }
+            at_home = path == home || home_id == Some((info.dev(), info.ino()));
         }
+        return Ok(());
     }
+    // 不可解析的外部根留待实际访问时报告。
     Ok(())
 }
 
@@ -362,7 +448,7 @@ pub fn preview_switch(
         }
         check_volume(new)?;
         *out = absolute(new)?;
-        safe_root(&absolute(home)?, out)?;
+        safe_root(home, out)?;
     }
     let mut plan = MigrationPlan {
         before: before.clone(),

@@ -94,7 +94,6 @@ fn official_target_volume_pause_resume_and_repair() {
     let prefix = row(&paused, "system-image").downloaded_bytes;
     println!("target-volume official API34 prefix {prefix} bytes");
     assert!(prefix > 0 && prefix < row(&paused, "system-image").size_bytes);
-    assert!(!root.join("staging").exists());
     drop(p);
     let p = Provisioner::new(&root);
     assert_eq!(row(&p.snapshot(), "system-image").downloaded_bytes, prefix);

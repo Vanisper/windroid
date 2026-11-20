@@ -391,7 +391,12 @@ pub(crate) fn inspect_registry(root: &Path) -> io::Result<()> {
         }
     }
     let records = records_in(root)?;
-    selected_in(root, &records).map(|_| ())
+    selected_in(root, &records).map(|_| ()).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("{}：{e}", root.join(".selected").display()),
+        )
+    })
 }
 
 fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
@@ -408,7 +413,10 @@ fn records_in(root: &Path) -> io::Result<Vec<InstanceRecord>> {
                 .into_string()
                 .map_err(|_| invalid("实例目录名称无效"))?,
         );
-        let record = read_record(root, &id)?;
+        let record = read_record(root, &id).map_err(|e| {
+            let path = entry.path().join(MANIFEST);
+            io::Error::new(e.kind(), format!("{}：{e}", path.display()))
+        })?;
         if !used.insert(record.port) {
             return Err(invalid("已有实例占用相同的端口对"));
         }

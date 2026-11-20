@@ -1,4 +1,4 @@
-//! 使用合成旧记录及独立外部卷路径验证格式门禁。快照覆盖文件内容、目录成员、权限和修改时刻。
+//! 使用独立目录验证工作区身份和只读检查。快照覆盖文件内容、目录成员、权限和修改时刻。
 #[path = "instances/support.rs"]
 #[allow(dead_code)]
 mod support;
@@ -44,6 +44,10 @@ fn fresh_and_current_accept_only_the_intended_initialization() {
     assert!(!home.exists());
     fs::create_dir(&home).unwrap();
     workspace::open(&home).unwrap();
+    assert_eq!(
+        fs::read(home.join("workspace-format")).unwrap(),
+        b"windroid-workspace-v1\n"
+    );
     let before = tree(&temp.0);
     assert_eq!(workspace::inspect(&home).unwrap(), Workspace::Current);
     workspace::open(&home).unwrap();
@@ -54,12 +58,15 @@ fn fresh_and_current_accept_only_the_intended_initialization() {
 fn rejected_workspaces_and_referenced_files_are_unchanged() {
     for case in [
         "unknown",
-        "legacy",
-        "mixed-record",
-        "mixed-layout",
+        "unmarked-records",
+        "invalid-instance",
+        "invalid-root",
+        "incomplete-resource",
         "unreadable",
         "uncommitted-transaction",
         "malformed-settings",
+        "private-resource-location",
+        "invalid-volume-binding",
         "damaged-marker",
         "bad-selection",
         "linked-lock",
@@ -75,38 +82,48 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
         } else {
             fs::create_dir(&home).unwrap();
         }
-        if !["unknown", "legacy", "linked-home"].contains(&case) {
+        if ![
+            "unknown",
+            "unmarked-records",
+            "incomplete-resource",
+            "linked-home",
+        ]
+        .contains(&case)
+        {
             workspace::open(&home).unwrap();
         }
         match case {
             "unknown" => fs::write(home.join("something"), "unknown").unwrap(),
-            "legacy" => {
-                let instance = home.join("instances/a");
-                fs::create_dir_all(&instance).unwrap();
-                fs::write(instance.join("instance.json"), r#"{"image":{"api":34}}"#).unwrap();
-                fs::write(instance.join("userdata-qemu.img"), b"private disk sentinel").unwrap();
+            "unmarked-records" => {
+                // 即使目录设置有效，也只有通过工作区身份检查后才可能使用它。
+                let config = windroid_locations::StorageLocations {
+                    runtime_root: external.clone(),
+                    image_root: external.join("images"),
+                };
                 fs::write(
-                    home.join("storage-locations.json"),
-                    format!(
-                        r#"{{"runtimeRoot":"{}","imageRoot":null}}"#,
-                        external.display()
-                    ),
+                    home.join(windroid_locations::SETTINGS),
+                    serde_json::to_vec(&config).unwrap(),
                 )
                 .unwrap();
-                fs::write(home.join(".storage-migration.json"), "{}").unwrap();
+                fs::write(home.join(".storage-migration.json"), b"interrupted").unwrap();
             }
             "uncommitted-transaction" => {
-                fs::write(home.join(".storage-migration-v2.json"), b"{").unwrap()
+                fs::write(home.join(".storage-migration.json"), b"{").unwrap()
             }
             "damaged-marker" => {
                 fs::write(home.join("workspace-format"), b"windroid-workspace-v9\n").unwrap()
             }
-            "mixed-layout" => fs::create_dir_all(home.join("runtime/sdk/emulator")).unwrap(),
-            "mixed-record" => {
+            "invalid-root" => fs::write(home.join("runtime"), b"file").unwrap(),
+            "incomplete-resource" => {
+                let dir = home.join("runtime/scrcpy-server/5.0.1");
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("scrcpy-server.jar"), b"incomplete").unwrap();
+            }
+            "invalid-instance" => {
                 let store =
                     runtime::instances::InstanceStore::new(runtime::Layout { root: home.clone() });
                 let record = store
-                    .create("旧清单", support::spec("compact-720"))
+                    .create("测试实例", support::spec("compact-720"))
                     .unwrap();
                 let path = home
                     .join("instances")
@@ -120,10 +137,26 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
                 fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
             }
             "malformed-settings" => fs::write(
-                home.join("storage-v2.json"),
+                home.join(windroid_locations::SETTINGS),
                 r#"{"runtimeRoot":"/does-not-exist","imageRoot":null}"#,
             )
             .unwrap(),
+            "invalid-volume-binding" => fs::write(
+                home.join(windroid_locations::SETTINGS),
+                r#"{"runtimeRoot":"/runtime","imageRoot":"/images","mounts":{"runtime":"relative"}}"#,
+            )
+            .unwrap(),
+            "private-resource-location" => {
+                let settings = windroid_locations::StorageLocations {
+                    runtime_root: home.join("instances/nested"),
+                    image_root: external.clone(),
+                };
+                fs::write(
+                    home.join(windroid_locations::SETTINGS),
+                    serde_json::to_vec(&settings).unwrap(),
+                )
+                .unwrap();
+            }
             "bad-selection" => {
                 fs::create_dir(home.join("instances")).unwrap();
                 fs::write(home.join("instances/.selected"), [0xff]).unwrap();
@@ -149,83 +182,99 @@ fn rejected_workspaces_and_referenced_files_are_unchanged() {
             assert_eq!(fs::read_dir(&home).unwrap().count(), before);
         } else {
             let before = tree(&temp.0);
-            assert!(workspace::open(&home).is_err(), "{case}");
+            let reason = workspace::open(&home).unwrap_err().to_string();
+            let detail = match case {
+                "unknown" | "unmarked-records" => "目录已有内容，缺少 Windroid 工作区格式标记",
+                "invalid-instance" => "revision",
+                "uncommitted-transaction" => ".storage-migration.json",
+                "malformed-settings" | "invalid-volume-binding" => windroid_locations::SETTINGS,
+                "private-resource-location" => "私有目录",
+                "bad-selection" => ".selected",
+                "invalid-root" => "runtime",
+                "incomplete-resource" => "scrcpy-server.jar",
+                "damaged-marker" => "工作区版本记录",
+                "linked-lock" => ".storage.lock",
+                "linked-home" => "普通目录",
+                _ => unreachable!(),
+            };
+            assert!(reason.contains(detail), "{case}: {reason}");
             assert_eq!(tree(&temp.0), before, "{case}");
         }
     }
 }
 
 #[test]
-fn missing_ancestor_cannot_redirect_initialization_into_an_old_workspace() {
+fn missing_ancestor_cannot_redirect_initialization_into_a_nonempty_directory() {
     let temp = support::Temp::create();
-    let old = temp.0.join("old");
-    fs::create_dir(&old).unwrap();
-    fs::write(old.join("storage-locations.json"), "{}").unwrap();
+    let other = temp.0.join("other");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("notes"), "keep").unwrap();
     let before = tree(&temp.0);
-    assert!(workspace::open(&temp.0.join("missing/../old")).is_err());
+    assert!(workspace::open(&temp.0.join("missing/../other")).is_err());
     assert_eq!(tree(&temp.0), before);
 }
 
 #[test]
-fn current_marker_with_an_unversioned_image_is_rejected_without_writes() {
+fn preflight_checks_the_paths_that_this_volume_resolves() {
     let temp = support::Temp::create();
     let home = temp.0.join("home");
     workspace::open(&home).unwrap();
-    let root = home.join("system-images");
-    let spec = support::spec("compact-720");
-    for (api, filename) in [
-        (33, "system.img"),
-        (34, "source.properties"),
-        (35, "system.img"),
-    ] {
-        let parent = root
-            .join(format!("android-{api}"))
-            .join(&spec.image.tag)
-            .join(&spec.image.abi);
-        fs::create_dir_all(&parent).unwrap();
-        let path = parent.join(filename);
-        fs::write(&path, b"preserve old payload").unwrap();
+    let bad = home.join("Instances/example");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("instance.json"), b"{").unwrap();
+    let case_insensitive = home.join("instances").try_exists().unwrap();
+
+    let check = |detail: &str| {
         let before = tree(&temp.0);
-        let problem = workspace::open(&home).unwrap_err().to_string();
-        assert!(
-            problem.contains("无法确认工作区格式") && problem.contains(filename),
-            "{problem}"
-        );
+        let result = workspace::open(&home);
+        if case_insensitive {
+            let reason = result.unwrap_err().to_string();
+            assert!(reason.contains(detail), "{reason}");
+        } else {
+            result.unwrap();
+        }
         assert_eq!(tree(&temp.0), before);
-        fs::remove_file(path).unwrap();
-    }
-    fs::write(root.join(".windroid-workspace"), b"previous owner").unwrap();
-    let before = tree(&temp.0);
-    assert!(
-        workspace::open(&home)
-            .unwrap_err()
-            .to_string()
-            .contains(".windroid-workspace")
-    );
-    assert_eq!(tree(&temp.0), before);
+    };
+    check("instance.json");
+
+    fs::remove_dir_all(home.join("Instances")).unwrap();
+    let external = temp.0.join("outside");
+    fs::create_dir(&external).unwrap();
+    symlink(&external, home.join("Preferences")).unwrap();
+    check("preferences");
 }
 
 #[test]
-fn mixed_image_check_stays_inside_default_legacy_package_directories() {
+fn current_workspace_ignores_files_outside_its_control_records() {
     let temp = support::Temp::create();
     let home = temp.0.join("home");
     workspace::open(&home).unwrap();
-    let image = support::spec("compact-720").image;
-    let abi = Path::new(&image.tag).join(&image.abi);
-    let root = home.join("system-images");
-    let parent = root.join("android-34").join(&abi);
-    fs::create_dir_all(parent.join("r14")).unwrap();
-    fs::write(parent.join("r14/system.img"), b"revision payload").unwrap();
-    fs::write(parent.join("readme"), b"user note").unwrap();
+    let resource_dir = home.join("resources");
+    fs::create_dir(&resource_dir).unwrap();
+    fs::write(resource_dir.join("notes.txt"), b"local file").unwrap();
+    fs::write(home.join("inventory.json"), b"user file").unwrap();
+    symlink(temp.0.join("absent"), home.join("personal-link")).unwrap();
+
+    let before = tree(&temp.0);
+    assert_eq!(workspace::inspect(&home).unwrap(), Workspace::Current);
+    workspace::open(&home).unwrap();
+    assert_eq!(tree(&temp.0), before);
+    use runtime::storage::{StorageLocations, SwitchMode, apply, preview_switch};
+    let mut locations = StorageLocations::defaults(&home);
+    locations.runtime_root = resource_dir;
+    let plan = preview_switch(&home, &locations, SwitchMode::Future, false).unwrap();
+    apply(&home, &plan).unwrap();
+    assert_eq!(workspace::inspect(&home).unwrap(), Workspace::Current);
+    locations.runtime_root = home.join("instances");
+    assert!(preview_switch(&home, &locations, SwitchMode::Future, false).is_err());
+}
+
+#[test]
+fn external_resource_locations_can_be_opened_while_offline() {
+    let temp = support::Temp::create();
+    let home = temp.0.join("home");
+    workspace::open(&home).unwrap();
     let external = temp.0.join("manual-images");
-    let target = external.join("android-33").join(&abi);
-    fs::create_dir_all(&target).unwrap();
-    fs::write(
-        target.join("source.properties"),
-        b"unrelated manual package",
-    )
-    .unwrap();
-    symlink(external.join("android-33"), root.join("android-33")).unwrap();
     let config = windroid_locations::StorageLocations {
         image_root: external,
         ..windroid_locations::StorageLocations::defaults(&home)
@@ -238,4 +287,43 @@ fn mixed_image_check_stays_inside_default_legacy_package_directories() {
     let before = tree(&temp.0);
     assert_eq!(workspace::inspect(&home).unwrap(), Workspace::Current);
     assert_eq!(tree(&temp.0), before);
+}
+
+#[test]
+fn stored_resource_roots_cannot_resolve_into_private_workspace_paths() {
+    let temp = support::Temp::create();
+    let home = temp.0.join("workspace");
+    workspace::open(&home).unwrap();
+    symlink(&home, temp.0.join("workspace-link")).unwrap();
+    symlink("preferences", home.join("local-link")).unwrap();
+    symlink("workspace-link/local-link", temp.0.join("preferences-link")).unwrap();
+    let insensitive = home.join("WORKSPACE-FORMAT").try_exists().unwrap();
+    let folds_long_s = home.join("workſpace-format").try_exists().unwrap();
+    fs::create_dir(home.join("logs")).unwrap();
+    let settings = home.join(windroid_locations::SETTINGS);
+    for (root, rejected) in [
+        (home.join("INSTANCES/future"), insensitive),
+        (home.join("inſtances/future"), folds_long_s),
+        (home.join("logſ/future"), folds_long_s),
+        (temp.0.join("WORKSPACE/logs/future"), insensitive),
+        (temp.0.join("workspace-link/cache/future"), true),
+        (home.join("local-link/future"), true),
+        (temp.0.join("preferences-link/future"), true),
+        (temp.0.join("workspace-link/public/future"), false),
+    ] {
+        let config = windroid_locations::StorageLocations {
+            runtime_root: root.clone(),
+            ..windroid_locations::StorageLocations::defaults(&home)
+        };
+        fs::write(&settings, serde_json::to_vec(&config).unwrap()).unwrap();
+        let before = tree(&temp.0);
+        let result = workspace::open(&home);
+        if rejected {
+            let reason = result.unwrap_err().to_string();
+            assert!(reason.contains("私有目录"), "{}: {reason}", root.display());
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(tree(&temp.0), before, "{}", root.display());
+    }
 }

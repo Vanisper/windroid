@@ -229,18 +229,15 @@ fn running_list_waits_for_launcher_classification_and_keeps_cached_rows_on_error
 }
 
 #[test]
-fn old_group_files_block_initialization_and_are_preserved() {
+fn attaching_an_unmarked_nonempty_directory_preserves_its_contents() {
     let layout = temporary_workspace();
-    let path = layout.root.join("groups.json");
-    for bytes in [b"{}".as_slice(), b"{damaged"] {
-        std::fs::write(&path, bytes).unwrap();
-        let (tx, _) = mpsc::channel();
-        let (_, rx) = mpsc::channel();
-        assert!(Library::attach(HostChannel::new(), layout.clone(), false, tx, rx).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(!layout.root.join("preferences").exists());
-        assert!(!layout.root.join("instances").exists());
-    }
+    let path = layout.root.join("notes.txt");
+    std::fs::write(&path, b"keep").unwrap();
+    let (tx, _) = mpsc::channel();
+    let (_, rx) = mpsc::channel();
+    assert!(Library::attach(HostChannel::new(), layout.clone(), false, tx, rx).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(&layout.root).unwrap().count(), 1);
     std::fs::remove_dir_all(layout.root).unwrap();
 }
 
@@ -251,6 +248,8 @@ fn inaccessible_existing_control_files_cause_zero_writes_on_attach() {
         ("instances/.registry.lock", 0o000, false),
         ("instances/.registry.lock", 0o400, false),
         ("instances", 0o500, true),
+        ("runtime", 0o000, true),
+        ("system-images", 0o000, true),
         (".components.lock", 0o000, false),
         (".images.lock", 0o000, false),
         (".storage.lock", 0o000, false),
@@ -288,6 +287,9 @@ fn inaccessible_existing_control_files_cause_zero_writes_on_attach() {
                 (before.mode(), before.mtime_nsec(), before.ino()),
                 (after.mode(), after.mtime_nsec(), after.ino())
             );
+        }
+        if directory {
+            std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         std::fs::remove_dir_all(layout.root).unwrap();
     }

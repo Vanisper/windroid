@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-pub const SETTINGS: &str = "storage-v2.json";
+pub const SETTINGS: &str = "storage.json";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
