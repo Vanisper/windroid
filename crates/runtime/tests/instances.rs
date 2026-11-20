@@ -1,4 +1,6 @@
 //! 实例持久化和真实后端的边界测试。设备命令均进入临时目录里的替身。
+#[path = "instances/diagnostics.rs"]
+mod diagnostics;
 #[path = "instances/preview.rs"]
 mod preview;
 #[path = "instances/support.rs"]
@@ -215,6 +217,24 @@ printf '%s\n' "$@" > "$WINDROID_BACKEND_TEST_DIR/args"
 printf '%s' "$ANDROID_AVD_HOME" > "$WINDROID_BACKEND_TEST_DIR/avd_home"
 printf '%s' "$ANDROID_EMULATOR_HOME" > "$WINDROID_BACKEND_TEST_DIR/emulator_home"
 printf '%s' "$TMPDIR" > "$WINDROID_BACKEND_TEST_DIR/emulator_tmp"
+if test -f "$WINDROID_BACKEND_TEST_DIR/log-test-mode"; then
+  mode=$(cat "$WINDROID_BACKEND_TEST_DIR/log-test-mode")
+  test "$mode" = quiet && exit 0
+  echo emulator-stdout
+  n=0
+  while test ! -f "$WINDROID_BACKEND_TEST_DIR/emit-after-host"; do
+    test "$n" -lt 500 || exit 99
+    n=$((n + 1))
+    sleep 0.02
+  done
+  if test "$mode" = flood; then
+    dd if=/dev/zero bs=65536 count=64 2>/dev/null || exit 91
+    dd if=/dev/zero bs=65536 count=64 >&2 || exit 92
+    touch "$WINDROID_BACKEND_TEST_DIR/both-streams-drained"
+  fi
+  echo after-host-exit >&2
+  exit 37
+fi
 echo emulator-stdout
 echo emulator-stderr >&2
 test -z "${NETSIM_INSTANCE+x}${NETSIM_ARGS+x}" || exit 1
@@ -268,9 +288,14 @@ esac
                 stream.write_all(b"OKAY00040029").unwrap();
             }
         });
+        diagnostics::collector_wrapper(&dir.0);
         let result = ChildCommand::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env(ROOT, &dir.0)
+            .env(
+                "WINDROID_TEST_COLLECTOR_BIN",
+                env!("CARGO_BIN_EXE_windroid-log-collector"),
+            )
             .env("WINDROID_HOME", &dir.0)
             .env("ANDROID_ADB_SERVER_PORT", service_port)
             .env_remove("ADB_SERVER_SOCKET")
@@ -284,11 +309,15 @@ esac
         assert!(result.success());
         return;
     };
-    runtime::instances::register_collector(Path::new(env!("CARGO_BIN_EXE_windroid-log-collector")));
     let root = std::path::PathBuf::from(path);
+    runtime::instances::register_collector(&root.join("collector"));
     let layout = Layout { root: root.clone() };
     let store = InstanceStore::new(layout.clone());
-    let a = store.create("工作 A", spec("compact-720")).unwrap();
+    let orphan = std::env::var(diagnostics::ORPHAN).ok();
+    let a = match &orphan {
+        Some(id) => store.get(&InstanceId::new(id)).unwrap(),
+        None => store.create("工作 A", spec("compact-720")).unwrap(),
+    };
     let fixture = runtime::ActiveRuntime::new(|home, _| {
         if home.join("next-lease-unavailable").exists() {
             return Err(std::io::Error::other("新的资源根不可用"));
@@ -310,6 +339,9 @@ esac
         },
     ));
     let mut backend = EmulatorBackend::with_runtime(a.id.clone(), layout.clone(), a.port, fixture);
+    if orphan.is_some() {
+        diagnostics::orphan_host(&mut backend);
+    }
     let mut facts = Facts::default();
     backend.observe(&mut facts);
     assert_eq!(State::of(&facts), State::Stopped);
@@ -582,6 +614,7 @@ esac
             );
         }
     }
+    diagnostics::faults(TEST, &layout, &a, &mut backend, &mut facts);
     assert_eq!(fs::read_to_string(&legacy).unwrap(), "旧版输出");
     store.delete(&a.id).unwrap();
 }

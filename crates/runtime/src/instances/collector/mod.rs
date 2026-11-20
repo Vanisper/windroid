@@ -248,12 +248,19 @@ fn discard(readers: [PipeReader; 2], stopped: &AtomicBool) {
     let mut bytes = [0u8; 16384];
     while !stopped.load(Ordering::Acquire) && descriptors.iter().any(|d| d.fd >= 0) {
         let rc = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 200) };
-        if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             break;
         }
         for (d, mut reader) in descriptors.iter_mut().zip(&readers) {
-            if d.revents != 0 && !matches!(reader.read(&mut bytes), Ok(n) if n != 0) {
-                d.fd = -1;
+            if d.revents != 0 {
+                match reader.read(&mut bytes) {
+                    Ok(n) if n > 0 => (),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+                    _ => d.fd = -1,
+                }
             }
         }
     }
@@ -301,6 +308,18 @@ impl Attempt {
             && let Err(e) = capture.finish(&reason)
         {
             self.id.issue(format!("模拟器日志可能有缺口：{e}"));
+            // 子进程已回收，原写者锁已释放。用宿主实际 wait 到的结果修复该周期。
+            if let Some(run) = &self.id.run
+                && let Err(error) = windroid_diagnostics::record_interruption(
+                    &self.id.home,
+                    &self.id.instance,
+                    run,
+                    &reason,
+                )
+            {
+                self.id
+                    .record(Level::Warn, &format!("无法持久化采集中断结果：{error}"));
+            }
         }
     }
 }
