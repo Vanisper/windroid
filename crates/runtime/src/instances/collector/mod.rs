@@ -104,7 +104,7 @@ impl Identity {
 
     fn issue(&self, message: String) {
         self.record(Level::Warn, &message);
-        app_log::set_capture_issue(&self.home, &self.instance, Some(message));
+        app_log::set_capture_issue(&self.home, &self.instance, self.run.as_deref(), message);
     }
 }
 
@@ -279,8 +279,7 @@ impl Attempt {
             instance: instance.to_owned(),
             run: run.as_ref().ok().cloned(),
         };
-        app_log::start_attempt(home, instance, id.run.as_deref());
-        app_log::set_capture_issue(home, instance, None);
+        app_log::begin_capture(home, instance, id.run.as_deref());
         let capture = match run.and_then(|run| Capture::start(command, &id, &run)) {
             Ok(capture) => Some(capture),
             Err(e) => {

@@ -6,12 +6,17 @@ use std::sync::Mutex;
 use log::Level;
 use windroid_diagnostics::{Event, RunWriter, Sink, new_run_id};
 
+struct CaptureStatus {
+    run: Option<String>,
+    issue: Option<String>,
+}
+
 struct Current {
     home: PathBuf,
     id: String,
     sink: Option<Sink>,
     error: Option<String>,
-    captures: BTreeMap<String, String>,
+    captures: BTreeMap<String, CaptureStatus>,
     attempts: BTreeMap<String, Option<String>>,
 }
 
@@ -84,13 +89,29 @@ pub fn last_start(home: &Path, id: &str) -> Option<(String, Option<String>)> {
     Some((s.id.clone(), s.attempts.get(id)?.clone()))
 }
 
-pub fn set_capture_issue(home: &Path, id: &str, reason: Option<String>) {
+/// 预检拒绝只更新执行请求的关联。实际通过检查的新采集周期才替换实例的采集状态。
+pub(crate) fn begin_capture(home: &Path, id: &str, run: Option<&str>) {
     if let Some(s) = CURRENT.lock().unwrap().as_mut().filter(|s| s.home == home) {
-        if let Some(reason) = reason {
-            s.captures.insert(id.to_owned(), reason);
-        } else {
-            s.captures.remove(id);
-        }
+        s.attempts.insert(id.to_owned(), run.map(str::to_owned));
+        s.captures.insert(
+            id.to_owned(),
+            CaptureStatus {
+                run: run.map(str::to_owned),
+                issue: None,
+            },
+        );
+    }
+}
+
+pub(crate) fn set_capture_issue(home: &Path, id: &str, run: Option<&str>, reason: String) {
+    let mut guard = CURRENT.lock().unwrap();
+    if let Some(status) = guard
+        .as_mut()
+        .filter(|s| s.home == home)
+        .and_then(|s| s.captures.get_mut(id))
+        .filter(|status| status.run.as_deref() == run)
+    {
+        status.issue = Some(reason);
     }
 }
 
@@ -98,7 +119,7 @@ pub fn capture_issue(home: &Path, instance: Option<&str>) -> Option<String> {
     let guard = CURRENT.lock().unwrap();
     let session = guard.as_ref().filter(|s| s.home == home)?;
     match instance {
-        Some(id) => session.captures.get(id).cloned(),
+        Some(id) => session.captures.get(id)?.issue.clone(),
         None => session.error.clone().or_else(|| {
             session
                 .sink
@@ -200,6 +221,16 @@ mod tests {
             Some("phone"),
             None,
             "端口被占用",
+        );
+        begin_capture(&root, "phone", Some("first"));
+        begin_capture(&root, "phone", Some("second"));
+        set_capture_issue(&root, "phone", Some("first"), "上次采集器迟到".into());
+        assert!(capture_issue(&root, Some("phone")).is_none());
+        start_attempt(&root, "phone", None);
+        set_capture_issue(&root, "phone", Some("second"), "活动采集有缺口".into());
+        assert_eq!(
+            capture_issue(&root, Some("phone")).as_deref(),
+            Some("活动采集有缺口")
         );
         session.finish("正常退出");
         assert!(current_id(&root).is_none());
