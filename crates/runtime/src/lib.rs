@@ -16,6 +16,22 @@ pub mod running;
 pub mod storage;
 pub mod workspace;
 
+/// 文件锁的生命周期用例需要独占进程。并行测试启动的其他子进程在 exec 前也会继承锁。
+#[cfg(test)]
+fn rerun_in_isolated_process(test: &str) -> bool {
+    const SELECTED: &str = "WINDROID_ISOLATED_RUNTIME_TEST";
+    if std::env::var(SELECTED).as_deref() == Ok(test) {
+        return false;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(SELECTED, test)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test}: {status}");
+    true
+}
+
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};

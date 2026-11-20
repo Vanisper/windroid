@@ -271,6 +271,11 @@ fn inherited_grant_survives_launcher_exit_and_is_released_by_child_exit() {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    const TEST: &str =
+        "admission::tests::inherited_grant_survives_launcher_exit_and_is_released_by_child_exit";
+    if crate::rerun_in_isolated_process(TEST) {
+        return;
+    }
     let dir = Temp::new();
     let admission = dir.controller(2560);
     let mut grant = admission
@@ -301,18 +306,19 @@ fn inherited_grant_survives_launcher_exit_and_is_released_by_child_exit() {
         "ready"
     );
     drop(grant);
-    assert!(
+    assert_eq!(
         admission
             .reserve(5554, guest(1, 2560), host(10, 16), None)
-            .is_err()
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::AddrInUse
     );
     child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
     assert!(child.wait().unwrap().success());
-    assert!(
-        admission
-            .reserve(5554, guest(1, 2560), host(10, 16), None)
-            .is_ok()
-    );
+    admission
+        .reserve(5554, guest(1, 2560), host(10, 16), None)
+        .unwrap();
 }
 
 #[cfg(target_os = "macos")]

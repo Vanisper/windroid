@@ -136,7 +136,11 @@ fn absent_bound_revision_is_reported_by_instance_and_only_it_is_downloadable() {
 
 #[test]
 fn processes_coordinate_by_version_across_rename() {
+    const TEST: &str = "storage::tests::processes_coordinate_by_version_across_rename";
     const CHILD: &str = "WINDROID_TEST_VERSION_LOCK_CHILD";
+    if crate::rerun_in_isolated_process(TEST) {
+        return;
+    }
     if let Some(root) = std::env::var_os(CHILD) {
         let root = PathBuf::from(root);
         let path = root.join("r14");
@@ -158,10 +162,7 @@ fn processes_coordinate_by_version_across_rename() {
     let check = || {
         assert!(
             Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "storage::tests::processes_coordinate_by_version_across_rename"
-                ])
+                .args(["--exact", TEST])
                 .env(CHILD, &tmp.0)
                 .status()
                 .unwrap()
