@@ -1,0 +1,117 @@
+{
+  "instanceId": "wd-60fbe951cb48efafd64929ef643e7bfb",
+  "snapshotPbSha256": "a0baa437e7f65143368d657c1692976c1884bff2528b225c3b8687cf7312b2d1",
+  "TZ": "WQA-02:55",
+  "trials": [
+    {
+      "commit": "8773493",
+      "timed": false,
+      "kqueue": {
+        "pid": 96746,
+        "waitStatus": 11,
+        "exit": -11,
+        "utc": "2026-11-20T21:13:37Z"
+      },
+      "subsequentGuestRead": {
+        "pid": 99705,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    },
+    {
+      "commit": "ac13208",
+      "timed": true,
+      "kqueue": {
+        "pid": 284,
+        "waitStatus": 0,
+        "exit": 0,
+        "utc": "2026-11-20T21:20:04Z",
+        "loadedObservedUtc": 1795209588.366996,
+        "axStopRequestedUtc": 1795209600.376201
+      },
+      "subsequentGuestRead": {
+        "pid": 429,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    },
+    {
+      "commit": "8773493",
+      "timed": true,
+      "kqueue": {
+        "pid": 754,
+        "waitStatus": 0,
+        "exit": 0,
+        "utc": "2026-11-20T21:20:32Z",
+        "loadedObservedUtc": 1795209616.404852,
+        "axStopRequestedUtc": 1795209628.40515
+      },
+      "subsequentGuestRead": {
+        "pid": 924,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    },
+    {
+      "commit": "ac13208",
+      "timed": true,
+      "kqueue": {
+        "pid": 1211,
+        "waitStatus": 0,
+        "exit": 0,
+        "utc": "2026-11-20T21:20:58Z",
+        "loadedObservedUtc": 1795209643.019449,
+        "axStopRequestedUtc": 1795209655.025236
+      },
+      "subsequentGuestRead": {
+        "pid": 1451,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    },
+    {
+      "commit": "8773493",
+      "timed": true,
+      "kqueue": {
+        "pid": 1705,
+        "waitStatus": 0,
+        "exit": 0,
+        "utc": "2026-11-20T21:21:26Z",
+        "loadedObservedUtc": 1795209670.78592,
+        "axStopRequestedUtc": 1795209682.790101
+      },
+      "subsequentGuestRead": {
+        "pid": 1856,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    },
+    {
+      "commit": "ac13208",
+      "timed": true,
+      "kqueue": {
+        "pid": 2099,
+        "waitStatus": 0,
+        "exit": 0,
+        "utc": "2026-11-20T21:22:00Z",
+        "loadedObservedUtc": 1795209704.975632,
+        "axStopRequestedUtc": 1795209716.9833689
+      },
+      "subsequentGuestRead": {
+        "pid": 2251,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    },
+    {
+      "commit": "8773493",
+      "timed": true,
+      "kqueue": {
+        "pid": 2503,
+        "waitStatus": 0,
+        "exit": 0,
+        "utc": "2026-11-20T21:22:28Z",
+        "loadedObservedUtc": 1795209732.6628768,
+        "axStopRequestedUtc": 1795209744.666303
+      },
+      "subsequentGuestRead": {
+        "pid": 2635,
+        "marker": "windroid-stop-3667dbc170d7e628"
+      }
+    }
+  ]
+}

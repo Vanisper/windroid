@@ -137,7 +137,7 @@ fn preview_includes_only_eligible_guests_in_order_and_leaves_no_state() {
     assert_eq!(fs::read(&config).unwrap(), original);
     assert_eq!(fs::read_to_string(stale_pid).unwrap(), i32::MAX.to_string());
     assert!(!admission_dir.exists() && !lock.exists() && runtime.current().is_none());
-    assert!(!layout.instance(&first.id).join("emulator.log").exists());
+    assert!(!layout.instance(&first.id).join("logs").exists());
     // 生产解析器遇到缺失的官方组件；首次预览也不建立工作区写锁或核验缓存。
     for name in [".components.lock", ".images.lock"] {
         fs::remove_file(root.0.join(name)).unwrap();

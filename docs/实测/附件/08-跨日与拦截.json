@@ -1,0 +1,271 @@
+{
+  "TZ": "WQA-02:55",
+  "midnightUtc": "2026-11-20T21:05:00Z",
+  "sources": {
+    "windroid": {
+      "pid": 82864,
+      "manifest": {
+        "format": 1,
+        "source": "app",
+        "id": "2ce504fb09a76911583822610c88d538",
+        "instanceId": null,
+        "appRunId": null,
+        "started": {
+          "utc": "2026-11-20T21:02:06.998Z",
+          "local": "2026-11-20T23:57:06.998+02:55",
+          "day": "2026-11-20",
+          "offset": 10500
+        },
+        "ended": {
+          "utc": "2026-11-20T21:05:14.415Z",
+          "local": "2026-11-21T00:00:14.415+02:55",
+          "day": "2026-11-21",
+          "offset": 10500
+        },
+        "outcome": "Windroid 正常退出",
+        "segments": [
+          {
+            "number": 1,
+            "first": 1,
+            "last": 6,
+            "stamp": {
+              "utc": "2026-11-20T21:02:06.998Z",
+              "local": "2026-11-20T23:57:06.998+02:55",
+              "day": "2026-11-20",
+              "offset": 10500
+            },
+            "latestUtc": "2026-11-20T21:02:52.204Z",
+            "bytes": 1894,
+            "removed": false
+          },
+          {
+            "number": 2,
+            "first": 7,
+            "last": 9,
+            "stamp": {
+              "utc": "2026-11-20T21:05:05.902Z",
+              "local": "2026-11-21T00:00:05.902+02:55",
+              "day": "2026-11-21",
+              "offset": 10500
+            },
+            "latestUtc": "2026-11-20T21:05:14.415Z",
+            "bytes": 970,
+            "removed": false
+          }
+        ],
+        "lost": false
+      },
+      "jsonlRecords": [
+        {
+          "seq": 5,
+          "segment": 1,
+          "stamp": {
+            "utc": "2026-11-20T21:02:31.895Z",
+            "local": "2026-11-20T23:57:31.895+02:55",
+            "day": "2026-11-20",
+            "offset": 10500
+          },
+          "source": "windroid",
+          "text": "启动请求失败：模拟器端口对 5554/5555 已被占用",
+          "level": "WARN",
+          "component": "实例调度",
+          "instanceId": "wd-28b792b8bac282aa3e43db8d121ba5ec",
+          "continued": false
+        },
+        {
+          "seq": 6,
+          "segment": 1,
+          "stamp": {
+            "utc": "2026-11-20T21:02:52.204Z",
+            "local": "2026-11-20T23:57:52.204+02:55",
+            "day": "2026-11-20",
+            "offset": 10500
+          },
+          "source": "windroid",
+          "text": "启动请求失败：模拟器端口对 5554/5555 已被占用",
+          "level": "WARN",
+          "component": "批量调度",
+          "instanceId": "wd-28b792b8bac282aa3e43db8d121ba5ec",
+          "continued": false
+        },
+        {
+          "seq": 7,
+          "segment": 2,
+          "stamp": {
+            "utc": "2026-11-20T21:05:05.902Z",
+            "local": "2026-11-21T00:00:05.902+02:55",
+            "day": "2026-11-21",
+            "offset": 10500
+          },
+          "source": "windroid",
+          "text": "模拟器进程已退出（exit status: 0）",
+          "level": "INFO",
+          "component": "emulator",
+          "instanceId": "wd-60fbe951cb48efafd64929ef643e7bfb",
+          "emulatorRunId": "4b8ef99e47aa263902ad60210c9bc440",
+          "continued": false
+        }
+      ],
+      "nativeViews": [
+        {
+          "view": "app-day-before",
+          "accessibilityValueLines": [
+            "#5  2026-11-20 23:57:31.895+02:55  windroid · WARN · 实例调度 · 实例 wd-28b792b8bac282aa3e43db8d121ba5ec  启动请求失败：模拟器端口对 5554/5555 已被占用",
+            "#6  2026-11-20 23:57:52.204+02:55  windroid · WARN · 批量调度 · 实例 wd-28b792b8bac282aa3e43db8d121ba5ec  启动请求失败：模拟器端口对 5554/5555 已被占用"
+          ]
+        },
+        {
+          "view": "app-day-after",
+          "accessibilityValueLines": [
+            "#7  2026-11-21 00:00:05.902+02:55  windroid · INFO · emulator · 实例 wd-60fbe951cb48efafd64929ef643e7bfb · 模拟器启动 4b8ef99e47aa263902ad60210c9bc440  模拟器进程已退出（exit status: 0）"
+          ]
+        },
+        {
+          "view": "app-cross-run",
+          "accessibilityValueLines": [
+            "#5  2026-11-20 23:57:31.895+02:55  windroid · WARN · 实例调度 · 实例 wd-28b792b8bac282aa3e43db8d121ba5ec  启动请求失败：模拟器端口对 5554/5555 已被占用",
+            "#6  2026-11-20 23:57:52.204+02:55  windroid · WARN · 批量调度 · 实例 wd-28b792b8bac282aa3e43db8d121ba5ec  启动请求失败：模拟器端口对 5554/5555 已被占用",
+            "#7  2026-11-21 00:00:05.902+02:55  windroid · INFO · emulator · 实例 wd-60fbe951cb48efafd64929ef643e7bfb · 模拟器启动 4b8ef99e47aa263902ad60210c9bc440  模拟器进程已退出（exit status: 0）"
+          ]
+        }
+      ]
+    },
+    "emulator": {
+      "pid": 82995,
+      "manifest": {
+        "format": 1,
+        "source": "emulator",
+        "id": "4b8ef99e47aa263902ad60210c9bc440",
+        "instanceId": "wd-60fbe951cb48efafd64929ef643e7bfb",
+        "appRunId": "2ce504fb09a76911583822610c88d538",
+        "started": {
+          "utc": "2026-11-20T21:02:08.733Z",
+          "local": "2026-11-20T23:57:08.733+02:55",
+          "day": "2026-11-20",
+          "offset": 10500
+        },
+        "ended": {
+          "utc": "2026-11-20T21:05:05.902Z",
+          "local": "2026-11-21T00:00:05.902+02:55",
+          "day": "2026-11-21",
+          "offset": 10500
+        },
+        "outcome": "模拟器进程已退出（exit status: 0）",
+        "segments": [
+          {
+            "number": 1,
+            "first": 1,
+            "last": 104,
+            "stamp": {
+              "utc": "2026-11-20T21:02:08.739Z",
+              "local": "2026-11-20T23:57:08.739+02:55",
+              "day": "2026-11-20",
+              "offset": 10500
+            },
+            "latestUtc": "2026-11-20T21:02:31.037Z",
+            "bytes": 27915,
+            "removed": false
+          },
+          {
+            "number": 2,
+            "first": 105,
+            "last": 113,
+            "stamp": {
+              "utc": "2026-11-20T21:05:03.073Z",
+              "local": "2026-11-21T00:00:03.073+02:55",
+              "day": "2026-11-21",
+              "offset": 10500
+            },
+            "latestUtc": "2026-11-20T21:05:05.902Z",
+            "bytes": 2369,
+            "removed": false
+          }
+        ],
+        "lost": false
+      },
+      "jsonlRecords": [
+        {
+          "seq": 104,
+          "segment": 1,
+          "stamp": {
+            "utc": "2026-11-20T21:02:31.037Z",
+            "local": "2026-11-20T23:57:31.037+02:55",
+            "day": "2026-11-20",
+            "offset": 10500
+          },
+          "source": "stdout",
+          "text": "INFO         | Increasing screen off timeout, logcat buffer size to 2M.",
+          "continued": false
+        },
+        {
+          "seq": 105,
+          "segment": 2,
+          "stamp": {
+            "utc": "2026-11-20T21:05:03.073Z",
+            "local": "2026-11-21T00:00:03.073+02:55",
+            "day": "2026-11-21",
+            "offset": 10500
+          },
+          "source": "stdout",
+          "text": "INFO         | Wait for emulator (pid 82995) 20 seconds to shutdown gracefully before kill;you can set environment variable ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL(in seconds) to change the default value (20 seconds)",
+          "continued": false
+        },
+        {
+          "seq": 113,
+          "segment": 2,
+          "stamp": {
+            "utc": "2026-11-20T21:05:05.902Z",
+            "local": "2026-11-21T00:00:05.902+02:55",
+            "day": "2026-11-21",
+            "offset": 10500
+          },
+          "source": "windroid",
+          "text": "模拟器进程已退出（exit status: 0）",
+          "continued": false
+        }
+      ],
+      "nativeViews": [
+        {
+          "view": "emulator-day-after",
+          "accessibilityValueLines": [
+            "#105  2026-11-21 00:00:03.073+02:55  stdout  INFO         | Wait for emulator (pid 82995) 20 seconds to shutdown gracefully before kill;you can set environment variable ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL(in seconds) to change the default value (20 seconds)",
+            "#113  2026-11-21 00:00:05.902+02:55  windroid  模拟器进程已退出（exit status: 0）"
+          ]
+        },
+        {
+          "view": "emu-run-p5",
+          "accessibilityValueLines": [
+            "#104  2026-11-20 23:57:31.037+02:55  stdout  INFO         | Increasing screen off timeout, logcat buffer size to 2M.",
+            "#105  2026-11-21 00:00:03.073+02:55  stdout  INFO         | Wait for emulator (pid 82995) 20 seconds to shutdown gracefully before kill;you can set environment variable ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL(in seconds) to change the default value (20 seconds)",
+            "#113  2026-11-21 00:00:05.902+02:55  windroid  模拟器进程已退出（exit status: 0）"
+          ]
+        },
+        {
+          "view": "emulator-same-day-after-reopen",
+          "clientPid": 14772,
+          "windowId": 21592,
+          "day": "2026-11-21",
+          "instanceId": "wd-60fbe951cb48efafd64929ef643e7bfb",
+          "operation": "管理 Android 2 → 更多 → 模拟器日志 → 按日期，向下滚动两次，从同一份 AX 树摘录三个启动按钮与分段控件的首条记录。",
+          "buttons": [
+            {
+              "label": "2026-11-21 00:04:30.884+02:55 启动",
+              "value": "启动标识 · e9191920d35950910507753410a23d3b\nWindroid 启动标识 · 883be781a77e9213f461b7e3133b3e3f · 模拟器进程已退出（exit status: 0）",
+              "firstRecord": "#1  2026-11-21 00:04:30.888+02:55  windroid  已创建模拟器进程 PID 93055"
+            },
+            {
+              "label": "2026-11-21 00:03:17.075+02:55 启动",
+              "value": "启动标识 · 5a151a6b5678023f4a6ce81eaff700ad\nWindroid 启动标识 · 883be781a77e9213f461b7e3133b3e3f · 模拟器进程已退出（signal: 6 (SIGABRT)）",
+              "firstRecord": "#1  2026-11-21 00:03:17.077+02:55  windroid  已创建模拟器进程 PID 91298"
+            },
+            {
+              "label": "2026-11-21 00:02:40.434+02:55 启动",
+              "value": "启动标识 · 0a002aea6e7710aee3c77f8b8a6635b8\nWindroid 启动标识 · 2bf2fad10f4d46df62758d04b91d83fa · 模拟器进程已退出（exit status: 0）",
+              "firstRecord": "#1  2026-11-21 00:02:40.437+02:55  windroid  已创建模拟器进程 PID 90467"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

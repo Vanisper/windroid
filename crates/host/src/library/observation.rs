@@ -83,6 +83,29 @@ impl Library {
                 }
                 let view = lib.preparation();
                 if previous != view {
+                    // 下载字节数频繁变化，日志只保留阶段切换和首次出现的故障。
+                    if previous["phase"] != view["phase"] || previous["error"] != view["error"] {
+                        let (level, detail) = match view["error"].as_str() {
+                            Some(reason) => {
+                                (log::Level::Warn, format!("运行环境准备失败：{reason}"))
+                            }
+                            None => (
+                                log::Level::Info,
+                                format!(
+                                    "运行环境状态 · {}",
+                                    view["phase"].as_str().unwrap_or("未知")
+                                ),
+                            ),
+                        };
+                        runtime::app_log::record(
+                            &lib.layout.root,
+                            level,
+                            "运行环境",
+                            None,
+                            None,
+                            &detail,
+                        );
+                    }
                     previous = view;
                     lib.notify();
                 }
@@ -267,6 +290,14 @@ impl Library {
                 if !accepts_window(&s, &instance_id) {
                     return;
                 }
+                runtime::app_log::record(
+                    &self.layout.root,
+                    log::Level::Warn,
+                    "显示会话",
+                    Some(&instance_id),
+                    None,
+                    &message,
+                );
                 s.operations.insert(
                     instance_id.clone(),
                     json!({"instanceId":instance_id,"message":message,"failed":true}),

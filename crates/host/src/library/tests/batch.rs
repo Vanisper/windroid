@@ -314,3 +314,153 @@ fn batch_stop_reports_process_exit_after_a_ready_guest_dies() {
     assert_eq!(preview["items"][0]["eligible"], false);
     assert_eq!(preview["items"][0]["reason"], "模拟器进程已退出");
 }
+
+#[test]
+fn start_refusals_persist_once_with_their_dispatch_scope() {
+    struct Refuse(device::FakeBackend);
+    impl device::Backend for Refuse {
+        fn exec(&mut self, cmd: &Command, facts: &mut Facts) -> Result<(), Rejection> {
+            if matches!(cmd, Command::Start) {
+                return Err(error("端口对 5554/5555 正被占用"));
+            }
+            self.0.exec(cmd, facts)
+        }
+        fn observe(&mut self, facts: &mut Facts) {
+            self.0.observe(facts);
+        }
+        fn abort(&mut self, facts: &mut Facts) {
+            self.0.abort(facts);
+        }
+    }
+    let run_id = runtime::app_log::AppLog::allocate_id();
+    let root = std::env::temp_dir().join(format!("windroid-command-log-{run_id}"));
+    std::fs::create_dir(&root).unwrap();
+    let logs = runtime::app_log::AppLog::open(&root, &run_id);
+    let (windows, _) = mpsc::channel();
+    let lib = Library::new(
+        HostChannel::new(),
+        Layout { root: root.clone() },
+        true,
+        windows,
+        false,
+    );
+    let id = "blocked";
+    add_backend(
+        &lib,
+        id,
+        Refuse(device::FakeBackend::new()),
+        Default::default(),
+    );
+
+    assert!(
+        lib.perform(&json!({"kind":"start", "instanceId":id}))
+            .is_err()
+    );
+    let preview = lib
+        .preview_batch(&json!({"action":"start","scope":"all","ids":[id]}))
+        .unwrap();
+    assert_eq!(preview["items"][0]["eligible"], true);
+    let checked = lib
+        .preview_batch(&json!({"previewId":preview["previewId"]}))
+        .unwrap();
+    commit(&lib, &checked).unwrap();
+    assert_eq!(result(&lib)["items"][0]["status"], "failed");
+    exercise_queue_refusals(&lib, &run_id);
+
+    logs.finish("正常退出");
+    let page = windroid_diagnostics::read_page(&root, None, &run_id, None, 0, 100).unwrap();
+    assert!(!page.more);
+    let rows: Vec<_> = page
+        .records
+        .iter()
+        .filter(|r| matches!(r.component.as_deref(), Some("实例调度" | "批量调度")))
+        .collect();
+    // 包含在预检实际执行时遭拒的两条；预览和重新检查均不计入期望数。
+    let expected = [
+        (Some(id), "实例调度", "启动", "端口对 5554/5555"),
+        (Some(id), "批量调度", "启动", "端口对 5554/5555"),
+        (Some("queued-start"), "实例调度", "启动", "队列已满"),
+        (Some("queued-restart"), "实例调度", "重新启动", "队列已关闭"),
+        (Some("queued-cold"), "实例调度", "冷启动", "队列已满"),
+        (None, "批量调度", "确认", "队列已满"),
+        (None, "批量调度", "确认", "队列已关闭"),
+        (Some("queued-start"), "批量调度", "启动", "队列已满"),
+        (Some("queued-restart"), "批量调度", "启动", "队列已关闭"),
+    ];
+    assert_eq!(rows.len(), expected.len(), "{rows:?}");
+    for (owner, component, operation, reason) in expected {
+        let found = rows
+            .iter()
+            .filter(|r| {
+                r.instance_id.as_deref() == owner
+                    && r.component.as_deref() == Some(component)
+                    && r.text.contains(operation)
+                    && r.text.contains(reason)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1, "{owner:?} {operation} {reason}：{rows:?}");
+        assert!(found[0].emulator_run_id.is_none());
+    }
+    assert!(!root.join("instances").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn exercise_queue_refusals(lib: &Arc<Library>, app_id: &str) {
+    // 零容量通道保持接收端但无人等待，try_send 必然返回 Full。另一通道直接关闭接收端。
+    let (full, _held) = mpsc::sync_channel(0);
+    let (closed, dropped) = mpsc::sync_channel(0);
+    drop(dropped);
+    let fallback = lib.lane();
+    let targets = [
+        ("queued-start", "start", &full),
+        ("queued-restart", "restart", &closed),
+        ("queued-cold", "coldRestart", &full),
+    ];
+    let mut prior_runs = Vec::new();
+    for (id, kind, lane) in targets {
+        add_backend(lib, id, device::FakeBackend::new(), Default::default());
+        {
+            let mut state = lib.state.lock().unwrap();
+            let instance = state.instances.get_mut(id).unwrap();
+            instance.lane = lane.clone();
+            instance.name = "同名实例".into();
+        }
+        let previous = runtime::app_log::AppLog::allocate_id();
+        runtime::app_log::start_attempt(&lib.layout.root, id, Some(&previous));
+        prior_runs.push((id, previous));
+        lib.dispatch_command(&fallback, json!({"kind":kind,"instanceId":id}), None);
+    }
+
+    let receipt = lib
+        .preview_batch(&json!({
+            "scope":"selected", "action":"start", "ids":["queued-start","queued-restart"]
+        }))
+        .unwrap();
+    assert!(
+        receipt["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["eligible"] == true)
+    );
+    let confirmation = json!({"kind":"executeBatch","previewId":receipt["previewId"]});
+    for unavailable in [&full, &closed] {
+        lib.dispatch_command(unavailable, confirmation.clone(), None);
+    }
+    // 全局队列拒绝没有消耗确认单；实际确认后才会逐个投递到实例队列。
+    commit(lib, &receipt).unwrap();
+    let batch = result(lib);
+    let items = batch["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for id in ["queued-start", "queued-restart"] {
+        let item = items.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(item["status"], "failed");
+    }
+    for (id, previous) in prior_runs {
+        assert_eq!(
+            runtime::app_log::last_start(&lib.layout.root, id),
+            Some((app_id.to_owned(), Some(previous))),
+            "未入队不能覆盖已登记的实例启动关联",
+        );
+    }
+}

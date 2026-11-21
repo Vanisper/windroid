@@ -1,8 +1,54 @@
 use super::*;
 use crate::actions::{self, Kind};
 
+pub(super) fn start_operation(kind: Option<&str>) -> Option<&'static str> {
+    match kind? {
+        "start" => Some("启动"),
+        "restart" => Some("重新启动"),
+        "coldRestart" => Some("冷启动"),
+        _ => None,
+    }
+}
+
 impl Library {
     pub(super) fn perform(self: &Arc<Self>, data: &JsonValue) -> Reply {
+        self.perform_logged(data, "实例调度")
+    }
+
+    pub(super) fn perform_logged(self: &Arc<Self>, data: &JsonValue, component: &str) -> Reply {
+        let id = data["instanceId"].as_str();
+        let operation = if let Some(name) = start_operation(data["kind"].as_str()) {
+            if let Some(id) = id {
+                runtime::app_log::start_attempt(&self.layout.root, id, None);
+            }
+            name
+        } else if data["kind"] == "stop" {
+            "停止"
+        } else {
+            return self.dispatch(data);
+        };
+        let result = self.dispatch(data);
+        let (level, message) = match &result {
+            Ok(_) => (log::Level::Info, format!("{operation}请求已执行")),
+            Err(reason) => (
+                log::Level::Warn,
+                format!("{operation}请求失败：{}", rejection_message(reason)),
+            ),
+        };
+        runtime::app_log::record(
+            &self.layout.root,
+            level,
+            component,
+            id,
+            id.and_then(|id| runtime::app_log::last_start(&self.layout.root, id))
+                .and_then(|(_, run)| run)
+                .as_deref(),
+            &message,
+        );
+        result
+    }
+
+    fn dispatch(self: &Arc<Self>, data: &JsonValue) -> Reply {
         if self.stopping.load(Ordering::Acquire) {
             return Err(error("应用库正在退出"));
         }

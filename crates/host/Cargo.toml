@@ -11,6 +11,7 @@ contract = { path = "../contract" }
 device = { path = "../device" }
 stream = { path = "../stream" }
 runtime = { path = "../runtime" }
+windroid-diagnostics = { path = "../diagnostics" }
 nsh-core = "0.5"
 nsh-engine = { version = "0.5", features = ["js-core"] }
 serde = { workspace = true }

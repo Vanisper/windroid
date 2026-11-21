@@ -392,7 +392,8 @@ impl Library {
             action,
             reply,
         };
-        let result = if lane.try_send(request).is_err() {
+        let result = if let Err(error) = lane.try_send(request) {
+            self.reject_unqueued(error);
             Outcome::new(Status::Failed, "实例操作队列繁忙或已关闭")
         } else {
             match ack.recv() {
@@ -423,18 +424,21 @@ impl Library {
         if !action.allows(snap.state) {
             return Err(Outcome::new(Status::Skipped, action.skip_reason(&snap)));
         }
-        self.perform(&json!({"kind": action.command(), "instanceId": id}))
-            .map(|seq| (seq, instance.handle.snapshot()))
-            .map_err(|r| {
-                if matches!(r, Rejection::WrongState { .. } | Rejection::NotReady { .. }) {
-                    Outcome::new(
-                        Status::Skipped,
-                        action.skip_reason(&instance.handle.snapshot()),
-                    )
-                } else {
-                    Outcome::new(Status::Failed, reason_text(&r))
-                }
-            })
+        self.perform_logged(
+            &json!({"kind": action.command(), "instanceId": id}),
+            "批量调度",
+        )
+        .map(|seq| (seq, instance.handle.snapshot()))
+        .map_err(|r| {
+            if matches!(r, Rejection::WrongState { .. } | Rejection::NotReady { .. }) {
+                Outcome::new(
+                    Status::Skipped,
+                    action.skip_reason(&instance.handle.snapshot()),
+                )
+            } else {
+                Outcome::new(Status::Failed, rejection_message(&r))
+            }
+        })
     }
 }
 
@@ -454,13 +458,6 @@ fn affected_windows(state: &ViewState, snap: &Snapshot) -> Vec<String> {
                 .clone(),
         })
         .collect()
-}
-
-fn reason_text(reason: &Rejection) -> String {
-    rejection_note(None, reason)["message"]
-        .as_str()
-        .unwrap_or("实例操作失败")
-        .into()
 }
 
 fn wait_for_outcome(action: Action, seq: u64, events: mpsc::Receiver<Update>) -> Outcome {

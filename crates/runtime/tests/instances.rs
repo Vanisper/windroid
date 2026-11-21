@@ -1,4 +1,6 @@
 //! 实例持久化和真实后端的边界测试。设备命令均进入临时目录里的替身。
+#[path = "instances/diagnostics.rs"]
+mod diagnostics;
 #[path = "instances/preview.rs"]
 mod preview;
 #[path = "instances/support.rs"]
@@ -215,6 +217,26 @@ printf '%s\n' "$@" > "$WINDROID_BACKEND_TEST_DIR/args"
 printf '%s' "$ANDROID_AVD_HOME" > "$WINDROID_BACKEND_TEST_DIR/avd_home"
 printf '%s' "$ANDROID_EMULATOR_HOME" > "$WINDROID_BACKEND_TEST_DIR/emulator_home"
 printf '%s' "$TMPDIR" > "$WINDROID_BACKEND_TEST_DIR/emulator_tmp"
+if test -f "$WINDROID_BACKEND_TEST_DIR/log-test-mode"; then
+  mode=$(cat "$WINDROID_BACKEND_TEST_DIR/log-test-mode")
+  test "$mode" = quiet && exit 0
+  echo emulator-stdout
+  n=0
+  while test ! -f "$WINDROID_BACKEND_TEST_DIR/emit-after-host"; do
+    test "$n" -lt 500 || exit 99
+    n=$((n + 1))
+    sleep 0.02
+  done
+  if test "$mode" = flood; then
+    dd if=/dev/zero bs=65536 count=64 2>/dev/null || exit 91
+    dd if=/dev/zero bs=65536 count=64 >&2 || exit 92
+    touch "$WINDROID_BACKEND_TEST_DIR/both-streams-drained"
+  fi
+  echo after-host-exit >&2
+  exit 37
+fi
+echo emulator-stdout
+echo emulator-stderr >&2
 test -z "${NETSIM_INSTANCE+x}${NETSIM_ARGS+x}" || exit 1
 while test "$1" != -datadir; do shift; done
 snapshot_dir="$2/snapshots/default_boot"
@@ -266,9 +288,14 @@ esac
                 stream.write_all(b"OKAY00040029").unwrap();
             }
         });
+        diagnostics::collector_wrapper(&dir.0);
         let result = ChildCommand::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env(ROOT, &dir.0)
+            .env(
+                "WINDROID_TEST_COLLECTOR_BIN",
+                env!("CARGO_BIN_EXE_windroid-log-collector"),
+            )
             .env("WINDROID_HOME", &dir.0)
             .env("ANDROID_ADB_SERVER_PORT", service_port)
             .env_remove("ADB_SERVER_SOCKET")
@@ -283,9 +310,14 @@ esac
         return;
     };
     let root = std::path::PathBuf::from(path);
+    runtime::instances::register_collector(&root.join("collector"));
     let layout = Layout { root: root.clone() };
     let store = InstanceStore::new(layout.clone());
-    let a = store.create("工作 A", spec("compact-720")).unwrap();
+    let orphan = std::env::var(diagnostics::ORPHAN).ok();
+    let a = match &orphan {
+        Some(id) => store.get(&InstanceId::new(id)).unwrap(),
+        None => store.create("工作 A", spec("compact-720")).unwrap(),
+    };
     let fixture = runtime::ActiveRuntime::new(|home, _| {
         if home.join("next-lease-unavailable").exists() {
             return Err(std::io::Error::other("新的资源根不可用"));
@@ -307,6 +339,9 @@ esac
         },
     ));
     let mut backend = EmulatorBackend::with_runtime(a.id.clone(), layout.clone(), a.port, fixture);
+    if orphan.is_some() {
+        diagnostics::orphan_host(&mut backend);
+    }
     let mut facts = Facts::default();
     backend.observe(&mut facts);
     assert_eq!(State::of(&facts), State::Stopped);
@@ -347,6 +382,10 @@ esac
     assert!(!facts.process_alive && unknown_pid.exists());
     fs::remove_file(unknown_pid).unwrap();
     store.delete(&old.id).unwrap();
+    let catalog = || windroid_diagnostics::Catalog::load(&root, Some(a.id.as_str())).unwrap();
+    assert!(catalog().runs.is_empty(), "启动前拒绝不能创建模拟器周期");
+    let legacy = layout.instance(&a.id).join("emulator.log");
+    fs::write(&legacy, "旧版输出").unwrap();
     // 在已经预留后制造 spawn 失败。恢复可执行文件后同一实例应能立即再次申请。
     let emulator = runtime::provision::RuntimePaths::discover(&root).emulator;
     let unavailable = emulator.with_extension("disabled");
@@ -354,6 +393,16 @@ esac
     let failure = backend.exec(&Command::Start, &mut facts).unwrap_err();
     assert!(matches!(failure, Rejection::Error { detail, .. } if detail.contains("无法启动")));
     assert!(!facts.process_alive && !pid_marker.exists());
+    let failed = catalog();
+    assert_eq!(failed.runs.len(), 1);
+    assert!(
+        failed.runs[0]
+            .outcome
+            .as_deref()
+            .unwrap()
+            .contains("进程创建失败")
+    );
+    assert!(failed.legacy);
     fs::rename(unavailable, emulator).unwrap();
     let temp_parent = layout.instance(&a.id).join("tmp");
     assert_eq!(fs::read_dir(&temp_parent).unwrap().count(), 0);
@@ -549,6 +598,24 @@ esac
             .unwrap()
             .contains("emu kill")
     );
+    let history = catalog();
+    assert!(history.runs.len() >= 4);
+    for run in history.runs.iter().filter(|r| r.id != failed.runs[0].id) {
+        assert!(!run.active);
+        assert!(run.outcome.as_deref().unwrap().contains("进程已退出"));
+        let page =
+            windroid_diagnostics::read_page(&root, Some(a.id.as_str()), &run.id, None, 0, 100)
+                .unwrap();
+        for (source, text) in [("stdout", "emulator-stdout"), ("stderr", "emulator-stderr")] {
+            assert!(
+                page.records
+                    .iter()
+                    .any(|r| r.source == source && r.text == text)
+            );
+        }
+    }
+    diagnostics::faults(TEST, &layout, &a, &mut backend, &mut facts);
+    assert_eq!(fs::read_to_string(&legacy).unwrap(), "旧版输出");
     store.delete(&a.id).unwrap();
 }
 
